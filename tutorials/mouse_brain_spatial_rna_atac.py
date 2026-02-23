@@ -23,36 +23,39 @@ from pprint import pprint
 print("Loaded environment variables from .env or env:", end="\n\n")
 pprint(dotenv_values())
 
-#%% load RNA data
 base_path = os.path.join(os.getenv("DATAPATH"), "Spatial_ATAC_RNA", "mouse", "spatial_omics")
-#file_name = os.path.join(base_path, "spatial_atac_rna_seq_mouse_brain.h5ad")
-file_name = os.path.join(base_path, "P22_RNA.h5ad")
 
-adata1 = sc.read_h5ad(file_name)
+#%% load RNA data
+#file_name = os.path.join(base_path, "spatial_atac_rna_seq_mouse_brain.h5ad")
+rna_file_name = os.path.join(base_path, "P22_RNA.h5ad")
+
+adata1 = sc.read_h5ad(rna_file_name)
 adata1.obsm["spatial"] = adata1.obsm["spatial"][:, [1, 0]] * -1
 adata1
 
 #%% load ATAC data
 #file_name = os.path.join(base_path, "spatial_atac_rna_seq_mouse_brain_atac.h5ad")
-file_name = os.path.join(base_path, "P22_ATAC_lsi.h5ad")
+atac_file_name = os.path.join(base_path, "P22_ATAC_lsi.h5ad")
 
-adata2 = sc.read_h5ad(file_name)
+adata2 = sc.read_h5ad(atac_file_name)
 adata2.obsm["spatial"] = adata2.obsm["spatial"][:, [1, 0]] * -1
 adata2
 
 #%% compute highly variable genes and peaks
 
-#sc.pp.filter_cells(adata1, min_genes=100)
-sc.pp.filter_genes(adata1, min_cells=3)
-sc.pp.normalize_total(adata1, target_sum=1e4)
-sc.pp.log1p(adata1)
-sc.pp.highly_variable_genes(adata1, n_top_genes=2000)
+if 'P22_RNA.h5ad' not in rna_file_name:
+    #sc.pp.filter_cells(adata1, min_genes=100)
+    sc.pp.filter_genes(adata1, min_cells=3)
+    sc.pp.normalize_total(adata1, target_sum=1e4)
+    sc.pp.log1p(adata1)
+    sc.pp.highly_variable_genes(adata1, n_top_genes=2000)
 
-#sc.pp.filter_cells(adata2, min_genes=100)
-sc.pp.filter_genes(adata2, min_cells=3)
-sc.pp.normalize_total(adata2, target_sum=1e4)
-sc.pp.log1p(adata2)
-sc.pp.highly_variable_genes(adata2, n_top_genes=10000)
+if 'P22_ATAC_lsi.h5ad' not in atac_file_name:
+    #sc.pp.filter_cells(adata2, min_genes=100)
+    sc.pp.filter_genes(adata2, min_cells=3)
+    sc.pp.normalize_total(adata2, target_sum=1e4)
+    sc.pp.log1p(adata2)
+    sc.pp.highly_variable_genes(adata2, n_top_genes=10000)
 
 #%% spatial graph
 MultiGATE.Cal_Spatial_Net(adata1, rad_cutoff=40)
