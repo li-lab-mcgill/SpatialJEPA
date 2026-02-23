@@ -25,13 +25,17 @@ pprint(dotenv_values())
 
 #%% load RNA data
 base_path = os.path.join(os.getenv("DATAPATH"), "Spatial_ATAC_RNA", "mouse", "spatial_omics")
-file_name = os.path.join(base_path, "spatial_atac_rna_seq_mouse_brain.h5ad")
+#file_name = os.path.join(base_path, "spatial_atac_rna_seq_mouse_brain.h5ad")
+file_name = os.path.join(base_path, "P22_RNA.h5ad")
+
 adata1 = sc.read_h5ad(file_name)
 adata1.obsm["spatial"] = adata1.obsm["spatial"][:, [1, 0]] * -1
 adata1
 
 #%% load ATAC data
-file_name = os.path.join(base_path, "spatial_atac_rna_seq_mouse_brain_atac.h5ad")
+#file_name = os.path.join(base_path, "spatial_atac_rna_seq_mouse_brain_atac.h5ad")
+file_name = os.path.join(base_path, "P22_ATAC_lsi.h5ad")
+
 adata2 = sc.read_h5ad(file_name)
 adata2.obsm["spatial"] = adata2.obsm["spatial"][:, [1, 0]] * -1
 adata2
