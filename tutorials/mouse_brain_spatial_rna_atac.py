@@ -57,6 +57,19 @@ if 'P22_ATAC_lsi.h5ad' not in atac_file_name:
     sc.pp.log1p(adata2)
     sc.pp.highly_variable_genes(adata2, n_top_genes=10000)
 
+#%% TMP - redo HVG to limit number of features to fit inside GPU memory
+import socket
+
+if socket.gethostname() != 'ri-muhc-gpu':
+
+    adata1.var['highly_variable'] = False
+    adata2.var['highly_variable'] = False
+
+    top_N_genes = 2000
+    top_N_peaks = 10000
+    adata1.var.loc[adata1.var['highly_variable_rank'].le(top_N_genes-1), 'highly_variable'] = True
+    adata2.var.loc[adata2.var['highly_variable_rank'].le(top_N_peaks-1), 'highly_variable'] = True
+
 #%% spatial graph
 MultiGATE.Cal_Spatial_Net(adata1, rad_cutoff=40)
 MultiGATE.Stats_Spatial_Net(adata1)
