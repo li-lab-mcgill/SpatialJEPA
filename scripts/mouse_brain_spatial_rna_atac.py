@@ -145,16 +145,62 @@ plt.show()
 
 #%% forward pass with target data
 
+import numpy as np
 import pandas as pd
-target_rna.uns["Spatial_Net"] = pd.DataFrame(columns=["Cell1", "Cell2", "Distance"])
-target_atac.uns["Spatial_Net"] = pd.DataFrame(columns=["Cell1", "Cell2", "Distance"])
+import torch
+from MultiGATE.MultiGATE import MultiGATE as MultiGATETrainer
 
-#MultiGATE.Cal_Spatial_Net(target_rna, rad_cutoff=40)
-MultiGATE.Stats_Spatial_Net(target_rna)
 
-#MultiGATE.Cal_Spatial_Net(target_atac, rad_cutoff=40)
-MultiGATE.Stats_Spatial_Net(target_atac)
+def build_knn_graph_as_spatial_net(adata, n_neighbors=15):
+    # Build a generic kNN cell graph for non-spatial data and store it in the
+    # format expected by MultiGATE.forward_MultiGATE (adata.uns['Spatial_Net']).
+    sc.pp.neighbors(adata, n_neighbors=n_neighbors)
+    conn = adata.obsp['connectivities'].tocoo()
+    mask = conn.row != conn.col
+    adata.uns['Spatial_Net'] = pd.DataFrame(
+        {
+            'Cell1': adata.obs_names[conn.row[mask]].to_numpy(),
+            'Cell2': adata.obs_names[conn.col[mask]].to_numpy(),
+            'Distance': np.zeros(int(mask.sum()), dtype=float),
+        }
+    )
 
+
+def build_zero_shot_target_trainer(source_trainer, target_spot_num):
+    # Rebuild MGATE with target N, load transferable weights, then force the
+    # dataset-sized gene-peak gating vectors to zero for prior-only GP attention.
+    target_trainer = MultiGATETrainer(
+        hidden_dims1=source_trainer.mgate.hidden_dims1,
+        hidden_dims2=source_trainer.mgate.hidden_dims2,
+        spot_num=target_spot_num,
+        temp=float(source_trainer.mgate.logit_scale.detach().cpu().item()),
+        n_epochs=1,
+        lr=source_trainer.lr,
+        gradient_clipping=source_trainer.gradient_clipping,
+        nonlinear=source_trainer.mgate.nonlinear,
+        weight_decay=source_trainer.mgate.weight_decay,
+        verbose=False,
+        random_seed=0,
+        config={'device': str(source_trainer.device)},
+    )
+
+    state_dict = {
+        k: v
+        for k, v in source_trainer.mgate.state_dict().items()
+        if k not in {'vgp0', 'vgp1'}
+    }
+    target_trainer.mgate.load_state_dict(state_dict, strict=False)
+
+    with torch.no_grad():
+        target_trainer.mgate.vgp0.zero_()
+        target_trainer.mgate.vgp1.zero_()
+
+    return target_trainer
+
+
+# Subset target to the same HVG feature space as the source model.
+# Note: If target is missing any of the source HVGs, forward_MultiGATE will
+# raise a dimension mismatch.
 target_rna = target_rna[:, target_rna.var['highly_variable']]
 target_atac = target_atac[:, target_atac.var['highly_variable']]
 
@@ -162,6 +208,14 @@ target_atac = target_atac[:, target_atac.var['highly_variable']]
 target_rna.uns['gene_peak_Net'] = source_rna.uns['gene_peak_Net']
 target_atac.uns['gene_peak_Net'] = source_rna.uns['gene_peak_Net']
 
+# Build a non-spatial kNN graph over target cells and store it as Spatial_Net.
+build_knn_graph_as_spatial_net(target_rna, n_neighbors=15)
+target_atac.uns['Spatial_Net'] = target_rna.uns['Spatial_Net']
+MultiGATE.Stats_Spatial_Net(target_rna)
+MultiGATE.Stats_Spatial_Net(target_atac)
+
+# Build a target-compatible trainer and disable data-adaptive GP attention.
+trainer_target = build_zero_shot_target_trainer(trainer, target_rna.n_obs)
 #%% forward pass
 # TMP - subsample target data to match source data
 #target_rna = target_rna[:len(source_rna)].copy()
@@ -170,7 +224,7 @@ target_atac.uns['gene_peak_Net'] = source_rna.uns['gene_peak_Net']
 target_rna, target_atac = MultiGATE.forward_MultiGATE(
     target_rna,
     target_atac,
-    trainer=trainer,
+    trainer=trainer_target,
     bp_width=400,
 )
 
