@@ -5,6 +5,13 @@ import socket
 import sys
 from pprint import pprint
 
+# Python 3.7 compatibility for muon/mudata (they use typing.Literal in newer versions)
+if sys.version_info < (3, 8):
+    import typing
+    from typing_extensions import Literal
+
+    typing.Literal = Literal
+
 # Ensure this script imports the local repo package, not site-packages.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
