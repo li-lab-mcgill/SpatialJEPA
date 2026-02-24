@@ -218,15 +218,18 @@ def Cal_gene_peak_Net_new(rna, atac, range=2000,
     peaks = genomics.Bed(atac.var.assign(name=atac.var_names))
     tss = genes.strand_specific_start_site()
     promoters = tss.expand(2000, 0)
-    dist_graph = genomics.window_graph(
-        promoters, peaks, range,
-        attr_fn=lambda l, r, d: { 
-            "dist": abs(d),
-            "weight": genomics.dist_power_decay(abs(d)),
-            "type": "dist"
-        }
-    )
-    dist_graph = nx.DiGraph(dist_graph)
+    try:
+        dist_graph = genomics.window_graph(
+            promoters, peaks, range,
+            attr_fn=lambda l, r, d: { 
+                "dist": abs(d),
+                "weight": genomics.dist_power_decay(abs(d)),
+                "type": "dist"
+            }
+        )
+        dist_graph = nx.DiGraph(dist_graph)
+    except NotImplementedError as exc:
+        raise RuntimeError("bedtools is required for Cal_gene_peak_Net_new. Install bedtools and ensure sortBed is on PATH.") from exc
     dist_graph.number_of_edges()
     dist = biadjacency_matrix(dist_graph, genes.index, peaks.index, weight="dist", dtype=np.float32).tocoo()
     df=pd.DataFrame({

@@ -1,88 +1,76 @@
 # Installation
 
-Follow these steps to install the MultiGATE package in a dedicated Conda environment. Please ensure you have Conda installed on your system before proceeding with these instructions.
+Follow these steps to install MultiGATE in a dedicated Conda environment.
 
 ```shell
-conda create -n MultiGATEenv  python=3.7 -y 
+conda create -n MultiGATEenv python=3.7 -y
 conda activate MultiGATEenv
-conda install tensorflow-gpu=1.15.0 cudatoolkit=10.0 cudnn=7.6.5 -y
-conda install scikit-learn  pandas scanpy jupyterlab tqdm matplotlib conda-forge::networkx bioconda::pybedtools  conda-forge::louvain -y
+
+# Required system tool for Cal_gene_peak_Net_new
+conda install -c bioconda bedtools -y
+
+# Core Python dependencies
+conda install scikit-learn pandas scanpy jupyterlab tqdm matplotlib -y
+conda install -c conda-forge networkx louvain -y
+conda install -c bioconda pybedtools -y
+
+# PyTorch (Python 3.7-compatible range)
+pip install "torch>=1.10.0,<1.14.0"
+
 export CFLAGS="-std=c99"
 pip install rpy2
 pip install MultiGATE
 ```
 
-> Installing MultiGATE in a pre-configured bioinformatics Conda environment via pip install MultiGATE should only take about one minute under normal circumstances.
-> If you can install MultiGATE following the above command you can just goto other tutorials to learn more about MultiGATE and skip the following detailed instructions for installation.
+> MultiGATE now uses a PyTorch backend by default. The original TensorFlow model class is still available as a legacy class.
 
 ## Detailed instructions
 
-### Installation Guide for MultiGATE Package
-
-Follow these steps to install the MultiGATE package in a dedicated Conda environment. Please ensure you have Conda installed on your system before proceeding with these instructions.
-
-1. **Create a Conda Environment**
-   Start by creating a new environment named `MultiGATEenv` with Python 3.7. This isolates the installation and avoids conflicts with existing packages.
+1. **Create a Conda environment**
 
    ```bash
    conda create -n MultiGATEenv python=3.7 -y
    ```
 
-2. **Activate the Environment**
-   Activate the newly created environment:
+2. **Activate the environment**
 
    ```bash
    conda activate MultiGATEenv
    ```
 
-3. **Install TensorFlow and CUDA Toolkit**
-   Install TensorFlow 1.15.0 along with the compatible CUDA toolkit and cuDNN library to enable GPU support. We strongly recommend you install the listed version of TensorFlow and CUDA toolkit and cudnn library.
+3. **Install `bedtools` (required)**
+
+   `Cal_gene_peak_Net_new` requires `bedtools` and `sortBed` to be available on `PATH`.
 
    ```bash
-   conda install tensorflow-gpu=1.15.0 cudatoolkit=10.0 cudnn=7.6.5 -y
+   conda install -c bioconda bedtools -y
    ```
 
-4. **Install Additional Dependencies**
-   Install the necessary Python packages including scikit-learn, pandas, scanpy for single-cell analysis, and other utilities.
+4. **Install Python dependencies**
 
    ```bash
    conda install scikit-learn pandas scanpy jupyterlab tqdm matplotlib -y
    conda install -c conda-forge networkx louvain -y
    conda install -c bioconda pybedtools -y
+   pip install "torch>=1.10.0,<1.14.0"
    ```
 
-5. **Install RPy2**
-   RPy2 is required for integrating R with Python. Note the use of `export CFLAGS="-std=c99"` to ensure compatibility with the C99 standard.
+5. **Install optional R bridge and MultiGATE**
 
    ```bash
    export CFLAGS="-std=c99"
    pip install rpy2
-   ```
-
-6. **Install MultiGATE**
-   Finally, install the MultiGATE package using pip. 
-
-   ```bash
    pip install MultiGATE
    ```
 
-7. **Verify Installation**
-   After installation, it's a good practice to verify that all components are installed correctly. You can do this by running a simple import test in Python.
+6. **Verify installation**
 
-   ```python
-   # Activate your Conda environment if not already activated
-   conda activate MultiGATEenv
-
-   # Test the installation
+   ```bash
    python -c "import MultiGATE; print('MultiGATE installed successfully')"
    ```
 
-### Troubleshooting
+## Troubleshooting
 
-If you encounter any errors during the installation, consider the following tips:
-
-- Ensure that your Conda environment is properly activated before installing any packages.
-- Check that the CUDA toolkit and cuDNN library versions are compatible with TensorFlow 1.15.0.
-- If pip installation fails, verify your internet connection and ensure that your Python environment is correctly configured to install packages.
-
-By following these detailed steps, you can set up the MultiGATE package and prepare for running your analyses. This setup provides a robust environment for computational studies in genomics and bioinformatics.
+- If `Cal_gene_peak_Net_new` fails with a `sortBed`/`bedtools` message, install `bedtools` and reopen the environment.
+- If PyTorch installation fails, verify your Python version is 3.7 and reinstall with the pinned range.
+- Ensure your Conda environment is activated before running installation commands.
