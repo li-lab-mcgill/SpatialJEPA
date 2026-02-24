@@ -162,9 +162,10 @@ target_atac = target_atac[:, target_atac.var['highly_variable']]
 target_rna.uns['gene_peak_Net'] = source_rna.uns['gene_peak_Net']
 target_atac.uns['gene_peak_Net'] = source_rna.uns['gene_peak_Net']
 
+#%% forward pass
 # TMP - subsample target data to match source data
-target_rna = target_rna[:len(source_rna)].copy()
-target_atac = target_atac[:len(source_atac)].copy()
+#target_rna = target_rna[:len(source_rna)].copy()
+#target_atac = target_atac[:len(source_atac)].copy()
 
 target_rna, target_atac = MultiGATE.forward_MultiGATE(
     target_rna,
