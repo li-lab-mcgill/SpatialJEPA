@@ -111,7 +111,13 @@ if num_epochs <= 0:
     raise ValueError("MULTIGATE_EPOCHS must be a positive integer.")
 
 print("Training epochs:", num_epochs)
-source_rna, source_atac = MultiGATE.train_MultiGATE(source_rna, source_atac, bp_width=400, n_epochs=num_epochs)
+source_rna, source_atac, trainer = MultiGATE.train_MultiGATE(
+    source_rna,
+    source_atac,
+    bp_width=400,
+    n_epochs=num_epochs,
+    return_trainer=True,
+)
 
 #%% clustering with Muon's WNN clustering
 sc.pp.neighbors(source_rna)
@@ -129,7 +135,7 @@ for ad in [source_rna, source_atac]:
     ad.obs['wnn'] = mdata.obs['leiden'].astype(int).astype('category')
     ad.obsm['X_umap'] = mdata.obsm['X_umap']
 
-#%% visualize results
+# visualize results
 plt.rcParams["figure.figsize"] = (7, 3)
 fig, axs = plt.subplots(1, 2)
 sc.pl.embedding(source_rna, basis="spatial", color="wnn", s=20, show=False, title='MultiGATE Spatial', ax=axs[0], legend_loc='None')
@@ -137,4 +143,57 @@ sc.pl.umap(source_rna, color="wnn", title='MultiGATE UMAP', ax=axs[1], size=20)
 plt.tight_layout()
 plt.show()
 
-# %%
+#%% forward pass with target data
+
+#target_rna.obsm["spatial"] = target_rna.obsm["spatial"][:, [1, 0]] * -1
+#target_atac.obsm["spatial"] = target_atac.obsm["spatial"][:, [1, 0]] * -1
+
+import pandas as pd
+target_rna.uns["Spatial_Net"] = pd.DataFrame(columns=["Cell1", "Cell2", "Distance"])
+target_atac.uns["Spatial_Net"] = pd.DataFrame(columns=["Cell1", "Cell2", "Distance"])
+
+#MultiGATE.Cal_Spatial_Net(target_rna, rad_cutoff=40)
+MultiGATE.Stats_Spatial_Net(target_rna)
+
+#MultiGATE.Cal_Spatial_Net(target_atac, rad_cutoff=40)
+MultiGATE.Stats_Spatial_Net(target_atac)
+
+target_rna = target_rna[:, target_rna.var['highly_variable']]
+target_atac = target_atac[:, target_atac.var['highly_variable']]
+
+# Reuse source gene-peak prior so target forward pass uses the same regulatory graph.
+target_rna.uns['gene_peak_Net'] = source_rna.uns['gene_peak_Net']
+target_atac.uns['gene_peak_Net'] = source_rna.uns['gene_peak_Net']
+
+target_rna, target_atac = MultiGATE.forward_MultiGATE(
+    target_rna[:len(source_rna)],
+    target_atac[:len(source_atac)],
+    trainer=trainer,
+    bp_width=400,
+)
+
+print("Target forward pass complete. Embedding shape:", target_rna.obsm["MultiGATE"].shape)
+
+#%% clustering with Muon's WNN clustering
+sc.pp.neighbors(target_rna, n_neighbors=100)
+sc.pp.neighbors(target_atac, n_neighbors=100)
+
+mdata = mu.MuData({"rna": target_rna, "atac": target_atac})
+mu.pp.neighbors(mdata)
+
+mu.tl.umap(mdata)
+sc.tl.leiden(mdata, resolution=1.5)
+
+# Replicate outputs of wnn_R: propagate cluster labels and UMAP coordinates
+# back to the individual AnnData objects so downstream code is unaffected.
+for ad in [target_rna, target_atac]:
+    ad.obs['wnn'] = mdata.obs['leiden'].astype(int).astype('category')
+    ad.obsm['X_umap'] = mdata.obsm['X_umap']
+
+# visualize results
+plt.rcParams["figure.figsize"] = (7, 3)
+fig, axs = plt.subplots(1, 2)
+sc.pl.embedding(source_rna, basis="spatial", color="wnn", s=20, show=False, title='MultiGATE Spatial', ax=axs[0], legend_loc='None')
+sc.pl.umap(source_rna, color="wnn", title='MultiGATE UMAP', ax=axs[1], size=20)
+plt.tight_layout()
+plt.show()
