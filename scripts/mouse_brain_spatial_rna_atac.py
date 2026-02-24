@@ -187,22 +187,7 @@ sc.pp.neighbors(target_atac, n_neighbors=10)
 mdata = mu.MuData({"rna": target_rna, "atac": target_atac})
 mu.pp.intersect_obs(mdata)
 
-## TMP - remove cells that don't have any neighbor in either modality
-import numpy as np
-lonely_cells = []
-for i1, mod1 in enumerate(mdata.mod):
-    neighbordistances = mdata.mod[mod1].obsp['distances']
-    nndistances = np.empty((neighbordistances.shape[0],), neighbordistances.dtype)
-    # neighborsdistances is a sparse matrix, we can either convert to dense, or loop
-    for i in range(neighbordistances.shape[0]):
-        nndist = neighbordistances[i, :].data
-        if nndist.size == 0:
-            lonely_cells.append(i)
-
-
-mdata = mdata[~mdata.obs_names.isin(mdata.obs_names[lonely_cells])]
 mu.pp.neighbors(mdata, n_neighbors=10)
-
 mu.tl.umap(mdata)
 sc.tl.leiden(mdata, resolution=1.5)
 
