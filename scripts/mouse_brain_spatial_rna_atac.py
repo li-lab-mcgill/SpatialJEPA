@@ -145,9 +145,6 @@ plt.show()
 
 #%% forward pass with target data
 
-#target_rna.obsm["spatial"] = target_rna.obsm["spatial"][:, [1, 0]] * -1
-#target_atac.obsm["spatial"] = target_atac.obsm["spatial"][:, [1, 0]] * -1
-
 import pandas as pd
 target_rna.uns["Spatial_Net"] = pd.DataFrame(columns=["Cell1", "Cell2", "Distance"])
 target_atac.uns["Spatial_Net"] = pd.DataFrame(columns=["Cell1", "Cell2", "Distance"])
@@ -165,9 +162,13 @@ target_atac = target_atac[:, target_atac.var['highly_variable']]
 target_rna.uns['gene_peak_Net'] = source_rna.uns['gene_peak_Net']
 target_atac.uns['gene_peak_Net'] = source_rna.uns['gene_peak_Net']
 
+# TMP - subsample target data to match source data
+target_rna = target_rna[:len(source_rna)].copy()
+target_atac = target_atac[:len(source_atac)].copy()
+
 target_rna, target_atac = MultiGATE.forward_MultiGATE(
-    target_rna[:len(source_rna)],
-    target_atac[:len(source_atac)],
+    target_rna,
+    target_atac,
     trainer=trainer,
     bp_width=400,
 )
@@ -175,11 +176,32 @@ target_rna, target_atac = MultiGATE.forward_MultiGATE(
 print("Target forward pass complete. Embedding shape:", target_rna.obsm["MultiGATE"].shape)
 
 #%% clustering with Muon's WNN clustering
-sc.pp.neighbors(target_rna, n_neighbors=100)
-sc.pp.neighbors(target_atac, n_neighbors=100)
+
+# TMP - filter cells that don't have at least 3 genes expressed
+sc.pp.filter_cells(target_rna, min_genes=3)
+sc.pp.filter_cells(target_atac, min_genes=3)
+
+sc.pp.neighbors(target_rna, n_neighbors=10)
+sc.pp.neighbors(target_atac, n_neighbors=10)
 
 mdata = mu.MuData({"rna": target_rna, "atac": target_atac})
-mu.pp.neighbors(mdata)
+mu.pp.intersect_obs(mdata)
+
+## TMP - remove cells that don't have any neighbor in either modality
+import numpy as np
+lonely_cells = []
+for i1, mod1 in enumerate(mdata.mod):
+    neighbordistances = mdata.mod[mod1].obsp['distances']
+    nndistances = np.empty((neighbordistances.shape[0],), neighbordistances.dtype)
+    # neighborsdistances is a sparse matrix, we can either convert to dense, or loop
+    for i in range(neighbordistances.shape[0]):
+        nndist = neighbordistances[i, :].data
+        if nndist.size == 0:
+            lonely_cells.append(i)
+
+
+mdata = mdata[~mdata.obs_names.isin(mdata.obs_names[lonely_cells])]
+mu.pp.neighbors(mdata, n_neighbors=10)
 
 mu.tl.umap(mdata)
 sc.tl.leiden(mdata, resolution=1.5)
@@ -192,8 +214,7 @@ for ad in [target_rna, target_atac]:
 
 # visualize results
 plt.rcParams["figure.figsize"] = (7, 3)
-fig, axs = plt.subplots(1, 2)
-sc.pl.embedding(source_rna, basis="spatial", color="wnn", s=20, show=False, title='MultiGATE Spatial', ax=axs[0], legend_loc='None')
-sc.pl.umap(source_rna, color="wnn", title='MultiGATE UMAP', ax=axs[1], size=20)
+fig, axs = plt.subplots(1, 1)
+sc.pl.umap(target_rna, color="wnn", title='MultiGATE UMAP', ax=axs, size=20)
 plt.tight_layout()
 plt.show()
