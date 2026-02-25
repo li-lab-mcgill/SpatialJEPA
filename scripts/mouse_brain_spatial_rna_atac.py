@@ -39,6 +39,7 @@ import scanpy as sc
 import scipy.sparse as sp
 import torch
 import torch.nn.functional as F
+from anndata import AnnData
 from dotenv import dotenv_values, load_dotenv
 from sklearn.preprocessing import Normalizer
 
@@ -74,6 +75,12 @@ def parse_args(notebook: bool = False):
         type=float,
         default=1.0,
         help="Scale factor for stage-2 KD objective.",
+    )
+    parser.add_argument(
+        "--log-mudata-umaps",
+        action="store_true",
+        default=False,
+        help="If set, log source/target MuData UMAP artifacts in addition to concat AnnData UMAPs.",
     )
     if notebook:
         return parser.parse_known_args()[0]
@@ -277,12 +284,172 @@ def log_umap_to_mlflow(mdata, artifact_path, title, color_key="wnn", size=20):
     umap_fig = None
     try:
         umap_fig, umap_ax = plt.subplots(figsize=(7, 5))
-        sc.pl.umap(mdata, color=color_key, title=title, ax=umap_ax, size=size, show=False)
+        plot_fn = mu.pl.umap if isinstance(mdata, mu.MuData) else sc.pl.umap
+        plot_fn(mdata, color=color_key, title=title, ax=umap_ax, size=size, show=False)
         umap_fig.tight_layout()
         mlflow.log_figure(umap_fig, artifact_path)
     finally:
         if umap_fig is not None:
             plt.close(umap_fig)
+
+
+def build_concat_adata_for_umap(rna_adata, atac_adata, embedding_key="MultiGATE"):
+    if embedding_key not in rna_adata.obsm or embedding_key not in atac_adata.obsm:
+        raise KeyError(
+            "Missing '{}' in one or both modalities when building concat AnnData.".format(embedding_key)
+        )
+
+    rna_obs = rna_adata.obs.copy()
+    atac_obs = atac_adata.obs.copy()
+    rna_obs["modality"] = "rna"
+    atac_obs["modality"] = "atac"
+    rna_obs.index = rna_obs.index.astype(str) + "_rna"
+    atac_obs.index = atac_obs.index.astype(str) + "_atac"
+
+    concat_adata = AnnData(
+        X=np.concatenate(
+            [
+                rna_adata.obsm[embedding_key],
+                atac_adata.obsm[embedding_key],
+            ],
+            axis=0,
+        ),
+        obs=pd.concat([rna_obs, atac_obs], axis=0),
+    )
+    return concat_adata
+
+
+def compute_concat_umap(concat_adata, n_neighbors=10, resolution=1.5):
+    sc.pp.neighbors(concat_adata, n_neighbors=n_neighbors)
+    sc.tl.umap(concat_adata)
+    sc.tl.leiden(concat_adata, resolution=resolution)
+
+
+def log_umap_panel_to_mlflow(adata, artifact_path, colors, titles, size=20):
+    if adata.n_obs < 3:
+        warnings.warn("Skipping UMAP artifact '{}' because n_obs < 3.".format(artifact_path))
+        return
+    if "X_umap" not in adata.obsm:
+        warnings.warn("Skipping UMAP artifact '{}' because X_umap is missing.".format(artifact_path))
+        return
+
+    fig = None
+    try:
+        n_panels = len(colors)
+        fig, axs = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5))
+        if n_panels == 1:
+            axs = [axs]
+        for idx, (color_key, title) in enumerate(zip(colors, titles)):
+            sc.pl.umap(
+                adata,
+                color=color_key,
+                title=title,
+                ax=axs[idx],
+                size=size,
+                show=False,
+            )
+        fig.tight_layout()
+        mlflow.log_figure(fig, artifact_path)
+    finally:
+        if fig is not None:
+            plt.close(fig)
+
+
+def build_mudata_with_umap(rna_adata, atac_adata, embedding_key="MultiGATE", n_neighbors=10, resolution=1.5):
+    if embedding_key not in rna_adata.obsm or embedding_key not in atac_adata.obsm:
+        raise KeyError(
+            "Missing '{}' in one or both modalities when building MuData.".format(embedding_key)
+        )
+
+    rna_eval = rna_adata.copy()
+    atac_eval = atac_adata.copy()
+    sc.pp.neighbors(rna_eval, use_rep=embedding_key, n_neighbors=n_neighbors)
+    sc.pp.neighbors(atac_eval, use_rep=embedding_key, n_neighbors=n_neighbors)
+
+    mdata = mu.MuData({"rna": rna_eval, "atac": atac_eval})
+    mu.pp.intersect_obs(mdata)
+    mu.pp.neighbors(mdata, n_neighbors=n_neighbors)
+    mu.tl.umap(mdata)
+    sc.tl.leiden(mdata, resolution=resolution)
+    mdata.obs["wnn"] = mdata.obs["leiden"].astype(int).astype("category")
+    return mdata
+
+
+def log_stage_umap_artifacts(
+    source_rna,
+    source_atac,
+    target_rna,
+    target_atac,
+    stage_label,
+    log_mudata_umaps=False,
+):
+    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
+    target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
+
+    compute_concat_umap(source_concat_adata, n_neighbors=10, resolution=1.5)
+    compute_concat_umap(target_concat_adata, n_neighbors=10, resolution=1.5)
+
+    log_umap_panel_to_mlflow(
+        source_concat_adata,
+        artifact_path="umap/{}/source_concat_adata_umap.png".format(stage_label),
+        colors=["modality", "leiden"],
+        titles=[
+            "Source Concat Modality ({})".format(stage_label),
+            "Source Concat Leiden ({})".format(stage_label),
+        ],
+        size=20,
+    )
+    log_umap_panel_to_mlflow(
+        target_concat_adata,
+        artifact_path="umap/{}/target_concat_adata_umap.png".format(stage_label),
+        colors=["modality", "leiden"],
+        titles=[
+            "Target Concat Modality ({})".format(stage_label),
+            "Target Concat Leiden ({})".format(stage_label),
+        ],
+        size=20,
+    )
+
+    output = {
+        "source_concat_adata": source_concat_adata,
+        "target_concat_adata": target_concat_adata,
+    }
+
+    if log_mudata_umaps:
+        source_mdata = build_mudata_with_umap(
+            source_rna,
+            source_atac,
+            embedding_key="MultiGATE",
+            n_neighbors=10,
+            resolution=1.5,
+        )
+        target_mdata = build_mudata_with_umap(
+            target_rna,
+            target_atac,
+            embedding_key="MultiGATE",
+            n_neighbors=10,
+            resolution=1.5,
+        )
+
+        log_umap_to_mlflow(
+            source_mdata,
+            artifact_path="umap/{}/source_mudata_umap.png".format(stage_label),
+            title="Source MuData UMAP ({})".format(stage_label),
+            color_key="wnn",
+            size=20,
+        )
+        log_umap_to_mlflow(
+            target_mdata,
+            artifact_path="umap/{}/target_mudata_umap.png".format(stage_label),
+            title="Target MuData UMAP ({})".format(stage_label),
+            color_key="wnn",
+            size=20,
+        )
+
+        output["source_mdata"] = source_mdata
+        output["target_mdata"] = target_mdata
+
+    return output
 
 
 def require_ot_backend():
@@ -663,7 +830,7 @@ def main():
         )
 
     #%% Build source trainer
-    num_epochs = int(os.getenv("MULTIGATE_EPOCHS", "100"))
+    num_epochs = int(os.getenv("MULTIGATE_EPOCHS", "10"))
     if num_epochs <= 0:
         raise ValueError("MULTIGATE_EPOCHS must be a positive integer.")
 
@@ -692,15 +859,13 @@ def main():
 
     #%% MLflow setup
     experiment_id = setup_mlflow()
-    eval_every = 100
+    eval_every = 10
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("Training epochs:", num_epochs)
     print("Target paired cells after subsampling:", target_rna.n_obs)
 
-    parent_run_id = None
     with mlflow.start_run(run_name=run_name):
-        parent_run_id = mlflow.active_run().info.run_id
         mlflow.log_param("mlflow_experiment_id", experiment_id)
         mlflow.log_param("n_epochs", num_epochs)
         mlflow.log_param("stage2_epochs", args.stage2_epochs)
@@ -708,6 +873,7 @@ def main():
         mlflow.log_param("bp_width", bp_width)
         mlflow.log_param("target_subsample_n", args.target_subsample_n)
         mlflow.log_param("target_subsample_seed", args.target_subsample_seed)
+        mlflow.log_param("log_mudata_umaps", args.log_mudata_umaps)
         mlflow.log_param("target_effective_n", int(target_rna.n_obs))
         mlflow.log_param("eval_every", eval_every)
         mlflow.log_param("source_cells", int(source_rna.n_obs))
@@ -779,6 +945,18 @@ def main():
             except Exception as exc:
                 warnings.warn("Target metric computation failed at epoch {}: {}".format(epoch, exc))
 
+        try:
+            log_stage_umap_artifacts(
+                source_rna=source_rna,
+                source_atac=source_atac,
+                target_rna=target_rna,
+                target_atac=target_atac,
+                stage_label="stage1",
+                log_mudata_umaps=args.log_mudata_umaps,
+            )
+        except Exception as exc:
+            warnings.warn("Failed to generate/log stage-1 UMAP artifacts: {}".format(exc))
+
         if args.stage2_epochs > 0:
             print(
                 "[Stage2 KD] Starting target distillation for {} epochs (lambda_kd={})".format(
@@ -797,135 +975,19 @@ def main():
                 stage2_epochs=args.stage2_epochs,
                 lambda_kd=args.lambda_kd,
             )
+            try:
+                log_stage_umap_artifacts(
+                    source_rna=source_rna,
+                    source_atac=source_atac,
+                    target_rna=target_rna,
+                    target_atac=target_atac,
+                    stage_label="stage2",
+                    log_mudata_umaps=args.log_mudata_umaps,
+                )
+            except Exception as exc:
+                warnings.warn("Failed to generate/log stage-2 UMAP artifacts: {}".format(exc))
         else:
             print("[Stage2 KD] Skipped because --stage2-epochs is 0.")
-
-    #%% clustering with Muon's WNN clustering (source)
-    sc.pp.neighbors(source_rna)
-    sc.pp.neighbors(source_atac)
-
-    source_mdata = mu.MuData({"rna": source_rna, "atac": source_atac})
-    mu.pp.neighbors(source_mdata)
-
-    mu.tl.umap(source_mdata)
-    sc.tl.leiden(source_mdata, resolution=1.5)
-
-    # Replicate outputs of wnn_R: propagate cluster labels and UMAP coordinates
-    # back to the individual AnnData objects so downstream code is unaffected.
-    for ad in [source_rna, source_atac]:
-        ad.obs["wnn"] = source_mdata.obs["leiden"].astype(int).astype("category")
-        ad.obsm["X_umap"] = source_mdata.obsm["X_umap"]
-
-    # visualize source results
-    '''
-    plt.rcParams["figure.figsize"] = (7, 3)
-    fig, axs = plt.subplots(1, 2)
-    sc.pl.embedding(source_rna, basis="spatial", color="wnn", s=20, show=False, title="MultiGATE Spatial", ax=axs[0], legend_loc="None")
-    sc.pl.umap(source_rna, color="wnn", title="MultiGATE UMAP", ax=axs[1], size=20)
-    plt.tight_layout()
-    plt.show()
-
-    print("Target forward pass complete. Embedding shape:", target_rna.obsm["MultiGATE"].shape)
-    '''
-
-    #%% clustering with Muon's WNN clustering (target)
-    sc.pp.filter_cells(target_rna, min_genes=3)
-    sc.pp.filter_cells(target_atac, min_genes=3)
-
-    sc.pp.neighbors(target_rna, n_neighbors=10)
-    sc.pp.neighbors(target_atac, n_neighbors=10)
-
-    target_mdata = mu.MuData({"rna": target_rna, "atac": target_atac})
-    mu.pp.intersect_obs(target_mdata)
-
-    mu.pp.neighbors(target_mdata, n_neighbors=10)
-    mu.tl.umap(target_mdata)
-    sc.tl.leiden(target_mdata, resolution=1.5)
-
-    # Replicate outputs of wnn_R: propagate cluster labels and UMAP coordinates
-    # back to the individual AnnData objects so downstream code is unaffected.
-    for ad in [target_rna, target_atac]:
-        ad.obs["wnn"] = target_mdata.obs["leiden"].astype(int).astype("category")
-        ad.obsm["X_umap"] = target_mdata.obsm["X_umap"]
-
-    # visualize target results
-    '''
-    plt.rcParams["figure.figsize"] = (7, 3)
-    fig, axs = plt.subplots(1, 1)
-    sc.pl.umap(target_rna, color="wnn", title="MultiGATE UMAP", ax=axs, size=20)
-    plt.tight_layout()
-    plt.show()
-    '''
-
-    #%% create and plot concat source & target data
-    from anndata import AnnData
-
-    source_concat_adata = AnnData(
-        X=np.concatenate([
-            source_rna.obsm["MultiGATE"],
-            source_atac.obsm["MultiGATE"]
-            ], axis=0),
-        obs=pd.concat([
-            source_rna.obs.assign(modality="rna"),
-            source_atac.obs.assign(modality="atac")
-            ], axis=0),
-        obsm={
-            "X_pca": np.concatenate([
-                source_rna.obsm["X_pca"],
-                source_atac.obsm["X_pca"]
-                ], axis=0),
-        },
-    )
-
-    sc.pp.neighbors(source_concat_adata, n_neighbors=10)
-    sc.tl.umap(source_concat_adata)
-    sc.tl.leiden(source_concat_adata, resolution=1.5)
-
-    sc.pl.umap(source_concat_adata, color=["modality", "leiden"], size=20)
-
-    target_concat_adata = AnnData(
-        X=np.concatenate([
-            target_rna.obsm["MultiGATE"],
-            target_atac.obsm["MultiGATE"]
-            ], axis=0),
-        obs=pd.concat([
-            target_rna.obs.assign(modality="rna"),
-            target_atac.obs.assign(modality="atac")
-            ], axis=0),
-        obsm={
-            "X_pca": np.concatenate([
-                target_rna.obsm["X_pca"],
-                target_atac.obsm["X_pca"]
-                ], axis=0),
-        },
-    )
-
-    sc.pp.neighbors(target_concat_adata, n_neighbors=10)
-    sc.tl.umap(target_concat_adata)
-    sc.tl.leiden(target_concat_adata, resolution=1.5)
-
-    sc.pl.umap(target_concat_adata, color=["modality", "leiden"], size=20)
-
-    #%% Log UMAPs to MLflow
-    if parent_run_id is not None:
-        try:
-            with mlflow.start_run(run_id=parent_run_id):
-                log_umap_to_mlflow(
-                    source_mdata,
-                    artifact_path="umap/source_data_umap_stage2.png",
-                    title="Source Data UMAP",
-                    color_key="wnn",
-                    size=20,
-                )
-                log_umap_to_mlflow(
-                    target_mdata,
-                    artifact_path="umap/target_data_umap_stage2.png",
-                    title="Target Data UMAP",
-                    color_key="wnn",
-                    size=20,
-                )
-        except Exception as exc:
-            warnings.warn("Failed to generate/log source/target UMAP artifacts to MLflow: {}".format(exc))
 
 #%%
 if __name__ == "__main__":
