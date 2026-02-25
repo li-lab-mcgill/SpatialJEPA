@@ -42,6 +42,7 @@ import torch.nn.functional as F
 from anndata import AnnData
 from dotenv import dotenv_values, load_dotenv
 from sklearn.preprocessing import Normalizer
+from tqdm import tqdm
 
 import MultiGATE
 from MultiGATE.MultiGATE import MultiGATE as MultiGATETrainer
@@ -55,7 +56,7 @@ def parse_args(notebook: bool = False):
     parser.add_argument(
         "--target-subsample-n",
         type=int,
-        default=5000,
+        default=1000,
         help="Maximum number of paired target cells to keep for live evaluation.",
     )
     parser.add_argument(
@@ -372,7 +373,7 @@ def compute_scib_metrics_for_domain(
             clisi_knn=False,
         ),
         batch_correction_metrics=BatchCorrection(
-            bras=True,
+            bras=False,
             ilisi_knn=True,
             kbet_per_label=False,
             graph_connectivity=False,
@@ -729,7 +730,8 @@ def run_stage2_distillation(
         target_scib_label_mode_logged = False
         target_scib_effective_label_key_logged = False
 
-        for epoch in range(1, stage2_epochs + 1):
+        pbar = tqdm(range(1, stage2_epochs + 1), desc="Stage 2 distillation", unit="epoch")
+        for epoch in pbar:
             student_trainer.mgate.train()
             student_trainer.optimizer.zero_grad()
 
@@ -761,6 +763,9 @@ def run_stage2_distillation(
             mlflow.log_metric("stage2_kd_ot_clip_loss", float(kd_ot_loss.detach().cpu().item()), step=epoch)
             mlflow.log_metric("stage2_clip_logits_parity_absdiff", float(clip_parity_absdiff), step=epoch)
 
+            loss_val = float(distill_loss.detach().cpu().item())
+            pbar.set_postfix({"distill_loss": "{:.4f}".format(loss_val)})
+
             set_multigate_embeddings(
                 target_rna,
                 target_atac,
@@ -769,30 +774,24 @@ def run_stage2_distillation(
                 key_added="MultiGATE",
             )
 
-            try:
-                target_scib_metrics = compute_scib_metrics_for_domain(
-                    rna_adata=target_rna,
-                    atac_adata=target_atac,
-                    domain_name="target",
-                    label_key=target_label_key,
-                    scib_n_jobs=scib_n_jobs,
+            # compute and log scib metrics for target data
+            target_scib_metrics = compute_scib_metrics_for_domain(
+                rna_adata=target_rna,
+                atac_adata=target_atac,
+                domain_name="target",
+                label_key=target_label_key,
+                scib_n_jobs=scib_n_jobs,
+            )
+            log_scib_metrics(prefix="stage2_target", metrics=target_scib_metrics, step=epoch)
+            if not target_scib_label_mode_logged:
+                mlflow.log_param("stage2_target_scib_label_mode", target_scib_metrics["label_mode"])
+                target_scib_label_mode_logged = True
+            if not target_scib_effective_label_key_logged:
+                mlflow.log_param(
+                    "stage2_target_scib_effective_label_key",
+                    target_scib_metrics["effective_label_key"],
                 )
-                log_scib_metrics(prefix="stage2_target", metrics=target_scib_metrics, step=epoch)
-                if not target_scib_label_mode_logged:
-                    mlflow.log_param("stage2_target_scib_label_mode", target_scib_metrics["label_mode"])
-                    target_scib_label_mode_logged = True
-                if not target_scib_effective_label_key_logged:
-                    mlflow.log_param(
-                        "stage2_target_scib_effective_label_key",
-                        target_scib_metrics["effective_label_key"],
-                    )
-                    target_scib_effective_label_key_logged = True
-            except Exception as exc:
-                warnings.warn(
-                    "scib metric computation failed for domain=target stage=stage2 epoch={}: {}".format(
-                        epoch, exc
-                    )
-                )
+                target_scib_effective_label_key_logged = True
 
     final_target_embeddings = student_trainer.infer(
         target_graph_tf,
