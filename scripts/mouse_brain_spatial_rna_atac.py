@@ -38,6 +38,7 @@ import pandas as pd
 import scanpy as sc
 import scipy.sparse as sp
 import torch
+import torch.nn.functional as F
 from dotenv import dotenv_values, load_dotenv
 from sklearn.preprocessing import Normalizer
 
@@ -61,6 +62,18 @@ def parse_args(notebook: bool = False):
         type=int,
         default=0,
         help="Random seed used when subsampling target cells.",
+    )
+    parser.add_argument(
+        "--stage2-epochs",
+        type=int,
+        default=100,
+        help="Number of teacher-student distillation epochs on target data (stage 2).",
+    )
+    parser.add_argument(
+        "--lambda-kd",
+        type=float,
+        default=1.0,
+        help="Scale factor for stage-2 KD objective.",
     )
     if notebook:
         return parser.parse_known_args()[0]
@@ -253,6 +266,193 @@ def compute_morans_i_mean(adata, rep_key="MultiGATE", neighbors_key="eval_graph"
     return float(np.nanmean(values))
 
 
+def require_ot_backend():
+    try:
+        from ot import emd
+    except Exception as exc:
+        raise ImportError(
+            "Stage-2 KD requires POT (`ot`). Install it in MultiGATEenv, e.g. "
+            "`pip install POT` or `conda install -c conda-forge pot`."
+        ) from exc
+    return emd
+
+
+def compute_clip_logits(clip_rna, clip_atac, logit_scale):
+    return torch.matmul(clip_rna, clip_atac.transpose(0, 1)) * torch.exp(logit_scale)
+
+
+def compute_clip_loss_from_logits(logits):
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    loss_rna = F.cross_entropy(logits, labels, reduction="none")
+    loss_atac = F.cross_entropy(logits.transpose(0, 1), labels, reduction="none")
+    return ((loss_rna + loss_atac) / 2.0).mean()
+
+
+def compute_kd_kl_loss(student_logits, teacher_logits):
+    kd_cols = F.kl_div(
+        F.log_softmax(student_logits, dim=1),
+        F.log_softmax(teacher_logits, dim=1),
+        reduction="batchmean",
+        log_target=True,
+    )
+    kd_rows = F.kl_div(
+        F.log_softmax(student_logits, dim=0),
+        F.log_softmax(teacher_logits, dim=0),
+        reduction="batchmean",
+        log_target=True,
+    )
+    return 0.5 * (kd_cols + kd_rows)
+
+
+def compute_ot_clip_loss(student_logits, teacher_logits, emd):
+    one = torch.tensor(1.0, device=teacher_logits.device, dtype=teacher_logits.dtype)
+    teacher_cost = 1 - (teacher_logits / torch.exp(1 / one))
+
+    teacher_cost_np = teacher_cost.detach().cpu().numpy()
+    plan = emd(a=[], b=[], M=teacher_cost_np)
+    plan_t = emd(a=[], b=[], M=teacher_cost_np.T)
+
+    plan = torch.as_tensor(plan, device=student_logits.device, dtype=student_logits.dtype)
+    plan_t = torch.as_tensor(plan_t, device=student_logits.device, dtype=student_logits.dtype)
+
+    labels = torch.argmax(plan, dim=1)
+    labels_t = torch.argmax(plan_t, dim=1)
+
+    ot_clip_loss = F.cross_entropy(student_logits, labels, reduction="none")
+    ot_clip_loss_t = F.cross_entropy(student_logits.transpose(0, 1), labels_t, reduction="none")
+    return 0.5 * (ot_clip_loss.mean() + ot_clip_loss_t.mean())
+
+
+def run_stage2_distillation(
+    source_trainer,
+    target_rna,
+    target_atac,
+    target_graph_tf,
+    target_gp_tf,
+    target_x1,
+    target_x2,
+    stage2_epochs,
+    lambda_kd,
+):
+    if stage2_epochs <= 0:
+        return None
+
+    emd = require_ot_backend()
+
+    teacher_trainer = build_zero_shot_target_trainer(source_trainer, target_rna.n_obs)
+    teacher_model = teacher_trainer.mgate
+    teacher_model.eval()
+    for teacher_param in teacher_model.parameters():
+        teacher_param.requires_grad = False
+
+    student_trainer = MultiGATETrainer(
+        hidden_dims1=source_trainer.mgate.hidden_dims1,
+        hidden_dims2=source_trainer.mgate.hidden_dims2,
+        spot_num=target_rna.n_obs,
+        temp=float(source_trainer.mgate.logit_scale.detach().cpu().item()),
+        n_epochs=stage2_epochs,
+        lr=source_trainer.lr,
+        gradient_clipping=source_trainer.gradient_clipping,
+        nonlinear=source_trainer.mgate.nonlinear,
+        weight_decay=source_trainer.mgate.weight_decay,
+        verbose=False,
+        random_seed=2021,
+        config={"device": str(source_trainer.device)},
+    )
+
+    target_a_t, target_prune_t, target_gp_t, target_x1_t, target_x2_t = student_trainer._prepare_inputs(
+        target_graph_tf,
+        target_graph_tf,
+        target_gp_tf,
+        target_x1,
+        target_x2,
+    )
+
+    parent_run = mlflow.active_run()
+    parent_run_name = None
+    if parent_run is not None:
+        parent_run_name = parent_run.data.tags.get("mlflow.runName")
+    stage2_run_name = "stage2_distillation" if not parent_run_name else "{}_stage2".format(parent_run_name)
+
+    with mlflow.start_run(run_name=stage2_run_name, nested=True):
+        mlflow.set_tag("training_stage", "stage2_distillation")
+        mlflow.set_tag("teacher_student_distillation", "true")
+        mlflow.log_param("stage2_epochs", stage2_epochs)
+        mlflow.log_param("lambda_kd", lambda_kd)
+        mlflow.log_param("kd_mix_kl", 0.1)
+        mlflow.log_param("kd_mix_ot", 0.9)
+        mlflow.log_param("student_init", "random")
+        mlflow.log_param("teacher_init", "source_to_target_zero_shot_vgp0")
+
+        for epoch in range(1, stage2_epochs + 1):
+            student_trainer.mgate.train()
+            student_trainer.optimizer.zero_grad()
+
+            student_outputs = student_trainer.mgate(target_a_t, target_prune_t, target_gp_t, target_x1_t, target_x2_t)
+            with torch.no_grad():
+                teacher_outputs = teacher_model(target_a_t, target_prune_t, target_gp_t, target_x1_t, target_x2_t)
+
+            student_clip_rna, student_clip_atac = student_outputs[5], student_outputs[6]
+            teacher_clip_rna, teacher_clip_atac = teacher_outputs[5], teacher_outputs[6]
+
+            student_logits = compute_clip_logits(student_clip_rna, student_clip_atac, student_trainer.mgate.logit_scale)
+            teacher_logits = compute_clip_logits(teacher_clip_rna, teacher_clip_atac, teacher_model.logit_scale)
+
+            kd_kl_loss = compute_kd_kl_loss(student_logits, teacher_logits)
+            kd_ot_loss = compute_ot_clip_loss(student_logits, teacher_logits, emd=emd)
+            distill_loss = lambda_kd * (0.1 * kd_kl_loss + 0.9 * kd_ot_loss)
+
+            distill_loss.backward()
+            torch.nn.utils.clip_grad_norm_(student_trainer.mgate.parameters(), student_trainer.gradient_clipping)
+            student_trainer.optimizer.step()
+
+            model_clip_loss = student_outputs[4]
+            reconstructed_clip_loss = compute_clip_loss_from_logits(student_logits)
+            clip_parity_absdiff = torch.abs(model_clip_loss - reconstructed_clip_loss).detach().cpu().item()
+
+            mlflow.log_metric("stage2_distill_loss", float(distill_loss.detach().cpu().item()), step=epoch)
+            mlflow.log_metric("stage2_kd_kl_loss", float(kd_kl_loss.detach().cpu().item()), step=epoch)
+            mlflow.log_metric("stage2_kd_ot_clip_loss", float(kd_ot_loss.detach().cpu().item()), step=epoch)
+            mlflow.log_metric("stage2_clip_logits_parity_absdiff", float(clip_parity_absdiff), step=epoch)
+
+            set_multigate_embeddings(
+                target_rna,
+                target_atac,
+                student_clip_rna.detach().cpu().numpy(),
+                student_clip_atac.detach().cpu().numpy(),
+                key_added="MultiGATE",
+            )
+
+            try:
+                target_morans = compute_morans_i_mean(
+                    target_rna,
+                    rep_key="MultiGATE",
+                    neighbors_key="target_stage2_eval",
+                    n_neighbors=15,
+                )
+                mlflow.log_metric("stage2_target_morans_i_mean", target_morans, step=epoch)
+                mlflow.log_metric("stage2_target_modularity_placeholder", target_morans, step=epoch)
+            except Exception as exc:
+                warnings.warn("Stage-2 target metric computation failed at epoch {}: {}".format(epoch, exc))
+
+    final_target_embeddings = student_trainer.infer(
+        target_graph_tf,
+        target_graph_tf,
+        target_gp_tf,
+        target_x1,
+        target_x2,
+    )
+    set_multigate_embeddings(
+        target_rna,
+        target_atac,
+        final_target_embeddings[0],
+        final_target_embeddings[1],
+        key_added="MultiGATE",
+    )
+
+    return student_trainer
+
+
 def setup_mlflow():
     # Default to a clean tracking location under BAKLAVA_base so we don't
     # accidentally write into other repos' local `mlruns/` directories.
@@ -314,10 +514,15 @@ def is_notebook():
 
 #%%
 def main():
+
     NOTEBOOK = is_notebook()
     args = parse_args(notebook=NOTEBOOK)
     if args.target_subsample_n <= 0:
         raise ValueError("--target-subsample-n must be a positive integer.")
+    if args.stage2_epochs < 0:
+        raise ValueError("--stage2-epochs must be a non-negative integer.")
+    if args.lambda_kd < 0:
+        raise ValueError("--lambda-kd must be non-negative.")
 
     #%% load env variables from .env file
     load_dotenv(dotenv_path="/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env")
@@ -477,6 +682,8 @@ def main():
     with mlflow.start_run(run_name=run_name):
         mlflow.log_param("mlflow_experiment_id", experiment_id)
         mlflow.log_param("n_epochs", num_epochs)
+        mlflow.log_param("stage2_epochs", args.stage2_epochs)
+        mlflow.log_param("lambda_kd", args.lambda_kd)
         mlflow.log_param("bp_width", bp_width)
         mlflow.log_param("target_subsample_n", args.target_subsample_n)
         mlflow.log_param("target_subsample_seed", args.target_subsample_seed)
@@ -550,6 +757,27 @@ def main():
                 mlflow.log_metric("target_modularity_placeholder", target_morans, step=epoch)
             except Exception as exc:
                 warnings.warn("Target metric computation failed at epoch {}: {}".format(epoch, exc))
+
+        if args.stage2_epochs > 0:
+            print(
+                "[Stage2 KD] Starting target distillation for {} epochs (lambda_kd={})".format(
+                    args.stage2_epochs,
+                    args.lambda_kd,
+                )
+            )
+            run_stage2_distillation(
+                source_trainer=trainer,
+                target_rna=target_rna,
+                target_atac=target_atac,
+                target_graph_tf=target_graph_tf,
+                target_gp_tf=target_gp_tf,
+                target_x1=target_x1,
+                target_x2=target_x2,
+                stage2_epochs=args.stage2_epochs,
+                lambda_kd=args.lambda_kd,
+            )
+        else:
+            print("[Stage2 KD] Skipped because --stage2-epochs is 0.")
 
     #%% clustering with Muon's WNN clustering (source)
     sc.pp.neighbors(source_rna)
