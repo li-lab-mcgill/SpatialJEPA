@@ -266,18 +266,18 @@ def compute_morans_i_mean(adata, rep_key="MultiGATE", neighbors_key="eval_graph"
     return float(np.nanmean(values))
 
 
-def log_umap_to_mlflow(adata, artifact_path, title, color_key="wnn", size=20):
-    if adata.n_obs < 3:
+def log_umap_to_mlflow(mdata, artifact_path, title, color_key="wnn", size=20):
+    if mdata.n_obs < 3:
         warnings.warn("Skipping UMAP artifact '{}' because n_obs < 3.".format(artifact_path))
         return
-    if "X_umap" not in adata.obsm:
+    if "X_umap" not in mdata.obsm:
         warnings.warn("Skipping UMAP artifact '{}' because X_umap is missing.".format(artifact_path))
         return
 
     umap_fig = None
     try:
         umap_fig, umap_ax = plt.subplots(figsize=(7, 5))
-        sc.pl.umap(adata, color=color_key, title=title, ax=umap_ax, size=size, show=False)
+        sc.pl.umap(mdata, color=color_key, title=title, ax=umap_ax, size=size, show=False)
         umap_fig.tight_layout()
         mlflow.log_figure(umap_fig, artifact_path)
     finally:
@@ -663,7 +663,7 @@ def main():
         )
 
     #%% Build source trainer
-    num_epochs = int(os.getenv("MULTIGATE_EPOCHS", "3000"))
+    num_epochs = int(os.getenv("MULTIGATE_EPOCHS", "100"))
     if num_epochs <= 0:
         raise ValueError("MULTIGATE_EPOCHS must be a positive integer.")
 
@@ -804,19 +804,20 @@ def main():
     sc.pp.neighbors(source_rna)
     sc.pp.neighbors(source_atac)
 
-    mdata = mu.MuData({"rna": source_rna, "atac": source_atac})
-    mu.pp.neighbors(mdata)
+    source_mdata = mu.MuData({"rna": source_rna, "atac": source_atac})
+    mu.pp.neighbors(source_mdata)
 
-    mu.tl.umap(mdata)
-    sc.tl.leiden(mdata, resolution=1.5)
+    mu.tl.umap(source_mdata)
+    sc.tl.leiden(source_mdata, resolution=1.5)
 
     # Replicate outputs of wnn_R: propagate cluster labels and UMAP coordinates
     # back to the individual AnnData objects so downstream code is unaffected.
     for ad in [source_rna, source_atac]:
-        ad.obs["wnn"] = mdata.obs["leiden"].astype(int).astype("category")
-        ad.obsm["X_umap"] = mdata.obsm["X_umap"]
+        ad.obs["wnn"] = source_mdata.obs["leiden"].astype(int).astype("category")
+        ad.obsm["X_umap"] = source_mdata.obsm["X_umap"]
 
     # visualize source results
+    '''
     plt.rcParams["figure.figsize"] = (7, 3)
     fig, axs = plt.subplots(1, 2)
     sc.pl.embedding(source_rna, basis="spatial", color="wnn", s=20, show=False, title="MultiGATE Spatial", ax=axs[0], legend_loc="None")
@@ -825,6 +826,7 @@ def main():
     plt.show()
 
     print("Target forward pass complete. Embedding shape:", target_rna.obsm["MultiGATE"].shape)
+    '''
 
     #%% clustering with Muon's WNN clustering (target)
     sc.pp.filter_cells(target_rna, min_genes=3)
@@ -833,39 +835,91 @@ def main():
     sc.pp.neighbors(target_rna, n_neighbors=10)
     sc.pp.neighbors(target_atac, n_neighbors=10)
 
-    mdata = mu.MuData({"rna": target_rna, "atac": target_atac})
-    mu.pp.intersect_obs(mdata)
+    target_mdata = mu.MuData({"rna": target_rna, "atac": target_atac})
+    mu.pp.intersect_obs(target_mdata)
 
-    mu.pp.neighbors(mdata, n_neighbors=10)
-    mu.tl.umap(mdata)
-    sc.tl.leiden(mdata, resolution=1.5)
+    mu.pp.neighbors(target_mdata, n_neighbors=10)
+    mu.tl.umap(target_mdata)
+    sc.tl.leiden(target_mdata, resolution=1.5)
 
     # Replicate outputs of wnn_R: propagate cluster labels and UMAP coordinates
     # back to the individual AnnData objects so downstream code is unaffected.
     for ad in [target_rna, target_atac]:
-        ad.obs["wnn"] = mdata.obs["leiden"].astype(int).astype("category")
-        ad.obsm["X_umap"] = mdata.obsm["X_umap"]
+        ad.obs["wnn"] = target_mdata.obs["leiden"].astype(int).astype("category")
+        ad.obsm["X_umap"] = target_mdata.obsm["X_umap"]
 
     # visualize target results
+    '''
     plt.rcParams["figure.figsize"] = (7, 3)
     fig, axs = plt.subplots(1, 1)
     sc.pl.umap(target_rna, color="wnn", title="MultiGATE UMAP", ax=axs, size=20)
     plt.tight_layout()
     plt.show()
+    '''
 
+    #%% create and plot concat source & target data
+    from anndata import AnnData
+
+    source_concat_adata = AnnData(
+        X=np.concatenate([
+            source_rna.obsm["MultiGATE"],
+            source_atac.obsm["MultiGATE"]
+            ], axis=0),
+        obs=pd.concat([
+            source_rna.obs.assign(modality="rna"),
+            source_atac.obs.assign(modality="atac")
+            ], axis=0),
+        obsm={
+            "X_pca": np.concatenate([
+                source_rna.obsm["X_pca"],
+                source_atac.obsm["X_pca"]
+                ], axis=0),
+        },
+    )
+
+    sc.pp.neighbors(source_concat_adata, n_neighbors=10)
+    sc.tl.umap(source_concat_adata)
+    sc.tl.leiden(source_concat_adata, resolution=1.5)
+
+    sc.pl.umap(source_concat_adata, color=["modality", "leiden"], size=20)
+
+    target_concat_adata = AnnData(
+        X=np.concatenate([
+            target_rna.obsm["MultiGATE"],
+            target_atac.obsm["MultiGATE"]
+            ], axis=0),
+        obs=pd.concat([
+            target_rna.obs.assign(modality="rna"),
+            target_atac.obs.assign(modality="atac")
+            ], axis=0),
+        obsm={
+            "X_pca": np.concatenate([
+                target_rna.obsm["X_pca"],
+                target_atac.obsm["X_pca"]
+                ], axis=0),
+        },
+    )
+
+    sc.pp.neighbors(target_concat_adata, n_neighbors=10)
+    sc.tl.umap(target_concat_adata)
+    sc.tl.leiden(target_concat_adata, resolution=1.5)
+
+    sc.pl.umap(target_concat_adata, color=["modality", "leiden"], size=20)
+
+    #%% Log UMAPs to MLflow
     if parent_run_id is not None:
         try:
             with mlflow.start_run(run_id=parent_run_id):
                 log_umap_to_mlflow(
-                    source_rna,
-                    artifact_path="umap/source_data_umap_final.png",
+                    source_mdata,
+                    artifact_path="umap/source_data_umap_stage2.png",
                     title="Source Data UMAP",
                     color_key="wnn",
                     size=20,
                 )
                 log_umap_to_mlflow(
-                    target_rna,
-                    artifact_path="umap/target_data_umap_final.png",
+                    target_mdata,
+                    artifact_path="umap/target_data_umap_stage2.png",
                     title="Target Data UMAP",
                     color_key="wnn",
                     size=20,
