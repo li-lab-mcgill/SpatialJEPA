@@ -82,6 +82,24 @@ def parse_args(notebook: bool = False):
         default=False,
         help="If set, log source/target MuData UMAP artifacts in addition to concat AnnData UMAPs.",
     )
+    parser.add_argument(
+        "--source-label-key",
+        type=str,
+        default=None,
+        help="Optional source label key in .obs for scib metrics. Falls back to pseudo labels if missing.",
+    )
+    parser.add_argument(
+        "--target-label-key",
+        type=str,
+        default=None,
+        help="Optional target label key in .obs for scib metrics. Falls back to pseudo labels if missing.",
+    )
+    parser.add_argument(
+        "--scib-n-jobs",
+        type=int,
+        default=1,
+        help="Number of jobs for scib-metrics neighbor search.",
+    )
     if notebook:
         return parser.parse_known_args()[0]
     else:
@@ -266,11 +284,144 @@ def pair_and_subsample_target(target_rna, target_atac, subsample_n, seed):
     return target_rna, target_atac
 
 
-def compute_morans_i_mean(adata, rep_key="MultiGATE", neighbors_key="eval_graph", n_neighbors=15):
-    sc.pp.neighbors(adata, use_rep=rep_key, n_neighbors=n_neighbors, key_added=neighbors_key)
-    conn_key = neighbors_key + "_connectivities"
-    values = sc.metrics.morans_i(adata.obsp[conn_key].tocsr(), adata.obsm[rep_key].T)
-    return float(np.nanmean(values))
+_SCIB_BACKEND = None
+
+
+def require_scib_backend():
+    global _SCIB_BACKEND
+    if _SCIB_BACKEND is not None:
+        return _SCIB_BACKEND
+
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+    os.environ.setdefault("JAX_DISABLE_JIT", os.environ.get("BAKLAVA_JAX_DISABLE_JIT", "1"))
+
+    try:
+        from scib_metrics.benchmark import Benchmarker, BioConservation, BatchCorrection
+    except Exception as exc:
+        raise ImportError(
+            "Failed to import scib-metrics. Install missing dependencies in MultiGATEenv_py310_scib, "
+            "e.g. `pip install chex scib-metrics` (or conda equivalents)."
+        ) from exc
+
+    _SCIB_BACKEND = {
+        "Benchmarker": Benchmarker,
+        "BioConservation": BioConservation,
+        "BatchCorrection": BatchCorrection,
+    }
+    return _SCIB_BACKEND
+
+
+def resolve_scib_labels(rna_adata, atac_adata, concat_adata, label_key, domain_name):
+    if label_key is not None:
+        if label_key in rna_adata.obs.columns and label_key in atac_adata.obs.columns:
+            if label_key not in concat_adata.obs.columns:
+                raise KeyError(
+                    "Label key '{}' missing in concatenated obs for {} domain.".format(label_key, domain_name)
+                )
+            return label_key, "provided"
+        warnings.warn(
+            "Requested label key '{}' for {} not found in both RNA and ATAC obs. "
+            "Falling back to pseudo labels.".format(label_key, domain_name)
+        )
+
+    sc.pp.neighbors(concat_adata, use_rep="X", n_neighbors=15, key_added="scib_eval")
+    sc.tl.leiden(
+        concat_adata,
+        neighbors_key="scib_eval",
+        key_added="scib_pseudo_leiden",
+        resolution=1.5,
+        random_state=0,
+    )
+    return "scib_pseudo_leiden", "pseudo_leiden"
+
+
+def compute_scib_metrics_for_domain(
+    rna_adata,
+    atac_adata,
+    domain_name,
+    label_key=None,
+    scib_n_jobs=1,
+):
+    scib_backend = require_scib_backend()
+    Benchmarker = scib_backend["Benchmarker"]
+    BioConservation = scib_backend["BioConservation"]
+    BatchCorrection = scib_backend["BatchCorrection"]
+
+    concat_adata = build_concat_adata_for_umap(rna_adata, atac_adata, embedding_key="MultiGATE")
+    effective_label_key, label_mode = resolve_scib_labels(
+        rna_adata=rna_adata,
+        atac_adata=atac_adata,
+        concat_adata=concat_adata,
+        label_key=label_key,
+        domain_name=domain_name,
+    )
+
+    concat_adata.obsm["multigate_latent"] = np.asarray(concat_adata.X)
+
+    benchmarker = Benchmarker(
+        adata=concat_adata,
+        batch_key="modality",
+        label_key=effective_label_key,
+        embedding_obsm_keys=["multigate_latent"],
+        bio_conservation_metrics=BioConservation(
+            isolated_labels=False,
+            nmi_ari_cluster_labels_leiden=False,
+            nmi_ari_cluster_labels_kmeans=False,
+            silhouette_label=True,
+            clisi_knn=False,
+        ),
+        batch_correction_metrics=BatchCorrection(
+            bras=True,
+            ilisi_knn=True,
+            kbet_per_label=False,
+            graph_connectivity=False,
+            pcr_comparison=False,
+        ),
+        pre_integrated_embedding_obsm_key="multigate_latent",
+        n_jobs=scib_n_jobs,
+        progress_bar=False,
+    )
+    benchmarker.benchmark()
+
+    results = benchmarker.get_results(min_max_scale=False, clean_names=False)
+    if "multigate_latent" not in results.index:
+        raise KeyError("scib results missing expected embedding row 'multigate_latent'.")
+    row = results.loc["multigate_latent"]
+
+    metrics = {
+        "label_mode": label_mode,
+        "effective_label_key": effective_label_key,
+    }
+
+    if "silhouette_label" in row.index:
+        metrics["silhouette_label"] = float(row["silhouette_label"])
+    if "ilisi_knn" in row.index:
+        metrics["ilisi"] = float(row["ilisi_knn"])
+    if "bras" in row.index:
+        metrics["bras"] = float(row["bras"])
+    if "Bio conservation" in row.index:
+        metrics["bio_conservation"] = float(row["Bio conservation"])
+    if "Batch correction" in row.index:
+        metrics["batch_correction"] = float(row["Batch correction"])
+    if "Total" in row.index:
+        metrics["total"] = float(row["Total"])
+
+    return metrics
+
+
+def log_scib_metrics(prefix, metrics, step):
+    mapping = {
+        "silhouette_label": "{}_scib_silhouette_label".format(prefix),
+        "ilisi": "{}_scib_ilisi".format(prefix),
+        "bras": "{}_scib_bras".format(prefix),
+        "bio_conservation": "{}_scib_bio_conservation".format(prefix),
+        "batch_correction": "{}_scib_batch_correction".format(prefix),
+        "total": "{}_scib_total".format(prefix),
+    }
+    for key, metric_name in mapping.items():
+        if key in metrics and np.isfinite(metrics[key]):
+            mlflow.log_metric(metric_name, float(metrics[key]), step=step)
 
 
 def log_umap_to_mlflow(mdata, artifact_path, title, color_key="wnn", size=20):
@@ -522,6 +673,8 @@ def run_stage2_distillation(
     target_x2,
     stage2_epochs,
     lambda_kd,
+    target_label_key,
+    scib_n_jobs,
 ):
     if stage2_epochs <= 0:
         return None
@@ -572,6 +725,9 @@ def run_stage2_distillation(
         mlflow.log_param("kd_mix_ot", 0.9)
         mlflow.log_param("student_init", "random")
         mlflow.log_param("teacher_init", "source_to_target_zero_shot_vgp0")
+        mlflow.log_param("stage2_target_label_key", target_label_key if target_label_key is not None else "None")
+        target_scib_label_mode_logged = False
+        target_scib_effective_label_key_logged = False
 
         for epoch in range(1, stage2_epochs + 1):
             student_trainer.mgate.train()
@@ -614,16 +770,29 @@ def run_stage2_distillation(
             )
 
             try:
-                target_morans = compute_morans_i_mean(
-                    target_rna,
-                    rep_key="MultiGATE",
-                    neighbors_key="target_stage2_eval",
-                    n_neighbors=15,
+                target_scib_metrics = compute_scib_metrics_for_domain(
+                    rna_adata=target_rna,
+                    atac_adata=target_atac,
+                    domain_name="target",
+                    label_key=target_label_key,
+                    scib_n_jobs=scib_n_jobs,
                 )
-                mlflow.log_metric("stage2_target_morans_i_mean", target_morans, step=epoch)
-                mlflow.log_metric("stage2_target_modularity_placeholder", target_morans, step=epoch)
+                log_scib_metrics(prefix="stage2_target", metrics=target_scib_metrics, step=epoch)
+                if not target_scib_label_mode_logged:
+                    mlflow.log_param("stage2_target_scib_label_mode", target_scib_metrics["label_mode"])
+                    target_scib_label_mode_logged = True
+                if not target_scib_effective_label_key_logged:
+                    mlflow.log_param(
+                        "stage2_target_scib_effective_label_key",
+                        target_scib_metrics["effective_label_key"],
+                    )
+                    target_scib_effective_label_key_logged = True
             except Exception as exc:
-                warnings.warn("Stage-2 target metric computation failed at epoch {}: {}".format(epoch, exc))
+                warnings.warn(
+                    "scib metric computation failed for domain=target stage=stage2 epoch={}: {}".format(
+                        epoch, exc
+                    )
+                )
 
     final_target_embeddings = student_trainer.infer(
         target_graph_tf,
@@ -713,6 +882,11 @@ def main():
         raise ValueError("--stage2-epochs must be a non-negative integer.")
     if args.lambda_kd < 0:
         raise ValueError("--lambda-kd must be non-negative.")
+    if args.scib_n_jobs <= 0:
+        raise ValueError("--scib-n-jobs must be a positive integer.")
+
+    # Fail fast if scib-metrics backend is not available.
+    require_scib_backend()
 
     #%% load env variables from .env file
     load_dotenv(dotenv_path="/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env")
@@ -878,11 +1052,17 @@ def main():
         mlflow.log_param("target_subsample_n", args.target_subsample_n)
         mlflow.log_param("target_subsample_seed", args.target_subsample_seed)
         mlflow.log_param("log_mudata_umaps", args.log_mudata_umaps)
+        mlflow.log_param("source_label_key", args.source_label_key if args.source_label_key is not None else "None")
+        mlflow.log_param("target_label_key", args.target_label_key if args.target_label_key is not None else "None")
         mlflow.log_param("target_effective_n", int(target_rna.n_obs))
         mlflow.log_param("eval_every", eval_every)
         mlflow.log_param("source_cells", int(source_rna.n_obs))
         mlflow.log_param("target_cells", int(target_rna.n_obs))
         mlflow.log_param("graph_type", graph_type)
+        source_scib_label_mode_logged = False
+        target_scib_label_mode_logged = False
+        source_scib_effective_label_key_logged = False
+        target_scib_effective_label_key_logged = False
 
         for epoch in range(1, num_epochs + 1):
             loss = trainer.run_epoch(epoch, source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t)
@@ -926,28 +1106,54 @@ def main():
             )
 
             try:
-                source_morans = compute_morans_i_mean(
-                    source_rna,
-                    rep_key="MultiGATE",
-                    neighbors_key="source_eval",
-                    n_neighbors=15,
+                source_scib_metrics = compute_scib_metrics_for_domain(
+                    rna_adata=source_rna,
+                    atac_adata=source_atac,
+                    domain_name="source",
+                    label_key=args.source_label_key,
+                    scib_n_jobs=args.scib_n_jobs,
                 )
-                mlflow.log_metric("source_morans_i_mean", source_morans, step=epoch)
-                mlflow.log_metric("source_modularity_placeholder", source_morans, step=epoch)
+                log_scib_metrics(prefix="source", metrics=source_scib_metrics, step=epoch)
+                if not source_scib_label_mode_logged:
+                    mlflow.log_param("source_scib_label_mode", source_scib_metrics["label_mode"])
+                    source_scib_label_mode_logged = True
+                if not source_scib_effective_label_key_logged:
+                    mlflow.log_param(
+                        "source_scib_effective_label_key",
+                        source_scib_metrics["effective_label_key"],
+                    )
+                    source_scib_effective_label_key_logged = True
             except Exception as exc:
-                warnings.warn("Source metric computation failed at epoch {}: {}".format(epoch, exc))
+                warnings.warn(
+                    "scib metric computation failed for domain=source stage=stage1 epoch={}: {}".format(
+                        epoch, exc
+                    )
+                )
 
             try:
-                target_morans = compute_morans_i_mean(
-                    target_rna,
-                    rep_key="MultiGATE",
-                    neighbors_key="target_eval",
-                    n_neighbors=15,
+                target_scib_metrics = compute_scib_metrics_for_domain(
+                    rna_adata=target_rna,
+                    atac_adata=target_atac,
+                    domain_name="target",
+                    label_key=args.target_label_key,
+                    scib_n_jobs=args.scib_n_jobs,
                 )
-                mlflow.log_metric("target_morans_i_mean", target_morans, step=epoch)
-                mlflow.log_metric("target_modularity_placeholder", target_morans, step=epoch)
+                log_scib_metrics(prefix="target", metrics=target_scib_metrics, step=epoch)
+                if not target_scib_label_mode_logged:
+                    mlflow.log_param("target_scib_label_mode", target_scib_metrics["label_mode"])
+                    target_scib_label_mode_logged = True
+                if not target_scib_effective_label_key_logged:
+                    mlflow.log_param(
+                        "target_scib_effective_label_key",
+                        target_scib_metrics["effective_label_key"],
+                    )
+                    target_scib_effective_label_key_logged = True
             except Exception as exc:
-                warnings.warn("Target metric computation failed at epoch {}: {}".format(epoch, exc))
+                warnings.warn(
+                    "scib metric computation failed for domain=target stage=stage1 epoch={}: {}".format(
+                        epoch, exc
+                    )
+                )
 
         try:
             log_stage_umap_artifacts(
@@ -978,6 +1184,8 @@ def main():
                 target_x2=target_x2,
                 stage2_epochs=args.stage2_epochs,
                 lambda_kd=args.lambda_kd,
+                target_label_key=args.target_label_key,
+                scib_n_jobs=args.scib_n_jobs,
             )
             try:
                 log_stage_umap_artifacts(
