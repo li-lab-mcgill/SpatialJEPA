@@ -480,19 +480,22 @@ def compute_kd_kl_loss(student_logits, teacher_logits):
         F.log_softmax(teacher_logits, dim=1),
         reduction="batchmean",
         log_target=True,
-    )
+    ).clamp(min=0)
     kd_rows = F.kl_div(
         F.log_softmax(student_logits, dim=0),
         F.log_softmax(teacher_logits, dim=0),
         reduction="batchmean",
         log_target=True,
-    )
+    ).clamp(min=0)
+
+    if not (kd_cols.is_nonzero() and kd_rows.is_nonzero()):
+        print("[WARNING] zero-valued KL divergence, temperature too high.")
     return 0.5 * (kd_cols + kd_rows)
 
 
 def compute_ot_clip_loss(student_logits, teacher_logits, emd):
     one = torch.tensor(1.0, device=teacher_logits.device, dtype=teacher_logits.dtype)
-    teacher_cost = 1 - (teacher_logits / torch.exp(1 / one))
+    teacher_cost = 0.5 * (2 - (teacher_logits / torch.exp(1 / one)))
 
     teacher_cost_np = teacher_cost.detach().cpu().numpy()
     plan = emd(a=[], b=[], M=teacher_cost_np)
@@ -584,8 +587,9 @@ def run_stage2_distillation(
             student_logits = compute_clip_logits(student_clip_rna, student_clip_atac, student_trainer.mgate.logit_scale)
             teacher_logits = compute_clip_logits(teacher_clip_rna, teacher_clip_atac, teacher_model.logit_scale)
 
-            kd_kl_loss = compute_kd_kl_loss(student_logits, teacher_logits)
             kd_ot_loss = compute_ot_clip_loss(student_logits, teacher_logits, emd=emd)
+            kd_kl_loss = compute_kd_kl_loss(student_logits, teacher_logits)
+            kd_kl_loss = kd_kl_loss * 50 # TMP - bring KL loss to same scale as OT loss
             distill_loss = lambda_kd * (0.1 * kd_kl_loss + 0.9 * kd_ot_loss)
 
             distill_loss.backward()
@@ -839,7 +843,7 @@ def main():
         hidden_dims1=[source_x1.shape[1]] + hidden_dims,
         hidden_dims2=[source_x2.shape[1]] + hidden_dims,
         spot_num=source_x1.shape[0],
-        temp=-10,
+        temp=1,
         n_epochs=num_epochs,
         lr=0.0001,
         gradient_clipping=5,
