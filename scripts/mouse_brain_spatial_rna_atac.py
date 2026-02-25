@@ -266,6 +266,25 @@ def compute_morans_i_mean(adata, rep_key="MultiGATE", neighbors_key="eval_graph"
     return float(np.nanmean(values))
 
 
+def log_umap_to_mlflow(adata, artifact_path, title, color_key="wnn", size=20):
+    if adata.n_obs < 3:
+        warnings.warn("Skipping UMAP artifact '{}' because n_obs < 3.".format(artifact_path))
+        return
+    if "X_umap" not in adata.obsm:
+        warnings.warn("Skipping UMAP artifact '{}' because X_umap is missing.".format(artifact_path))
+        return
+
+    umap_fig = None
+    try:
+        umap_fig, umap_ax = plt.subplots(figsize=(7, 5))
+        sc.pl.umap(adata, color=color_key, title=title, ax=umap_ax, size=size, show=False)
+        umap_fig.tight_layout()
+        mlflow.log_figure(umap_fig, artifact_path)
+    finally:
+        if umap_fig is not None:
+            plt.close(umap_fig)
+
+
 def require_ot_backend():
     try:
         from ot import emd
@@ -679,7 +698,9 @@ def main():
     print("Training epochs:", num_epochs)
     print("Target paired cells after subsampling:", target_rna.n_obs)
 
+    parent_run_id = None
     with mlflow.start_run(run_name=run_name):
+        parent_run_id = mlflow.active_run().info.run_id
         mlflow.log_param("mlflow_experiment_id", experiment_id)
         mlflow.log_param("n_epochs", num_epochs)
         mlflow.log_param("stage2_epochs", args.stage2_epochs)
@@ -831,6 +852,26 @@ def main():
     sc.pl.umap(target_rna, color="wnn", title="MultiGATE UMAP", ax=axs, size=20)
     plt.tight_layout()
     plt.show()
+
+    if parent_run_id is not None:
+        try:
+            with mlflow.start_run(run_id=parent_run_id):
+                log_umap_to_mlflow(
+                    source_rna,
+                    artifact_path="umap/source_data_umap_final.png",
+                    title="Source Data UMAP",
+                    color_key="wnn",
+                    size=20,
+                )
+                log_umap_to_mlflow(
+                    target_rna,
+                    artifact_path="umap/target_data_umap_final.png",
+                    title="Target Data UMAP",
+                    color_key="wnn",
+                    size=20,
+                )
+        except Exception as exc:
+            warnings.warn("Failed to generate/log source/target UMAP artifacts to MLflow: {}".format(exc))
 
 #%%
 if __name__ == "__main__":
