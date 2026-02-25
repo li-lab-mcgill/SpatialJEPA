@@ -1,8 +1,11 @@
+#!/usr/bin/env python
 #%%
+import argparse
 import os
 import shutil
 import socket
 import sys
+from datetime import datetime
 from pprint import pprint
 
 # Python 3.7 compatibility for muon/mudata (they use typing.Literal in newer versions)
@@ -28,140 +31,166 @@ if env_bin and env_bin not in current_path_entries:
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import matplotlib.pyplot as plt
+import mlflow
 import muon as mu
-import scanpy as sc
-from dotenv import dotenv_values, load_dotenv
-
-import MultiGATE
-
-import warnings
-warnings.filterwarnings('ignore')
-
-#%% load env variables from .env file
-load_dotenv(dotenv_path="/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env")
-print("Loaded environment variables from .env or env:", end="\n\n")
-pprint(dotenv_values("/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env"))
-print("Using MultiGATE module:", MultiGATE.__file__)
-
-if os.getenv("DATAPATH") is None:
-    raise EnvironmentError(
-        "DATAPATH is not set. Export DATAPATH to the base data directory, e.g. "
-        "'/home/mcb/users/dmannk/BAKLAVA_base/data'."
-    )
-
-if shutil.which("bedtools") is None:
-    raise EnvironmentError(
-        "bedtools is required for Cal_gene_peak_Net_new. Install bedtools and ensure sortBed is available on PATH."
-    )
-
-base_path = os.path.join(os.getenv("DATAPATH"), "aligned_data")
-
-#%% load source data
-source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned.h5ad"))
-source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned.h5ad"))
-
-source_rna.obsm["spatial"] = source_rna.obsm["spatial"][:, [1, 0]] * -1
-source_atac.obsm["spatial"] = source_atac.obsm["spatial"][:, [1, 0]] * -1
-
-#%% load target data
-target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
-target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
-
-#%% TMP - redo HVG to limit number of features to fit inside GPU memory
-if socket.gethostname() != 'ri-muhc-gpu':
-
-    source_rna.var['highly_variable'] = False
-    source_atac.var['highly_variable'] = False
-
-    target_rna.var['highly_variable'] = False
-    target_atac.var['highly_variable'] = False
-    
-    top_N_genes = 2000
-    top_N_peaks = 10000
-    source_rna.var.loc[source_rna.var['highly_variable_rank'].le(top_N_genes - 1), 'highly_variable'] = True
-    source_atac.var.loc[source_atac.var['highly_variable_rank'].le(top_N_peaks - 1), 'highly_variable'] = True
-
-    target_rna.var.loc[
-        target_rna.var_names.isin(source_rna.var_names[source_rna.var['highly_variable']]),
-        'highly_variable'] = True
-    target_atac.var.loc[
-        target_atac.var_names.isin(source_atac.var_names[source_atac.var['highly_variable']]),
-        'highly_variable'] = True
-
-#%% spatial graph
-MultiGATE.Cal_Spatial_Net(source_rna, rad_cutoff=40)
-MultiGATE.Stats_Spatial_Net(source_rna)
-
-MultiGATE.Cal_Spatial_Net(source_atac, rad_cutoff=40)
-MultiGATE.Stats_Spatial_Net(source_atac)
-
-source_rna = source_rna[:, source_rna.var['highly_variable']]
-source_atac = source_atac[:, source_atac.var['highly_variable']]
-
-gtf_path = os.path.join(os.getenv("DATAPATH"), "gene_annotations", "gencode.vM25.chr_patch_hapl_scaff.annotation.gtf.gz")
-if not os.path.exists(gtf_path):
-    raise FileNotFoundError("GTF annotation file not found: {}".format(gtf_path))
-
-MultiGATE.Cal_gene_peak_Net_new(source_rna, source_atac, 150000, file=gtf_path)
-source_rna.uns['gene_peak_Net'] = source_atac.uns['gene_peak_Net']
-
-#%% running MultiGATE
-num_epochs = int(os.getenv("MULTIGATE_EPOCHS", "3000"))
-if num_epochs <= 0:
-    raise ValueError("MULTIGATE_EPOCHS must be a positive integer.")
-
-print("Training epochs:", num_epochs)
-source_rna, source_atac, trainer = MultiGATE.train_MultiGATE(
-    source_rna,
-    source_atac,
-    bp_width=400,
-    n_epochs=num_epochs,
-    return_trainer=True,
-)
-
-#%% clustering with Muon's WNN clustering
-sc.pp.neighbors(source_rna)
-sc.pp.neighbors(source_atac)
-
-mdata = mu.MuData({"rna": source_rna, "atac": source_atac})
-mu.pp.neighbors(mdata)
-
-mu.tl.umap(mdata)
-sc.tl.leiden(mdata, resolution=1.5)
-
-# Replicate outputs of wnn_R: propagate cluster labels and UMAP coordinates
-# back to the individual AnnData objects so downstream code is unaffected.
-for ad in [source_rna, source_atac]:
-    ad.obs['wnn'] = mdata.obs['leiden'].astype(int).astype('category')
-    ad.obsm['X_umap'] = mdata.obsm['X_umap']
-
-# visualize results
-plt.rcParams["figure.figsize"] = (7, 3)
-fig, axs = plt.subplots(1, 2)
-sc.pl.embedding(source_rna, basis="spatial", color="wnn", s=20, show=False, title='MultiGATE Spatial', ax=axs[0], legend_loc='None')
-sc.pl.umap(source_rna, color="wnn", title='MultiGATE UMAP', ax=axs[1], size=20)
-plt.tight_layout()
-plt.show()
-
-#%% forward pass with target data
-
 import numpy as np
 import pandas as pd
+import scanpy as sc
+import scipy.sparse as sp
 import torch
+from dotenv import dotenv_values, load_dotenv
+from sklearn.preprocessing import Normalizer
+
+import MultiGATE
 from MultiGATE.MultiGATE import MultiGATE as MultiGATETrainer
+
+import warnings
+warnings.filterwarnings("ignore")
+
+
+def parse_args(notebook: bool = False):
+    parser = argparse.ArgumentParser(description="Train MultiGATE on source and run live zero-shot eval on target.")
+    parser.add_argument(
+        "--target-subsample-n",
+        type=int,
+        default=5000,
+        help="Maximum number of paired target cells to keep for live evaluation.",
+    )
+    parser.add_argument(
+        "--target-subsample-seed",
+        type=int,
+        default=0,
+        help="Random seed used when subsampling target cells.",
+    )
+    if notebook:
+        return parser.parse_known_args()[0]
+    else:
+        return parser.parse_args()
+
+
+def _to_dense_df(adata):
+    if isinstance(adata.X, np.ndarray):
+        matrix = adata.X
+    else:
+        matrix = adata.X.toarray()
+    return pd.DataFrame(matrix, index=adata.obs.index, columns=adata.var.index)
+
+
+def prepare_graph_data(adj):
+    num_nodes = adj.shape[0]
+    adj = adj + sp.eye(num_nodes)
+    if not sp.isspmatrix_coo(adj):
+        adj = adj.tocoo()
+    adj = adj.astype(np.float32)
+    indices = np.vstack((adj.col, adj.row)).transpose()
+    return (indices, adj.data, adj.shape)
+
+
+def build_graph_inputs(adata1, adata2, bp_width=450, graph_type="ATAC", protein_value=0.001):
+    if "highly_variable" in adata1.var.columns and "highly_variable" in adata2.var.columns:
+        adata_vars1 = adata1[:, adata1.var["highly_variable"]]
+        adata_vars2 = adata2[:, adata2.var["highly_variable"]]
+    else:
+        adata_vars1 = adata1
+        adata_vars2 = adata2
+
+    x1 = _to_dense_df(adata_vars1)
+    x2 = _to_dense_df(adata_vars2)
+
+    cells = np.array(x1.index)
+    cells_id_tran = dict(zip(cells, range(cells.shape[0])))
+
+    genes = np.array(x1.columns)
+    peaks = np.array(x2.columns)
+    genes_id_tran = dict(zip(genes, range(genes.shape[0])))
+    peaks_id_tran = dict(zip(peaks, range(peaks.shape[0])))
+
+    if "Spatial_Net" not in adata1.uns:
+        raise ValueError("Spatial_Net is not existed! Run Cal_Spatial_Net first!")
+
+    spatial_net = adata_vars1.uns["Spatial_Net"]
+    graph_df = spatial_net.copy()
+    graph_df["Cell1"] = graph_df["Cell1"].map(cells_id_tran)
+    graph_df["Cell2"] = graph_df["Cell2"].map(cells_id_tran)
+    graph_df = graph_df.dropna(subset=["Cell1", "Cell2"])
+    graph_df[["Cell1", "Cell2"]] = graph_df[["Cell1", "Cell2"]].astype(int)
+
+    graph = sp.coo_matrix(
+        (np.ones(graph_df.shape[0]), (graph_df["Cell1"], graph_df["Cell2"])),
+        shape=(adata_vars1.n_obs, adata_vars1.n_obs),
+    )
+    graph_tf = prepare_graph_data(graph)
+
+    if "gene_peak_Net" not in adata1.uns:
+        raise ValueError("gene_peak_Net is not existed! Run Cal_gene_peak_Net first!")
+
+    gene_peak_net = adata_vars1.uns["gene_peak_Net"]
+    if graph_type == "protein":
+        gene_peak_net = gene_peak_net.copy()
+        gene_peak_net.columns = ["Gene", "Peak"]
+
+    gp_df = gene_peak_net.copy()
+    gp_df["Gene"] = gp_df["Gene"].map(genes_id_tran)
+    gp_df["Peak"] = gp_df["Peak"].map(peaks_id_tran)
+    gp_df = gp_df.dropna(subset=["Gene", "Peak"]).copy()
+    if gp_df.empty:
+        raise ValueError("gene_peak_Net does not overlap with selected RNA/ATAC features.")
+
+    gp_df["Gene"] = gp_df["Gene"].astype(int)
+    gp_df["Peak"] = gp_df["Peak"].astype(int) + adata_vars1.n_vars
+
+    if graph_type in ["ATAC", "ATAC_RNA"]:
+        dist = gp_df["Distance"].astype(float)
+        gp_bp_width = bp_width if graph_type == "ATAC" else 2000
+        weights = np.concatenate(
+            (
+                ((dist + gp_bp_width) / gp_bp_width) ** (-0.75),
+                ((dist + gp_bp_width) / gp_bp_width) ** (-0.75),
+            ),
+            axis=0,
+        )
+    else:
+        weights = np.ones(gp_df.shape[0] * 2) * protein_value
+
+    gp_graph = sp.coo_matrix(
+        (
+            weights,
+            (
+                np.concatenate((gp_df["Gene"], gp_df["Peak"]), axis=0),
+                np.concatenate((gp_df["Peak"], gp_df["Gene"]), axis=0),
+            ),
+        ),
+        shape=(adata_vars1.n_vars + adata_vars2.n_vars, adata_vars1.n_vars + adata_vars2.n_vars),
+    )
+    gp_graph_tf = prepare_graph_data(gp_graph)
+
+    return graph_tf, gp_graph_tf, x1, x2
+
+
+def set_multigate_embeddings(adata1, adata2, embeddings_rna, embeddings_atac, key_added="MultiGATE"):
+    adata1.obsm[key_added] = embeddings_rna
+    adata2.obsm[key_added] = embeddings_atac
+
+    norm2 = Normalizer(norm="l2")
+    clip_all = (
+        norm2.fit_transform(embeddings_rna)
+        + norm2.fit_transform(embeddings_atac)
+    ) / 2.0
+    adata1.obsm[key_added + "_clip_all"] = clip_all
+    adata2.obsm[key_added + "_clip_all"] = clip_all
 
 
 def build_knn_graph_as_spatial_net(adata, n_neighbors=15):
     # Build a generic kNN cell graph for non-spatial data and store it in the
     # format expected by MultiGATE.forward_MultiGATE (adata.uns['Spatial_Net']).
     sc.pp.neighbors(adata, n_neighbors=n_neighbors)
-    conn = adata.obsp['connectivities'].tocoo()
+    conn = adata.obsp["connectivities"].tocoo()
     mask = conn.row != conn.col
-    adata.uns['Spatial_Net'] = pd.DataFrame(
+    adata.uns["Spatial_Net"] = pd.DataFrame(
         {
-            'Cell1': adata.obs_names[conn.row[mask]].to_numpy(),
-            'Cell2': adata.obs_names[conn.col[mask]].to_numpy(),
-            'Distance': np.zeros(int(mask.sum()), dtype=float),
+            "Cell1": adata.obs_names[conn.row[mask]].to_numpy(),
+            "Cell2": adata.obs_names[conn.col[mask]].to_numpy(),
+            "Distance": np.zeros(int(mask.sum()), dtype=float),
         }
     )
 
@@ -181,13 +210,13 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num):
         weight_decay=source_trainer.mgate.weight_decay,
         verbose=False,
         random_seed=0,
-        config={'device': str(source_trainer.device)},
+        config={"device": str(source_trainer.device)},
     )
 
     state_dict = {
-        k: v
-        for k, v in source_trainer.mgate.state_dict().items()
-        if k not in {'vgp0', 'vgp1'}
+        key: value
+        for key, value in source_trainer.mgate.state_dict().items()
+        if key not in {"vgp0", "vgp1"}
     }
     target_trainer.mgate.load_state_dict(state_dict, strict=False)
 
@@ -198,63 +227,383 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num):
     return target_trainer
 
 
-# Subset target to the same HVG feature space as the source model.
-# Note: If target is missing any of the source HVGs, forward_MultiGATE will
-# raise a dimension mismatch.
-target_rna = target_rna[:, target_rna.var['highly_variable']]
-target_atac = target_atac[:, target_atac.var['highly_variable']]
+def pair_and_subsample_target(target_rna, target_atac, subsample_n, seed):
+    shared_obs = target_rna.obs_names.intersection(target_atac.obs_names)
+    if len(shared_obs) == 0:
+        raise ValueError("Target RNA/ATAC share zero cells after preprocessing.")
 
-# Reuse source gene-peak prior so target forward pass uses the same regulatory graph.
-target_rna.uns['gene_peak_Net'] = source_rna.uns['gene_peak_Net']
-target_atac.uns['gene_peak_Net'] = source_rna.uns['gene_peak_Net']
+    target_rna = target_rna[shared_obs].copy()
+    target_atac = target_atac[shared_obs].copy()
 
-# Build a non-spatial kNN graph over target cells and store it as Spatial_Net.
-build_knn_graph_as_spatial_net(target_rna, n_neighbors=15)
-target_atac.uns['Spatial_Net'] = target_rna.uns['Spatial_Net']
-MultiGATE.Stats_Spatial_Net(target_rna)
-MultiGATE.Stats_Spatial_Net(target_atac)
+    if target_rna.n_obs > subsample_n:
+        rng = np.random.RandomState(seed)
+        selected = np.array(target_rna.obs_names)[
+            rng.choice(target_rna.n_obs, size=subsample_n, replace=False)
+        ]
+        target_rna = target_rna[selected].copy()
+        target_atac = target_atac[selected].copy()
 
-# Build a target-compatible trainer and disable data-adaptive GP attention.
-trainer_target = build_zero_shot_target_trainer(trainer, target_rna.n_obs)
-#%% forward pass
-# TMP - subsample target data to match source data
-#target_rna = target_rna[:len(source_rna)].copy()
-#target_atac = target_atac[:len(source_atac)].copy()
+    return target_rna, target_atac
 
-target_rna, target_atac = MultiGATE.forward_MultiGATE(
-    target_rna,
-    target_atac,
-    trainer=trainer_target,
-    bp_width=400,
-)
 
-print("Target forward pass complete. Embedding shape:", target_rna.obsm["MultiGATE"].shape)
+def compute_morans_i_mean(adata, rep_key="MultiGATE", neighbors_key="eval_graph", n_neighbors=15):
+    sc.pp.neighbors(adata, use_rep=rep_key, n_neighbors=n_neighbors, key_added=neighbors_key)
+    conn_key = neighbors_key + "_connectivities"
+    values = sc.metrics.morans_i(adata.obsp[conn_key].tocsr(), adata.obsm[rep_key].T)
+    return float(np.nanmean(values))
 
-#%% clustering with Muon's WNN clustering
 
-# TMP - filter cells that don't have at least 3 genes expressed
-sc.pp.filter_cells(target_rna, min_genes=3)
-sc.pp.filter_cells(target_atac, min_genes=3)
+def setup_mlflow():
+    # Default to a clean tracking location under BAKLAVA_base so we don't
+    # accidentally write into other repos' local `mlruns/` directories.
+    baklava_base_dir = os.path.dirname(REPO_ROOT)
+    default_mlflow_base_dir = os.path.join(baklava_base_dir, "mlflow_tracking", "MultiGATE")
 
-sc.pp.neighbors(target_rna, n_neighbors=10)
-sc.pp.neighbors(target_atac, n_neighbors=10)
+    # If a global MLFLOW_BASE_DIR is set (e.g. by BAKLAVA's `.env`), namespace
+    # MultiGATE runs under a dedicated subdirectory to avoid schema/version
+    # conflicts with other MLflow usage.
+    env_mlflow_base_dir = os.environ.get("MLFLOW_BASE_DIR")
+    if env_mlflow_base_dir:
+        mlflow_base_dir = os.path.abspath(env_mlflow_base_dir)
+        if os.path.basename(mlflow_base_dir.rstrip(os.sep)) != "MultiGATE":
+            mlflow_base_dir = os.path.join(mlflow_base_dir, "MultiGATE")
+    else:
+        mlflow_base_dir = os.path.abspath(default_mlflow_base_dir)
+    os.makedirs(mlflow_base_dir, exist_ok=True)
 
-mdata = mu.MuData({"rna": target_rna, "atac": target_atac})
-mu.pp.intersect_obs(mdata)
+    mlflow_db_path = os.path.join(mlflow_base_dir, "mlflow.db")
+    tracking_uri = "sqlite:///{}".format(mlflow_db_path)
+    os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
+    mlflow.set_tracking_uri(tracking_uri)
+    print("MLflow backend-store-uri:", tracking_uri)
+    print("MLflow base dir:", mlflow_base_dir)
 
-mu.pp.neighbors(mdata, n_neighbors=10)
-mu.tl.umap(mdata)
-sc.tl.leiden(mdata, resolution=1.5)
+    experiment_name = "multigate_mouse_brain_live_zeroshot"
+    artifact_dir = os.path.join(mlflow_base_dir, "mlflow_artifacts", experiment_name)
+    os.makedirs(artifact_dir, exist_ok=True)
 
-# Replicate outputs of wnn_R: propagate cluster labels and UMAP coordinates
-# back to the individual AnnData objects so downstream code is unaffected.
-for ad in [target_rna, target_atac]:
-    ad.obs['wnn'] = mdata.obs['leiden'].astype(int).astype('category')
-    ad.obsm['X_umap'] = mdata.obsm['X_umap']
+    experiment = mlflow.get_experiment_by_name(experiment_name)
+    if experiment is None:
+        experiment_id = mlflow.create_experiment(
+            experiment_name,
+            artifact_location=os.path.abspath(artifact_dir),
+        )
+        print("Created MLflow experiment: {} (ID: {})".format(experiment_name, experiment_id))
+    else:
+        experiment_id = experiment.experiment_id
+        print("Using MLflow experiment: {} (ID: {})".format(experiment_name, experiment_id))
 
-# visualize results
-plt.rcParams["figure.figsize"] = (7, 3)
-fig, axs = plt.subplots(1, 1)
-sc.pl.umap(target_rna, color="wnn", title='MultiGATE UMAP', ax=axs, size=20)
-plt.tight_layout()
-plt.show()
+    mlflow.set_experiment(experiment_name=experiment_name)
+    return experiment_id
+
+def is_notebook():
+    try:
+        from IPython import get_ipython
+        shell = get_ipython().__class__.__name__
+        if shell == "ZMQInteractiveShell":
+            # Jupyter notebook or qtconsole
+            return True
+        elif shell == "TerminalInteractiveShell":
+            # Terminal running IPython
+            return False
+        else:
+            # Other types
+            return False
+    except Exception:
+        return False
+
+#%%
+def main():
+    NOTEBOOK = is_notebook()
+    args = parse_args(notebook=NOTEBOOK)
+    if args.target_subsample_n <= 0:
+        raise ValueError("--target-subsample-n must be a positive integer.")
+
+    #%% load env variables from .env file
+    load_dotenv(dotenv_path="/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env")
+    print("Loaded environment variables from .env or env:", end="\n\n")
+    pprint(dotenv_values("/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env"))
+    print("Using MultiGATE module:", MultiGATE.__file__)
+
+    if os.getenv("DATAPATH") is None:
+        raise EnvironmentError(
+            "DATAPATH is not set. Export DATAPATH to the base data directory, e.g. "
+            "'/home/mcb/users/dmannk/BAKLAVA_base/data'."
+        )
+
+    if shutil.which("bedtools") is None:
+        raise EnvironmentError(
+            "bedtools is required for Cal_gene_peak_Net_new. Install bedtools and ensure sortBed is available on PATH."
+        )
+
+    base_path = os.path.join(os.getenv("DATAPATH"), "aligned_data")
+
+    #%% load source data
+    source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned.h5ad"))
+    source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned.h5ad"))
+
+    source_rna.obsm["spatial"] = source_rna.obsm["spatial"][:, [1, 0]] * -1
+    source_atac.obsm["spatial"] = source_atac.obsm["spatial"][:, [1, 0]] * -1
+
+    #%% load target data
+    target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
+    target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
+
+    #%% TMP - redo HVG to limit number of features to fit inside GPU memory
+    if socket.gethostname() != "ri-muhc-gpu":
+        source_rna.var["highly_variable"] = False
+        source_atac.var["highly_variable"] = False
+
+        target_rna.var["highly_variable"] = False
+        target_atac.var["highly_variable"] = False
+
+        top_n_genes = 2000
+        top_n_peaks = 10000
+        source_rna.var.loc[source_rna.var["highly_variable_rank"].le(top_n_genes - 1), "highly_variable"] = True
+        source_atac.var.loc[source_atac.var["highly_variable_rank"].le(top_n_peaks - 1), "highly_variable"] = True
+
+        target_rna.var.loc[
+            target_rna.var_names.isin(source_rna.var_names[source_rna.var["highly_variable"]]),
+            "highly_variable",
+        ] = True
+        target_atac.var.loc[
+            target_atac.var_names.isin(source_atac.var_names[source_atac.var["highly_variable"]]),
+            "highly_variable",
+        ] = True
+
+    #%% source spatial graph
+    MultiGATE.Cal_Spatial_Net(source_rna, rad_cutoff=40)
+    MultiGATE.Stats_Spatial_Net(source_rna)
+
+    MultiGATE.Cal_Spatial_Net(source_atac, rad_cutoff=40)
+    MultiGATE.Stats_Spatial_Net(source_atac)
+
+    source_rna = source_rna[:, source_rna.var["highly_variable"]].copy()
+    source_atac = source_atac[:, source_atac.var["highly_variable"]].copy()
+
+    gtf_path = os.path.join(os.getenv("DATAPATH"), "gene_annotations", "gencode.vM25.chr_patch_hapl_scaff.annotation.gtf.gz")
+    if not os.path.exists(gtf_path):
+        raise FileNotFoundError("GTF annotation file not found: {}".format(gtf_path))
+
+    MultiGATE.Cal_gene_peak_Net_new(source_rna, source_atac, 150000, file=gtf_path)
+    source_rna.uns["gene_peak_Net"] = source_atac.uns["gene_peak_Net"]
+
+    #%% target prep for live zero-shot eval
+    target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
+    target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
+
+    target_rna, target_atac = pair_and_subsample_target(
+        target_rna,
+        target_atac,
+        subsample_n=args.target_subsample_n,
+        seed=args.target_subsample_seed,
+    )
+
+    target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
+    target_atac.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
+
+    build_knn_graph_as_spatial_net(target_rna, n_neighbors=15)
+    target_atac.uns["Spatial_Net"] = target_rna.uns["Spatial_Net"].copy()
+    MultiGATE.Stats_Spatial_Net(target_rna)
+    MultiGATE.Stats_Spatial_Net(target_atac)
+
+    #%% Build reusable graph/data inputs
+    bp_width = 400
+    graph_type = "ATAC"
+    protein_value = 0.001
+
+    source_graph_tf, source_gp_tf, source_x1, source_x2 = build_graph_inputs(
+        source_rna,
+        source_atac,
+        bp_width=bp_width,
+        graph_type=graph_type,
+        protein_value=protein_value,
+    )
+    target_graph_tf, target_gp_tf, target_x1, target_x2 = build_graph_inputs(
+        target_rna,
+        target_atac,
+        bp_width=bp_width,
+        graph_type=graph_type,
+        protein_value=protein_value,
+    )
+
+    if target_x1.shape[1] != source_x1.shape[1] or target_x2.shape[1] != source_x2.shape[1]:
+        raise ValueError(
+            "Target feature dimensions do not match source model dimensions: "
+            "RNA {} vs {}, ATAC {} vs {}.".format(
+                target_x1.shape[1],
+                source_x1.shape[1],
+                target_x2.shape[1],
+                source_x2.shape[1],
+            )
+        )
+
+    #%% Build source trainer
+    num_epochs = int(os.getenv("MULTIGATE_EPOCHS", "3000"))
+    if num_epochs <= 0:
+        raise ValueError("MULTIGATE_EPOCHS must be a positive integer.")
+
+    hidden_dims = [512, 30]
+    trainer = MultiGATETrainer(
+        hidden_dims1=[source_x1.shape[1]] + hidden_dims,
+        hidden_dims2=[source_x2.shape[1]] + hidden_dims,
+        spot_num=source_x1.shape[0],
+        temp=-10,
+        n_epochs=num_epochs,
+        lr=0.0001,
+        gradient_clipping=5,
+        nonlinear=True,
+        weight_decay=0.0001,
+        verbose=False,
+        random_seed=2020,
+    )
+
+    source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t = trainer._prepare_inputs(
+        source_graph_tf,
+        source_graph_tf,
+        source_gp_tf,
+        source_x1,
+        source_x2,
+    )
+
+    #%% MLflow setup
+    experiment_id = setup_mlflow()
+    eval_every = 100
+    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print("Training epochs:", num_epochs)
+    print("Target paired cells after subsampling:", target_rna.n_obs)
+
+    with mlflow.start_run(run_name=run_name):
+        mlflow.log_param("mlflow_experiment_id", experiment_id)
+        mlflow.log_param("n_epochs", num_epochs)
+        mlflow.log_param("bp_width", bp_width)
+        mlflow.log_param("target_subsample_n", args.target_subsample_n)
+        mlflow.log_param("target_subsample_seed", args.target_subsample_seed)
+        mlflow.log_param("target_effective_n", int(target_rna.n_obs))
+        mlflow.log_param("eval_every", eval_every)
+        mlflow.log_param("source_cells", int(source_rna.n_obs))
+        mlflow.log_param("target_cells", int(target_rna.n_obs))
+        mlflow.log_param("graph_type", graph_type)
+
+        for epoch in range(1, num_epochs + 1):
+            loss = trainer.run_epoch(epoch, source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t)
+            mlflow.log_metric("source_train_loss", float(loss), step=epoch)
+
+            should_eval = (epoch % eval_every == 0) or (epoch == num_epochs)
+            if not should_eval:
+                continue
+
+            print("[Live eval] Epoch {}/{}".format(epoch, num_epochs))
+
+            source_embeddings = trainer.infer(
+                source_graph_tf,
+                source_graph_tf,
+                source_gp_tf,
+                source_x1,
+                source_x2,
+            )
+            set_multigate_embeddings(
+                source_rna,
+                source_atac,
+                source_embeddings[0],
+                source_embeddings[1],
+                key_added="MultiGATE",
+            )
+
+            trainer_target = build_zero_shot_target_trainer(trainer, target_rna.n_obs)
+            target_embeddings = trainer_target.infer(
+                target_graph_tf,
+                target_graph_tf,
+                target_gp_tf,
+                target_x1,
+                target_x2,
+            )
+            set_multigate_embeddings(
+                target_rna,
+                target_atac,
+                target_embeddings[0],
+                target_embeddings[1],
+                key_added="MultiGATE",
+            )
+
+            try:
+                source_morans = compute_morans_i_mean(
+                    source_rna,
+                    rep_key="MultiGATE",
+                    neighbors_key="source_eval",
+                    n_neighbors=15,
+                )
+                mlflow.log_metric("source_morans_i_mean", source_morans, step=epoch)
+                mlflow.log_metric("source_modularity_placeholder", source_morans, step=epoch)
+            except Exception as exc:
+                warnings.warn("Source metric computation failed at epoch {}: {}".format(epoch, exc))
+
+            try:
+                target_morans = compute_morans_i_mean(
+                    target_rna,
+                    rep_key="MultiGATE",
+                    neighbors_key="target_eval",
+                    n_neighbors=15,
+                )
+                mlflow.log_metric("target_morans_i_mean", target_morans, step=epoch)
+                mlflow.log_metric("target_modularity_placeholder", target_morans, step=epoch)
+            except Exception as exc:
+                warnings.warn("Target metric computation failed at epoch {}: {}".format(epoch, exc))
+
+    #%% clustering with Muon's WNN clustering (source)
+    sc.pp.neighbors(source_rna)
+    sc.pp.neighbors(source_atac)
+
+    mdata = mu.MuData({"rna": source_rna, "atac": source_atac})
+    mu.pp.neighbors(mdata)
+
+    mu.tl.umap(mdata)
+    sc.tl.leiden(mdata, resolution=1.5)
+
+    # Replicate outputs of wnn_R: propagate cluster labels and UMAP coordinates
+    # back to the individual AnnData objects so downstream code is unaffected.
+    for ad in [source_rna, source_atac]:
+        ad.obs["wnn"] = mdata.obs["leiden"].astype(int).astype("category")
+        ad.obsm["X_umap"] = mdata.obsm["X_umap"]
+
+    # visualize source results
+    plt.rcParams["figure.figsize"] = (7, 3)
+    fig, axs = plt.subplots(1, 2)
+    sc.pl.embedding(source_rna, basis="spatial", color="wnn", s=20, show=False, title="MultiGATE Spatial", ax=axs[0], legend_loc="None")
+    sc.pl.umap(source_rna, color="wnn", title="MultiGATE UMAP", ax=axs[1], size=20)
+    plt.tight_layout()
+    plt.show()
+
+    print("Target forward pass complete. Embedding shape:", target_rna.obsm["MultiGATE"].shape)
+
+    #%% clustering with Muon's WNN clustering (target)
+    sc.pp.filter_cells(target_rna, min_genes=3)
+    sc.pp.filter_cells(target_atac, min_genes=3)
+
+    sc.pp.neighbors(target_rna, n_neighbors=10)
+    sc.pp.neighbors(target_atac, n_neighbors=10)
+
+    mdata = mu.MuData({"rna": target_rna, "atac": target_atac})
+    mu.pp.intersect_obs(mdata)
+
+    mu.pp.neighbors(mdata, n_neighbors=10)
+    mu.tl.umap(mdata)
+    sc.tl.leiden(mdata, resolution=1.5)
+
+    # Replicate outputs of wnn_R: propagate cluster labels and UMAP coordinates
+    # back to the individual AnnData objects so downstream code is unaffected.
+    for ad in [target_rna, target_atac]:
+        ad.obs["wnn"] = mdata.obs["leiden"].astype(int).astype("category")
+        ad.obsm["X_umap"] = mdata.obsm["X_umap"]
+
+    # visualize target results
+    plt.rcParams["figure.figsize"] = (7, 3)
+    fig, axs = plt.subplots(1, 1)
+    sc.pl.umap(target_rna, color="wnn", title="MultiGATE UMAP", ax=axs, size=20)
+    plt.tight_layout()
+    plt.show()
+
+#%%
+if __name__ == "__main__":
+    main()
