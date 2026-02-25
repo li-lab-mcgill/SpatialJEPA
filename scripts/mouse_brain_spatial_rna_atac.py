@@ -68,7 +68,7 @@ def parse_args(notebook: bool = False):
     parser.add_argument(
         "--stage2-epochs",
         type=int,
-        default=100,
+        default=500,
         help="Number of teacher-student distillation epochs on target data (stage 2).",
     )
     parser.add_argument(
@@ -1007,7 +1007,7 @@ def main():
         )
 
     #%% Build source trainer
-    num_epochs = int(os.getenv("MULTIGATE_EPOCHS", "10"))
+    num_epochs = int(os.getenv("MULTIGATE_EPOCHS", "1000"))
     if num_epochs <= 0:
         raise ValueError("MULTIGATE_EPOCHS must be a positive integer.")
 
@@ -1036,7 +1036,7 @@ def main():
 
     #%% MLflow setup
     experiment_id = setup_mlflow()
-    eval_every = 10
+    eval_every = 50
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("Training epochs:", num_epochs)
@@ -1063,15 +1063,13 @@ def main():
         source_scib_effective_label_key_logged = False
         target_scib_effective_label_key_logged = False
 
-        for epoch in range(1, num_epochs + 1):
+        for epoch in tqdm(range(1, num_epochs + 1), desc="Stage 1 training", unit="epoch"):
             loss = trainer.run_epoch(epoch, source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t)
             mlflow.log_metric("source_train_loss", float(loss), step=epoch)
 
-            should_eval = (epoch % eval_every == 0) or (epoch == num_epochs)
+            should_eval = (epoch == 1) or (epoch % eval_every == 0) or (epoch == num_epochs)
             if not should_eval:
                 continue
-
-            print("[Live eval] Epoch {}/{}".format(epoch, num_epochs))
 
             source_embeddings = trainer.infer(
                 source_graph_tf,
@@ -1104,67 +1102,54 @@ def main():
                 key_added="MultiGATE",
             )
 
-            try:
-                source_scib_metrics = compute_scib_metrics_for_domain(
-                    rna_adata=source_rna,
-                    atac_adata=source_atac,
-                    domain_name="source",
-                    label_key=args.source_label_key,
-                    scib_n_jobs=args.scib_n_jobs,
-                )
-                log_scib_metrics(prefix="source", metrics=source_scib_metrics, step=epoch)
-                if not source_scib_label_mode_logged:
-                    mlflow.log_param("source_scib_label_mode", source_scib_metrics["label_mode"])
-                    source_scib_label_mode_logged = True
-                if not source_scib_effective_label_key_logged:
-                    mlflow.log_param(
-                        "source_scib_effective_label_key",
-                        source_scib_metrics["effective_label_key"],
-                    )
-                    source_scib_effective_label_key_logged = True
-            except Exception as exc:
-                warnings.warn(
-                    "scib metric computation failed for domain=source stage=stage1 epoch={}: {}".format(
-                        epoch, exc
-                    )
-                )
-
-            try:
-                target_scib_metrics = compute_scib_metrics_for_domain(
-                    rna_adata=target_rna,
-                    atac_adata=target_atac,
-                    domain_name="target",
-                    label_key=args.target_label_key,
-                    scib_n_jobs=args.scib_n_jobs,
-                )
-                log_scib_metrics(prefix="target", metrics=target_scib_metrics, step=epoch)
-                if not target_scib_label_mode_logged:
-                    mlflow.log_param("target_scib_label_mode", target_scib_metrics["label_mode"])
-                    target_scib_label_mode_logged = True
-                if not target_scib_effective_label_key_logged:
-                    mlflow.log_param(
-                        "target_scib_effective_label_key",
-                        target_scib_metrics["effective_label_key"],
-                    )
-                    target_scib_effective_label_key_logged = True
-            except Exception as exc:
-                warnings.warn(
-                    "scib metric computation failed for domain=target stage=stage1 epoch={}: {}".format(
-                        epoch, exc
-                    )
-                )
-
-        try:
-            log_stage_umap_artifacts(
-                source_rna=source_rna,
-                source_atac=source_atac,
-                target_rna=target_rna,
-                target_atac=target_atac,
-                stage_label="stage1",
-                log_mudata_umaps=args.log_mudata_umaps,
+            # compute and log scib metrics for source data
+            source_scib_metrics = compute_scib_metrics_for_domain(
+                rna_adata=source_rna,
+                atac_adata=source_atac,
+                domain_name="source",
+                label_key=args.source_label_key,
+                scib_n_jobs=args.scib_n_jobs,
             )
-        except Exception as exc:
-            warnings.warn("Failed to generate/log stage-1 UMAP artifacts: {}".format(exc))
+            log_scib_metrics(prefix="source", metrics=source_scib_metrics, step=epoch)
+            if not source_scib_label_mode_logged:
+                mlflow.log_param("source_scib_label_mode", source_scib_metrics["label_mode"])
+                source_scib_label_mode_logged = True
+            if not source_scib_effective_label_key_logged:
+                mlflow.log_param(
+                    "source_scib_effective_label_key",
+                    source_scib_metrics["effective_label_key"],
+                )
+                source_scib_effective_label_key_logged = True
+
+            # compute and log scib metrics for target data
+            target_scib_metrics = compute_scib_metrics_for_domain(
+                rna_adata=target_rna,
+                atac_adata=target_atac,
+                domain_name="target",
+                label_key=args.target_label_key,
+                scib_n_jobs=args.scib_n_jobs,
+            )
+            log_scib_metrics(prefix="target", metrics=target_scib_metrics, step=epoch)
+            if not target_scib_label_mode_logged:
+                mlflow.log_param("target_scib_label_mode", target_scib_metrics["label_mode"])
+                target_scib_label_mode_logged = True
+            if not target_scib_effective_label_key_logged:
+                mlflow.log_param(
+                    "target_scib_effective_label_key",
+                    target_scib_metrics["effective_label_key"],
+                )
+                target_scib_effective_label_key_logged = True
+
+
+        # log stage-1 UMAP artifacts
+        log_stage_umap_artifacts(
+            source_rna=source_rna,
+            source_atac=source_atac,
+            target_rna=target_rna,
+            target_atac=target_atac,
+            stage_label="stage1",
+            log_mudata_umaps=args.log_mudata_umaps,
+        )
 
         if args.stage2_epochs > 0:
             print(
@@ -1186,17 +1171,15 @@ def main():
                 target_label_key=args.target_label_key,
                 scib_n_jobs=args.scib_n_jobs,
             )
-            try:
-                log_stage_umap_artifacts(
-                    source_rna=source_rna,
-                    source_atac=source_atac,
-                    target_rna=target_rna,
-                    target_atac=target_atac,
-                    stage_label="stage2",
-                    log_mudata_umaps=args.log_mudata_umaps,
-                )
-            except Exception as exc:
-                warnings.warn("Failed to generate/log stage-2 UMAP artifacts: {}".format(exc))
+            # log stage-2 UMAP artifacts
+            log_stage_umap_artifacts(
+                source_rna=source_rna,
+                source_atac=source_atac,
+                target_rna=target_rna,
+                target_atac=target_atac,
+                stage_label="stage2",
+                log_mudata_umaps=args.log_mudata_umaps,
+            )
         else:
             print("[Stage2 KD] Skipped because --stage2-epochs is 0.")
 
