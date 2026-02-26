@@ -98,34 +98,34 @@ class MGATE(nn.Module):
 
         # Encoder
         H = torch.cat([X1.transpose(0, 1), X2.transpose(0, 1)], dim=0)
-        self.Cgp[0] = self.graph_attention_layer(GP, H, self.vgp0, self.vgp1)
+        self.Cgp[0] = self.graph_attention_layer(GP, H, self.vgp0, self.vgp1) # att_fg of Eq. (3)
         H = torch.sparse.mm(self.Cgp[0], H)
-        H = F.relu(H)
+        H = F.relu(H) # after relu, H is output of Eq. (1) in the paper, i.e. ~X^T_(f)
 
         split_point = X1.shape[1]
         H1 = H[:split_point, :].transpose(0, 1).contiguous()
         H2 = H[split_point:, :].transpose(0, 1).contiguous()
 
         for layer in range(self.n_layers):
-            H1 = self.__encoder(A, H1, self.W1, self.C1, self.v1_0, self.v1_1, layer)
-            H2 = self.__encoder(A, H2, self.W2, self.C2, self.v2_0, self.v2_1, layer)
+            H1 = self.__encoder(A, H1, self.W1, self.C1, self.v1_0, self.v1_1, layer) # output of Eq. (5) for first modality (RNA)
+            H2 = self.__encoder(A, H2, self.W2, self.C2, self.v2_0, self.v2_1, layer) # output of Eq. (5) for second modality (ATAC)
             if self.nonlinear and layer != self.n_layers - 1:
                 H1 = F.elu(H1)
                 H2 = F.elu(H2)
 
-        self.H1 = H1
-        self.H2 = H2
+        self.H1 = H1 # output of Eq. (8) for first modality (RNA)
+        self.H2 = H2 # output of Eq. (8) for second modality (ATAC) 
 
         # Decoder
-        for layer in range(self.n_layers - 1, -1, -1):
-            H1 = self.__decoder(H1, self.W1, self.C1, layer)
-            H2 = self.__decoder(H2, self.W2, self.C2, layer)
+        for layer in range(self.n_layers - 1, -1, -1): # layer index decreases from n_layers - 1 to 0
+            H1 = self.__decoder(H1, self.W1, self.C1, layer) # Eq. (9) for first modality (RNA)
+            H2 = self.__decoder(H2, self.W2, self.C2, layer) # Eq. (9) for second modality (ATAC)
             if self.nonlinear and layer != 0:
                 H1 = F.elu(H1)
                 H2 = F.elu(H2)
 
         H = torch.cat([H1.transpose(0, 1), H2.transpose(0, 1)], dim=0)
-        H = torch.sparse.mm(self.Cgp[0], H)
+        H = torch.sparse.mm(self.Cgp[0], H) # Eq. (11)
         H = F.elu(H)
 
         H1_dec = H[:split_point, :].transpose(0, 1).contiguous()
@@ -186,13 +186,13 @@ class MGATE(nn.Module):
         if layer == self.n_layers - 1:
             return H
 
-        C[layer] = self.graph_attention_layer(A, H, v0[layer], v1[layer])
+        C[layer] = self.graph_attention_layer(A, H, v0[layer], v1[layer]) # att_ij of Eq. (7)
         return torch.sparse.mm(C[layer], H)
 
     def __decoder(self, H, W, C, layer):
         H = torch.matmul(H, W[layer].transpose(0, 1))
         if layer == 0:
-            return H
+            return H # Eq. (10)
 
         return torch.sparse.mm(C[layer - 1], H)
 
@@ -207,16 +207,17 @@ class MGATE(nn.Module):
         return penalty * self.weight_decay
 
     def graph_attention_layer(self, A, M, v0, v1):
-        A = A.coalesce()
+        A = A.coalesce() # prior feature-feature adjacency matrix, i.e. A_fg in Eq. (4)
         indices = A.indices()
         row = indices[0]
         col = indices[1]
 
         f1 = torch.matmul(M, v0).squeeze(-1)
-        f2 = torch.matmul(M, v1).squeeze(-1)
+        f2 = torch.matmul(M, v1).squeeze(-1) 
         logits = f1[row] + f2[col]
+        e_fg = torch.sigmoid(logits) # Eqs. (2) or (6) in the paper
 
-        weighted_logits = torch.log(torch.clamp(A.values(), min=1e-12)) * torch.sigmoid(logits)
+        weighted_logits = torch.log(torch.clamp(A.values(), min=1e-12)) * e_fg
         unnormalized_attentions = torch.sparse_coo_tensor(
             indices,
             weighted_logits,
@@ -224,5 +225,5 @@ class MGATE(nn.Module):
             device=A.device,
         ).coalesce()
 
-        attentions = torch.sparse.softmax(unnormalized_attentions, dim=1)
+        attentions = torch.sparse.softmax(unnormalized_attentions, dim=1)  # att_fg of Eq. (3), or att_ij of Eq. (7)
         return attentions.coalesce()

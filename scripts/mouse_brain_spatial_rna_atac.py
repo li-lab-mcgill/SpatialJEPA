@@ -923,8 +923,10 @@ def main():
     source_atac.obsm["spatial"] = source_atac.obsm["spatial"][:, [1, 0]] * -1
 
     # TARGET
-    target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
-    target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
+    #target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
+    #target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
+    target_rna = source_rna.copy()
+    target_atac = source_atac.copy()
 
     #%% TMP - redo HVG to limit number of features to fit inside GPU memory
     if socket.gethostname() != "ri-muhc-gpu":
