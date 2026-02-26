@@ -54,8 +54,9 @@ class MGATE(nn.Module):
             for i in range(self.n_layers - 1)
         ])
 
-        self.vgp0 = nn.Parameter(torch.empty(spot_num, 1))
-        self.vgp1 = nn.Parameter(torch.empty(spot_num, 1))
+        feat_num = hidden_dims1[0] + hidden_dims2[0]
+        self.vgp0 = nn.Parameter(torch.empty(feat_num, 1))
+        self.vgp1 = nn.Parameter(torch.empty(feat_num, 1))
 
         emb_dim1 = hidden_dims1[-1]
         emb_dim2 = hidden_dims2[-1]
@@ -98,7 +99,7 @@ class MGATE(nn.Module):
 
         # Encoder
         H = torch.cat([X1.transpose(0, 1), X2.transpose(0, 1)], dim=0)
-        self.Cgp[0] = self.graph_attention_layer(GP, H, self.vgp0, self.vgp1) # att_fg of Eq. (3)
+        self.Cgp[0] = self._gp_attention_layer(GP, self.vgp0, self.vgp1) # att_fg of Eq. (3)
         H = torch.sparse.mm(self.Cgp[0], H)
         H = F.relu(H) # after relu, H is output of Eq. (1) in the paper, i.e. ~X^T_(f)
 
@@ -227,3 +228,25 @@ class MGATE(nn.Module):
 
         attentions = torch.sparse.softmax(unnormalized_attentions, dim=1)  # att_fg of Eq. (3), or att_ij of Eq. (7)
         return attentions.coalesce()
+
+    def _gp_attention_layer(self, A, v0, v1):
+        """GP attention using feature-anchored keys (transferable across cell counts)."""
+        A = A.coalesce()
+        indices = A.indices()
+        row = indices[0]
+        col = indices[1]
+
+        f1 = v0.squeeze(-1)  # (n_features,) — direct per-feature attention key
+        f2 = v1.squeeze(-1)
+        logits = f1[row] + f2[col]
+        e_fg = torch.sigmoid(logits)
+
+        weighted_logits = torch.log(torch.clamp(A.values(), min=1e-12)) * e_fg
+        unnormalized_attentions = torch.sparse_coo_tensor(
+            indices,
+            weighted_logits,
+            A.shape,
+            device=A.device,
+        ).coalesce()
+
+        return torch.sparse.softmax(unnormalized_attentions, dim=1).coalesce()

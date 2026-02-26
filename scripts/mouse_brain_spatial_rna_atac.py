@@ -127,6 +127,24 @@ def parse_args(notebook: bool = False):
         default=1,
         help="Number of jobs for scib-metrics neighbor search.",
     )
+    parser.add_argument(
+        "--vgp-mode",
+        type=str,
+        choices=["zero", "feature"],
+        default="zero",
+        help=(
+            "How to initialise GP gating vectors (vgp0/vgp1) when transferring to the target. "
+            "'zero': zero out vgp (prior-only GP attention, Option 1). "
+            "'feature': transfer trained feature-anchored vgp directly (Option 2)."
+        ),
+    )
+    parser.add_argument(
+        "--spatial-graph-type",
+        type=str,
+        choices=["spatial", "knn", "identity", "tangram"],
+        default="spatial",
+        help="Type of graph to use for MultiGATE.",
+    )
     if notebook:
         return parser.parse_known_args()[0]
     else:
@@ -260,9 +278,10 @@ def build_knn_graph_as_spatial_net(adata, n_neighbors=15):
     )
 
 
-def build_zero_shot_target_trainer(source_trainer, target_spot_num, keep_vgp_weights=False):
-    # Rebuild MGATE with target N, load transferable weights, then force the
-    # dataset-sized gene-peak gating vectors to zero for prior-only GP attention.
+def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_mode="zero"):
+    # Rebuild MGATE with target N and load transferable weights.
+    # vgp_mode="zero":    zero out vgp0/vgp1 (prior-only GP attention, Option 1).
+    # vgp_mode="feature": transfer trained feature-anchored vgp directly (Option 2).
     target_trainer = MultiGATETrainer(
         hidden_dims1=source_trainer.mgate.hidden_dims1,
         hidden_dims2=source_trainer.mgate.hidden_dims2,
@@ -278,11 +297,12 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num, keep_vgp_wei
         config={"device": str(source_trainer.device)},
     )
 
-    if keep_vgp_weights:
+    if vgp_mode == "feature":
+        # vgp0/vgp1 are now (feat_num, 1) — same shape regardless of cell count, so load directly.
         state_dict = source_trainer.mgate.state_dict()
         target_trainer.mgate.load_state_dict(state_dict, strict=False)
 
-    else:
+    else:  # vgp_mode == "zero"
         state_dict = {
             key: value
             for key, value in source_trainer.mgate.state_dict().items()
@@ -707,13 +727,14 @@ def run_stage2_distillation(
     lambda_kd,
     target_label_key,
     scib_n_jobs,
+    vgp_mode="zero",
 ):
     if stage2_epochs <= 0:
         return None
 
     emd = require_ot_backend()
 
-    teacher_trainer = build_zero_shot_target_trainer(source_trainer, target_rna.n_obs, keep_vgp_weights=True)
+    teacher_trainer = build_zero_shot_target_trainer(source_trainer, target_rna.n_obs, vgp_mode=vgp_mode)
     teacher_model = teacher_trainer.mgate
     teacher_model.eval()
     for teacher_param in teacher_model.parameters():
@@ -974,9 +995,7 @@ def main():
 
     #%% target prep for live zero-shot eval
 
-    graph_type = "spatial"
-
-    if graph_type == "spatial":
+    if args.spatial_graph_type == "spatial":
         MultiGATE.Cal_Spatial_Net(target_rna, rad_cutoff=40)
         MultiGATE.Stats_Spatial_Net(target_rna)
         MultiGATE.Cal_Spatial_Net(target_atac, rad_cutoff=40)
@@ -986,7 +1005,7 @@ def main():
         MultiGATE.Cal_gene_peak_Net_new(target_rna, target_atac, 150000, file=gtf_path)
         target_rna.uns["gene_peak_Net"] = target_atac.uns["gene_peak_Net"]
 
-    elif graph_type == "knn":
+    elif args.spatial_graph_type == "knn":
         target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
         target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
         target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
@@ -996,7 +1015,7 @@ def main():
         MultiGATE.Stats_Spatial_Net(target_rna)
         MultiGATE.Stats_Spatial_Net(target_atac)
 
-    elif graph_type == "identity":
+    elif args.spatial_graph_type == "identity":
         target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
         target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
         target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
@@ -1006,7 +1025,7 @@ def main():
         #MultiGATE.Stats_Spatial_Net(target_rna)
         #MultiGATE.Stats_Spatial_Net(target_atac)
 
-    elif graph_type == 'tangram':
+    elif args.spatial_graph_type == 'tangram':
         tangram_net = pd.read_csv(os.path.join(os.getenv("OUTPATH"), "tangram", "tangram_spatial_net_affinity.csv"))
         target_rna.uns['Spatial_Net'] = tangram_net
         target_atac.uns['Spatial_Net'] = tangram_net.copy()    
@@ -1123,7 +1142,7 @@ def main():
                 key_added="MultiGATE",
             )
 
-            trainer_target = build_zero_shot_target_trainer(trainer, target_rna.n_obs, keep_vgp_weights=True)
+            trainer_target = build_zero_shot_target_trainer(trainer, target_rna.n_obs, vgp_mode=args.vgp_mode)
             target_embeddings = trainer_target.infer(
                 target_graph_tf,
                 target_graph_tf,
@@ -1220,6 +1239,7 @@ def main():
                 lambda_kd=args.lambda_kd,
                 target_label_key=args.target_label_key,
                 scib_n_jobs=args.scib_n_jobs,
+                vgp_mode=args.vgp_mode,
             )
             # log stage-2 UMAP artifacts
             log_stage_umap_artifacts(
