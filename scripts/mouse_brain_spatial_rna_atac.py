@@ -973,23 +973,39 @@ def main():
     source_rna.uns["gene_peak_Net"] = source_atac.uns["gene_peak_Net"]
 
     #%% target prep for live zero-shot eval
-    target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
-    target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
-    '''
-    target_rna, target_atac = pair_and_subsample_target(
-        target_rna,
-        target_atac,
-        subsample_n=args.target_subsample_n,
-        seed=args.target_subsample_seed,
-    )
-    '''
-    target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
-    target_atac.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
 
-    build_knn_graph_as_spatial_net(target_rna, n_neighbors=15)
-    target_atac.uns["Spatial_Net"] = target_rna.uns["Spatial_Net"].copy()
-    MultiGATE.Stats_Spatial_Net(target_rna)
-    MultiGATE.Stats_Spatial_Net(target_atac)
+    graph_type = "spatial"
+
+    if graph_type == "spatial":
+        MultiGATE.Cal_Spatial_Net(target_rna, rad_cutoff=40)
+        MultiGATE.Stats_Spatial_Net(target_rna)
+        MultiGATE.Cal_Spatial_Net(target_atac, rad_cutoff=40)
+        MultiGATE.Stats_Spatial_Net(target_atac)
+        target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
+        target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
+        MultiGATE.Cal_gene_peak_Net_new(target_rna, target_atac, 150000, file=gtf_path)
+        target_rna.uns["gene_peak_Net"] = target_atac.uns["gene_peak_Net"]
+
+    elif graph_type == "knn":
+        target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
+        target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
+        target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
+        target_atac.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
+        build_knn_graph_as_spatial_net(target_rna, n_neighbors=15)
+        target_atac.uns["Spatial_Net"] = target_rna.uns["Spatial_Net"].copy()
+        MultiGATE.Stats_Spatial_Net(target_rna)
+        MultiGATE.Stats_Spatial_Net(target_atac)
+
+    elif graph_type == "identity":
+        target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
+        target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
+        target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
+        target_atac.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
+        target_rna.uns["Spatial_Net"] = pd.DataFrame(columns=['Cell1', 'Cell2', 'Distance'])
+        target_atac.uns["Spatial_Net"] = target_rna.uns["Spatial_Net"].copy()
+        #MultiGATE.Stats_Spatial_Net(target_rna)
+        #MultiGATE.Stats_Spatial_Net(target_atac)
+
 
     #%% Build reusable graph/data inputs
     bp_width = 400
