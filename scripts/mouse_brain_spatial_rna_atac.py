@@ -15,9 +15,28 @@ if sys.version_info < (3, 8):
 
     typing.Literal = Literal
 
+#%% load env variables from .env file
+from dotenv import dotenv_values, load_dotenv
+load_dotenv(dotenv_path="/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env")
+print("Loaded environment variables from .env or env:", end="\n\n")
+pprint(dotenv_values("/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env"))
+
+if os.getenv("DATAPATH") is None:
+    raise EnvironmentError(
+        "DATAPATH is not set. Export DATAPATH to the base data directory, e.g. "
+        "'/home/mcb/users/dmannk/BAKLAVA_base/data'."
+    )
+
+if shutil.which("bedtools") is None:
+    raise EnvironmentError(
+        "bedtools is required for Cal_gene_peak_Net_new. Install bedtools and ensure sortBed is available on PATH."
+    )
+
+base_path = os.path.join(os.getenv("DATAPATH"), "aligned_data")
+
 # Ensure this script imports the local repo package, not site-packages.
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+BAKLAVA_BASE_DIR = os.getenv("BAKLAVA_BASE_DIR")
+REPO_ROOT = os.path.join(BAKLAVA_BASE_DIR, "MultiGATE")
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
@@ -40,13 +59,13 @@ import scipy.sparse as sp
 import torch
 import torch.nn.functional as F
 from anndata import AnnData
-from dotenv import dotenv_values, load_dotenv
 from sklearn.preprocessing import Normalizer
 from tqdm import tqdm
 import tempfile
 
 import MultiGATE
 from MultiGATE.MultiGATE import MultiGATE as MultiGATETrainer
+print("Using MultiGATE module:", MultiGATE.__file__)
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -69,13 +88,13 @@ def parse_args(notebook: bool = False):
     parser.add_argument(
         "--stage1-epochs",
         type=int,
-        default=100,
+        default=1000,
         help="Number of epochs to train the model for stage 1.",
     )
     parser.add_argument(
         "--stage2-epochs",
         type=int,
-        default=50,
+        default=500,
         help="Number of teacher-student distillation epochs on target data for stage 2.",
     )
     parser.add_argument(
@@ -893,25 +912,6 @@ def main():
 
     # Fail fast if scib-metrics backend is not available.
     require_scib_backend()
-
-    #%% load env variables from .env file
-    load_dotenv(dotenv_path="/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env")
-    print("Loaded environment variables from .env or env:", end="\n\n")
-    pprint(dotenv_values("/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env"))
-    print("Using MultiGATE module:", MultiGATE.__file__)
-
-    if os.getenv("DATAPATH") is None:
-        raise EnvironmentError(
-            "DATAPATH is not set. Export DATAPATH to the base data directory, e.g. "
-            "'/home/mcb/users/dmannk/BAKLAVA_base/data'."
-        )
-
-    if shutil.which("bedtools") is None:
-        raise EnvironmentError(
-            "bedtools is required for Cal_gene_peak_Net_new. Install bedtools and ensure sortBed is available on PATH."
-        )
-
-    base_path = os.path.join(os.getenv("DATAPATH"), "aligned_data")
 
     #%% load source data
     source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned.h5ad"))
