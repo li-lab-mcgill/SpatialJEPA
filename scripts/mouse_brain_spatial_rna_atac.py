@@ -88,13 +88,13 @@ def parse_args(notebook: bool = False):
     parser.add_argument(
         "--stage1-epochs",
         type=int,
-        default=1000,
+        default=3000,
         help="Number of epochs to train the model for stage 1.",
     )
     parser.add_argument(
         "--stage2-epochs",
         type=int,
-        default=500,
+        default=1000,
         help="Number of teacher-student distillation epochs on target data for stage 2.",
     )
     parser.add_argument(
@@ -1281,7 +1281,9 @@ else:
             raise FileNotFoundError(f"GTF annotation file not found: {gtf_file}")
 
         if output_dir is None:
-            output_dir = os.path.join(REPO_ROOT, "attention_analysis")
+            OUTPATH = os.getenv("OUTPATH")
+            output_dir = os.path.join(OUTPATH, "MultiGATE", "attention_analysis")
+            os.makedirs(output_dir, exist_ok=True)
 
         peak_gene_df = extract_peak_gene_connections(
             peak_gene_attention=peak_gene_attention,
