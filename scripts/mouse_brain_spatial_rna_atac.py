@@ -43,6 +43,7 @@ from anndata import AnnData
 from dotenv import dotenv_values, load_dotenv
 from sklearn.preprocessing import Normalizer
 from tqdm import tqdm
+import tempfile
 
 import MultiGATE
 from MultiGATE.MultiGATE import MultiGATE as MultiGATETrainer
@@ -66,10 +67,16 @@ def parse_args(notebook: bool = False):
         help="Random seed used when subsampling target cells.",
     )
     parser.add_argument(
+        "--stage1-epochs",
+        type=int,
+        default=100,
+        help="Number of epochs to train the model for stage 1.",
+    )
+    parser.add_argument(
         "--stage2-epochs",
         type=int,
-        default=500,
-        help="Number of teacher-student distillation epochs on target data (stage 2).",
+        default=50,
+        help="Number of teacher-student distillation epochs on target data for stage 2.",
     )
     parser.add_argument(
         "--lambda-kd",
@@ -1007,9 +1014,9 @@ def main():
         )
 
     #%% Build source trainer
-    num_epochs = int(os.getenv("MULTIGATE_EPOCHS", "1000"))
+    num_epochs = args.stage1_epochs
     if num_epochs <= 0:
-        raise ValueError("MULTIGATE_EPOCHS must be a positive integer.")
+        raise ValueError("--stage1-epochs must be a positive integer.")
 
     hidden_dims = [512, 30]
     trainer = MultiGATETrainer(
@@ -1039,7 +1046,7 @@ def main():
     eval_every = 50
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    print("Training epochs:", num_epochs)
+    print("Training epochs for stage 1:", num_epochs)
     print("Target paired cells after subsampling:", target_rna.n_obs)
 
     with mlflow.start_run(run_name=run_name):
@@ -1151,6 +1158,19 @@ def main():
             log_mudata_umaps=args.log_mudata_umaps,
         )
 
+        # log stage-1 model artifacts and attention matrix
+        source_peak_gene_attention = source_embeddings[4][0] #peak_gene_attention = source_rna.uns['MultiGATE_gene_peak_attention'][0]
+        model_stage1 = trainer.mgate.state_dict()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "source_peak_gene_attention.npz")
+            sp.save_npz(local_path, source_peak_gene_attention)
+            mlflow.log_artifact(local_path, artifact_path="matrices")
+
+            local_path = os.path.join(tmpdir, "model_stage1.pth")
+            torch.save(model_stage1, local_path)
+            mlflow.log_artifact(local_path, artifact_path="models")
+
         if args.stage2_epochs > 0:
             print(
                 "[Stage2 KD] Starting target distillation for {} epochs (lambda_kd={})".format(
@@ -1180,6 +1200,19 @@ def main():
                 stage_label="stage2",
                 log_mudata_umaps=args.log_mudata_umaps,
             )
+
+            # log stage-2 model artifacts and attention matrix
+            target_peak_gene_attention = target_embeddings[4][0] #target_peak_gene_attention = target_rna.uns['MultiGATE_gene_peak_attention'][0]
+            model_stage2 = trainer_target.mgate.state_dict()
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                local_path = os.path.join(tmpdir, "target_peak_gene_attention.npz")
+                sp.save_npz(local_path, target_peak_gene_attention)
+                mlflow.log_artifact(local_path, artifact_path="matrices")
+
+                local_path = os.path.join(tmpdir, "model_stage2.pth")
+                torch.save(model_stage2, local_path)
+                mlflow.log_artifact(local_path, artifact_path="models")
         else:
             print("[Stage2 KD] Skipped because --stage2-epochs is 0.")
 

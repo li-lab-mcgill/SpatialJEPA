@@ -63,6 +63,9 @@ class MGATE(nn.Module):
         self.W_t = nn.Parameter(torch.empty(emb_dim2, emb_dim2))
         self.logit_scale = nn.Parameter(torch.tensor(float(temp), dtype=torch.float32))
 
+        self.bn_rna = nn.BatchNorm1d(emb_dim1)
+        self.bn_atac = nn.BatchNorm1d(emb_dim2)
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -130,10 +133,10 @@ class MGATE(nn.Module):
         X2_ = H2_dec
 
         # CLIP-style alignment loss
-        RNA_e = F.normalize(torch.matmul(self.H1, self.W_i), p=2, dim=1)
-        ATAC_e = F.normalize(torch.matmul(self.H2, self.W_t), p=2, dim=1)
-        self.H1 = RNA_e
-        self.H2 = ATAC_e
+        rna_proj = self.bn_rna(torch.matmul(self.H1, self.W_i))
+        atac_proj = self.bn_atac(torch.matmul(self.H2, self.W_t))
+        RNA_e = F.normalize(rna_proj, p=2, dim=1)
+        ATAC_e = F.normalize(atac_proj, p=2, dim=1)
 
         logits = torch.matmul(RNA_e, ATAC_e.transpose(0, 1)) * torch.exp(self.logit_scale)
         labels = torch.arange(logits.shape[0], device=logits.device)
