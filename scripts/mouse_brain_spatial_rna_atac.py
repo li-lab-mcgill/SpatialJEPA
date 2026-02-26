@@ -260,7 +260,7 @@ def build_knn_graph_as_spatial_net(adata, n_neighbors=15):
     )
 
 
-def build_zero_shot_target_trainer(source_trainer, target_spot_num):
+def build_zero_shot_target_trainer(source_trainer, target_spot_num, keep_vgp_weights=False):
     # Rebuild MGATE with target N, load transferable weights, then force the
     # dataset-sized gene-peak gating vectors to zero for prior-only GP attention.
     target_trainer = MultiGATETrainer(
@@ -278,16 +278,21 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num):
         config={"device": str(source_trainer.device)},
     )
 
-    state_dict = {
-        key: value
-        for key, value in source_trainer.mgate.state_dict().items()
-        if key not in {"vgp0", "vgp1"}
-    }
-    target_trainer.mgate.load_state_dict(state_dict, strict=False)
+    if keep_vgp_weights:
+        state_dict = source_trainer.mgate.state_dict()
+        target_trainer.mgate.load_state_dict(state_dict, strict=False)
 
-    with torch.no_grad():
-        target_trainer.mgate.vgp0.zero_()
-        target_trainer.mgate.vgp1.zero_()
+    else:
+        state_dict = {
+            key: value
+            for key, value in source_trainer.mgate.state_dict().items()
+            if key not in {"vgp0", "vgp1"}
+        }
+        target_trainer.mgate.load_state_dict(state_dict, strict=False)
+
+        with torch.no_grad():
+            target_trainer.mgate.vgp0.zero_()
+            target_trainer.mgate.vgp1.zero_()
 
     return target_trainer
 
@@ -708,7 +713,7 @@ def run_stage2_distillation(
 
     emd = require_ot_backend()
 
-    teacher_trainer = build_zero_shot_target_trainer(source_trainer, target_rna.n_obs)
+    teacher_trainer = build_zero_shot_target_trainer(source_trainer, target_rna.n_obs, keep_vgp_weights=True)
     teacher_model = teacher_trainer.mgate
     teacher_model.eval()
     for teacher_param in teacher_model.parameters():
@@ -923,8 +928,10 @@ def main():
     source_atac.obsm["spatial"] = source_atac.obsm["spatial"][:, [1, 0]] * -1
 
     # TARGET
-    target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
-    target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
+    #target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
+    #target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
+    target_rna = source_rna.copy()
+    target_atac = source_atac.copy()
 
     #%% TMP - redo HVG to limit number of features to fit inside GPU memory
     if socket.gethostname() != "ri-muhc-gpu":
@@ -968,14 +975,14 @@ def main():
     #%% target prep for live zero-shot eval
     target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
     target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
-
+    '''
     target_rna, target_atac = pair_and_subsample_target(
         target_rna,
         target_atac,
         subsample_n=args.target_subsample_n,
         seed=args.target_subsample_seed,
     )
-
+    '''
     target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
     target_atac.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
 
@@ -1095,7 +1102,7 @@ def main():
                 key_added="MultiGATE",
             )
 
-            trainer_target = build_zero_shot_target_trainer(trainer, target_rna.n_obs)
+            trainer_target = build_zero_shot_target_trainer(trainer, target_rna.n_obs, keep_vgp_weights=True)
             target_embeddings = trainer_target.infer(
                 target_graph_tf,
                 target_graph_tf,
