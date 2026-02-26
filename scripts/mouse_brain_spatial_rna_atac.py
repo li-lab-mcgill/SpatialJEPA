@@ -88,13 +88,13 @@ def parse_args(notebook: bool = False):
     parser.add_argument(
         "--stage1-epochs",
         type=int,
-        default=3000,
+        default=1000,
         help="Number of epochs to train the model for stage 1.",
     )
     parser.add_argument(
         "--stage2-epochs",
         type=int,
-        default=1000,
+        default=0,
         help="Number of teacher-student distillation epochs on target data for stage 2.",
     )
     parser.add_argument(
@@ -913,14 +913,16 @@ def main():
     # Fail fast if scib-metrics backend is not available.
     require_scib_backend()
 
-    #%% load source data
+    #%% load data
+
+    # SOURCE
     source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned.h5ad"))
     source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned.h5ad"))
 
     source_rna.obsm["spatial"] = source_rna.obsm["spatial"][:, [1, 0]] * -1
     source_atac.obsm["spatial"] = source_atac.obsm["spatial"][:, [1, 0]] * -1
 
-    #%% load target data
+    # TARGET
     target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
     target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
 
@@ -1043,7 +1045,7 @@ def main():
 
     #%% MLflow setup
     experiment_id = setup_mlflow()
-    eval_every = 50
+    eval_every = 1000
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("Training epochs for stage 1:", num_epochs)
@@ -1170,7 +1172,7 @@ def main():
             local_path = os.path.join(tmpdir, "model_stage1.pth")
             torch.save(model_stage1, local_path)
             mlflow.log_artifact(local_path, artifact_path="models")
-
+        #%% stage 2
         if args.stage2_epochs > 0:
             print(
                 "[Stage2 KD] Starting target distillation for {} epochs (lambda_kd={})".format(

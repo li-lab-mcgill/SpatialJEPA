@@ -63,10 +63,10 @@ class MGATE(nn.Module):
         self.W_t = nn.Parameter(torch.empty(emb_dim2, emb_dim2))
         self.logit_scale = nn.Parameter(torch.tensor(float(temp), dtype=torch.float32))
 
-        #self.bn_rna = nn.BatchNorm1d(emb_dim1)
-        #self.bn_atac = nn.BatchNorm1d(emb_dim2)
-        self.bn_rna = nn.Identity()
-        self.bn_atac = nn.Identity()
+        self.bn_rna = nn.BatchNorm1d(emb_dim1)
+        self.bn_atac = nn.BatchNorm1d(emb_dim2)
+        #self.bn_rna = nn.Identity()
+        #self.bn_atac = nn.Identity()
 
         self.reset_parameters()
 
@@ -139,6 +139,9 @@ class MGATE(nn.Module):
         atac_proj = self.bn_atac(torch.matmul(self.H2, self.W_t))
         RNA_e = F.normalize(rna_proj, p=2, dim=1)
         ATAC_e = F.normalize(atac_proj, p=2, dim=1)
+
+        self.H1 = RNA_e
+        self.H2 = ATAC_e
 
         logits = torch.matmul(RNA_e, ATAC_e.transpose(0, 1)) * torch.exp(self.logit_scale)
         labels = torch.arange(logits.shape[0], device=logits.device)
