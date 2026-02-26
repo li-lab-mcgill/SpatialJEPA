@@ -1006,6 +1006,11 @@ def main():
         #MultiGATE.Stats_Spatial_Net(target_rna)
         #MultiGATE.Stats_Spatial_Net(target_atac)
 
+    elif graph_type == 'tangram':
+        tangram_net = pd.read_csv(os.path.join(os.getenv("OUTPATH"), "tangram", "tangram_spatial_net_affinity.csv"))
+        target_rna.uns['Spatial_Net'] = tangram_net
+        target_atac.uns['Spatial_Net'] = tangram_net.copy()    
+
 
     #%% Build reusable graph/data inputs
     bp_width = 400
