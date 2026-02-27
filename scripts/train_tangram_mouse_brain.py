@@ -588,10 +588,10 @@ def main():
     print("  Saved:", pseudocoords_path)
 
     # Raw mapping matrix (sparse, for flexibility)
-    M_sparse = sp.csr_matrix(M)
-    mapping_path = os.path.join(args.output_dir, "tangram_mapping_matrix.npz")
-    sp.save_npz(mapping_path, M_sparse)
-    print("  Saved:", mapping_path)
+    #M_sparse = sp.csr_matrix(M)
+    #mapping_path = os.path.join(args.output_dir, "tangram_mapping_matrix.npz")
+    #sp.save_npz(mapping_path, M_sparse)
+    #print("  Saved:", mapping_path)
 
     # Cell / spot name arrays (index into M rows/columns)
     sc_names_path = os.path.join(args.output_dir, "tangram_sc_obs_names.txt")
