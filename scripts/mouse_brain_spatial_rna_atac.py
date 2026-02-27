@@ -47,7 +47,7 @@ current_path_entries = os.environ.get("PATH", "").split(os.pathsep)
 if env_bin and env_bin not in current_path_entries:
     os.environ["PATH"] = env_bin + os.pathsep + os.environ.get("PATH", "")
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+#os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import matplotlib.pyplot as plt
 import mlflow
@@ -88,13 +88,13 @@ def parse_args(notebook: bool = False):
     parser.add_argument(
         "--stage1-epochs",
         type=int,
-        default=1000,
+        default=500,
         help="Number of epochs to train the model for stage 1.",
     )
     parser.add_argument(
         "--stage2-epochs",
         type=int,
-        default=0,
+        default=10,
         help="Number of teacher-student distillation epochs on target data for stage 2.",
     )
     parser.add_argument(
@@ -1005,6 +1005,13 @@ def main():
         MultiGATE.Cal_gene_peak_Net_new(target_rna, target_atac, 150000, file=gtf_path)
         target_rna.uns["gene_peak_Net"] = target_atac.uns["gene_peak_Net"]
 
+    elif args.spatial_graph_type == 'tangram':
+        tangram_net = pd.read_csv(os.path.join(os.getenv("OUTPATH"), "tangram", "tangram_spatial_net_affinity.csv"))
+        target_rna.uns['Spatial_Net'] = tangram_net
+        target_atac.uns['Spatial_Net'] = tangram_net.copy()
+        MultiGATE.Cal_gene_peak_Net_new(target_rna, target_atac, 150000, file=gtf_path)
+        target_rna.uns["gene_peak_Net"] = target_atac.uns["gene_peak_Net"]
+
     elif args.spatial_graph_type == "knn":
         target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
         target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
@@ -1023,12 +1030,7 @@ def main():
         target_rna.uns["Spatial_Net"] = pd.DataFrame(columns=['Cell1', 'Cell2', 'Distance'])
         target_atac.uns["Spatial_Net"] = target_rna.uns["Spatial_Net"].copy()
         #MultiGATE.Stats_Spatial_Net(target_rna)
-        #MultiGATE.Stats_Spatial_Net(target_atac)
-
-    elif args.spatial_graph_type == 'tangram':
-        tangram_net = pd.read_csv(os.path.join(os.getenv("OUTPATH"), "tangram", "tangram_spatial_net_affinity.csv"))
-        target_rna.uns['Spatial_Net'] = tangram_net
-        target_atac.uns['Spatial_Net'] = tangram_net.copy()    
+        #MultiGATE.Stats_Spatial_Net(target_atac) 
 
 
     #%% Build reusable graph/data inputs

@@ -444,7 +444,7 @@ def mapping_matrix_to_spatial_net_pseudocoords(M, obs_names, sp_coords, k, devic
 # ---------------------------------------------------------------------------
 
 def main():
-
+#%%
     notebook = is_notebook()
     args = parse_args(notebook=notebook)
 
@@ -485,6 +485,11 @@ def main():
 
     if socket.gethostname() != "ri-muhc-gpu":
         # Replicate the HVG override in mouse_brain_spatial_rna_atac.py
+        # Rank 0 = highest dispersion, 1 = second highest, ... (correct per-gene rank)
+        order = (-adata_sp.var["dispersions_norm"]).argsort()
+        rank = np.empty(len(order), dtype=order.dtype)
+        rank[order] = np.arange(len(order))
+        adata_sp.var["highly_variable_rank"] = rank
         adata_sp.var["highly_variable"] = False
         adata_sp.var.loc[
             adata_sp.var["highly_variable_rank"].le(args.n_top_genes - 1),
@@ -536,7 +541,7 @@ def main():
         density_prior=args.density_prior,
         num_epochs=args.n_epochs,
         device=args.device,
-        verbose=False,
+        verbose=True,
     )
     if args.mode == "clusters":
         map_kwargs["cluster_label"] = args.cluster_label
@@ -545,6 +550,10 @@ def main():
     # adata_map.X : (n_sc_cells, n_sp_spots) mapping matrix
 
     print("  Mapping matrix shape:", adata_map.X.shape)
+
+    # Plot Tangram results
+    print("\nPlotting Tangram results...")
+    tg.plot_training_scores(adata_map, bins=10, alpha=.5)
 
     # ------------------------------------------------------------------
     # 5. Extract mapping matrix M
@@ -612,6 +621,8 @@ def main():
         "        target_atac.uns['Spatial_Net'] = tangram_net.copy()".format(affinity_path)
     )
 
-
+#%%
 if __name__ == "__main__":
     main()
+
+# %%
