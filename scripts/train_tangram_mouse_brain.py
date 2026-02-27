@@ -490,6 +490,7 @@ def main():
         rank = np.empty(len(order), dtype=order.dtype)
         rank[order] = np.arange(len(order))
         adata_sp.var["highly_variable_rank"] = rank
+        
         adata_sp.var["highly_variable"] = False
         adata_sp.var.loc[
             adata_sp.var["highly_variable_rank"].le(args.n_top_genes - 1),
