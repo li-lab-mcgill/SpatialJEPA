@@ -56,13 +56,8 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 try:
     import tangram as tg
-except ImportError as exc:
-    raise ImportError(
-        "tangram-sc is required. Install it with:\n"
-        "  pip install tangram-sc\n"
-        "or:\n"
-        "  conda install -c conda-forge tangram-sc"
-    ) from exc
+except:
+    from scvi.external import Tangram as tg
 
 import numpy as np
 import pandas as pd
@@ -94,7 +89,7 @@ def is_notebook():
             return False
     except Exception:
         return False
-        
+
 def parse_args(notebook=False):
     base_path = os.path.join(os.getenv("DATAPATH"), "aligned_data")
     default_output_dir = os.path.join(os.getenv("OUTPATH", os.path.join(os.getenv("DATAPATH"), "..", "outputs")), "tangram")
@@ -104,20 +99,18 @@ def parse_args(notebook=False):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--sp-path",
+        "--source-data",
         type=str,
-        default=os.path.join(base_path, "source_rna_aligned.h5ad"),
-        help="Path to the spatial RNA reference AnnData (must have obsm['spatial']).",
+        choices=["spatial_rna_atac"],
+        default="spatial_rna_atac",
+        help="Source RNA data to use for Tangram training.",
     )
     parser.add_argument(
-        "--sc-path",
+        "--target-data",
         type=str,
-        default=os.path.join(base_path, "source_rna_aligned.h5ad"),
-        help=(
-            "Path to the sc RNA query AnnData (the dataset you want to assign "
-            "pseudo-spatial coordinates to).  Defaults to the same file as "
-            "--sp-path (self-mapping, useful for pipeline validation)."
-        ),
+        choices=["10x_mouse_brain", "10x_mouse_brain_AD"],
+        default="10x_mouse_brain",
+        help="Target RNA data to use for Tangram mapping.",
     )
     parser.add_argument(
         "--n-top-genes",
@@ -131,7 +124,7 @@ def parse_args(notebook=False):
     parser.add_argument(
         "--n-epochs",
         type=int,
-        default=1000,
+        default=10,
         help="Number of Tangram optimisation epochs.",
     )
     parser.add_argument(
@@ -271,13 +264,14 @@ def mapping_matrix_to_spatial_net_pseudocoords(M, obs_names, sp_coords, k):
     return pd.DataFrame({"Cell1": cell1, "Cell2": cell2, "Distance": dist_vals})
 
 
-# ---------------------------------------------------------------------------
+#%% ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
+
     notebook = is_notebook()
-    args = parse_args()
+    args = parse_args(notebook=notebook)
 
     if args.mode == "clusters" and args.cluster_label is None:
         raise ValueError("--cluster-label is required when --mode=clusters.")
@@ -289,8 +283,12 @@ def main():
     # 1. Load data
     # ------------------------------------------------------------------
     print("\n[1] Loading data...")
-    adata_sp = sc.read_h5ad(args.sp_path)
-    adata_sc = sc.read_h5ad(args.sc_path)
+    
+    if args.source_data == "spatial_rna_atac":
+        adata_sp = sc.read_h5ad(os.path.join(os.getenv("DATAPATH"), "aligned_data", "source_rna_aligned.h5ad"))
+
+    if args.target_data == "10x_mouse_brain":
+        adata_sc = sc.read_h5ad(os.path.join(os.getenv("DATAPATH"), "aligned_data", "target_rna_aligned.h5ad"))
 
     print("  Spatial reference: {} cells, {} genes".format(adata_sp.n_obs, adata_sp.n_vars))
     print("  SC query:          {} cells, {} genes".format(adata_sc.n_obs, adata_sc.n_vars))
