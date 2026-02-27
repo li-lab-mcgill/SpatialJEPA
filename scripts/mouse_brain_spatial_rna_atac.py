@@ -924,7 +924,7 @@ def is_notebook():
 
 #%%
 def main():
-
+#%%
     NOTEBOOK = is_notebook()
     args = parse_args(notebook=NOTEBOOK)
     if args.target_subsample_n <= 0:
@@ -964,6 +964,18 @@ def main():
 
         top_n_genes = 2000
         top_n_peaks = 10000
+
+        if 'highly_variable_rank' not in source_rna.var.columns:
+            order = (-source_rna.var["dispersions_norm"]).argsort()
+            rank = np.empty(len(order), dtype=order.dtype)
+            rank[order] = np.arange(len(order))
+            source_rna.var["highly_variable_rank"] = rank
+
+            order = (-source_atac.var["dispersions_norm"]).argsort()
+            rank = np.empty(len(order), dtype=order.dtype)
+            rank[order] = np.arange(len(order))
+            source_atac.var["highly_variable_rank"] = rank
+            
         source_rna.var.loc[source_rna.var["highly_variable_rank"].le(top_n_genes - 1), "highly_variable"] = True
         source_atac.var.loc[source_atac.var["highly_variable_rank"].le(top_n_peaks - 1), "highly_variable"] = True
 
