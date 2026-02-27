@@ -196,72 +196,247 @@ def select_hvgs(adata, n_top):
     return hvg_names
 
 
-def mapping_matrix_to_spatial_net_affinity(M, obs_names, k):
+try:
+    import faiss
+except ImportError:
+    import torch
+    print("faiss is not installed. Using torch.nn.functional.pdist instead.")
+
+def _faiss_gpu_exact_knn_remove_self(
+    X,
+    k,
+    metric="ip",  # "ip" (inner product) or "l2"
+    gpu_id=0,
+):
     """
-    Option B: build a cell-cell kNN graph from cosine similarity of M rows.
+    Exact FAISS GPU kNN with robust self-neighbor removal.
 
-    M : (n_cells, n_spots) ndarray — each row is a cell's probability
-        distribution over spatial spots.
-    obs_names : array-like of length n_cells — cell barcodes.
-    k : int — number of nearest neighbours per cell.
+    Parameters
+    ----------
+    X : ndarray, shape (n_samples, d)
+        Input vectors (float32 will be enforced).
+    k : int
+        Number of non-self neighbors to return.
+    metric : {"ip", "l2"}
+        "ip" for inner product search (use with L2-normalized vectors for cosine),
+        "l2" for Euclidean search.
+    gpu_id : int
+        GPU device id.
 
-    Returns a DataFrame with columns Cell1, Cell2, Distance (1 - cosine_sim),
-    compatible with adata.uns['Spatial_Net'].
+    Returns
+    -------
+    Dk : ndarray, shape (n_samples, k)
+        Distances (for metric="ip", this is similarity; caller may convert).
+        For metric="l2", FAISS returns squared L2 distances.
+    Ik : ndarray, shape (n_samples, k)
+        Neighbor indices (self removed).
     """
-    # Cosine similarity: normalise rows then dot-product
-    M_norm = normalize(M, norm="l2", axis=1)
-    # NearestNeighbors with cosine metric; k+1 to exclude the cell itself
-    nbrs = NearestNeighbors(n_neighbors=k + 1, metric="cosine", algorithm="brute")
-    nbrs.fit(M_norm)
-    distances, indices = nbrs.kneighbors(M_norm)
+    X = np.ascontiguousarray(X.astype(np.float32))
+    n, d = X.shape
 
-    # distances[:,0] == 0 (self); slice it off
-    distances = distances[:, 1:]   # cosine distance = 1 - cosine_similarity
-    indices = indices[:, 1:]
+    if k >= n:
+        raise ValueError(f"k must be < n_samples (got k={k}, n_samples={n})")
 
+    # Build exact GPU index
+    res = faiss.StandardGpuResources()
+
+    if metric == "ip":
+        cpu_index = faiss.IndexFlatIP(d)
+    elif metric == "l2":
+        cpu_index = faiss.IndexFlatL2(d)
+    else:
+        raise ValueError("metric must be 'ip' or 'l2'")
+
+    gpu_index = faiss.index_cpu_to_gpu(res, gpu_id, cpu_index)
+    gpu_index.add(X)
+
+    # Search k+1 to allow self-hit
+    D, I = gpu_index.search(X, k + 1)
+
+    # Robust self-removal (do not assume self is always the first neighbor)
+    rows = np.arange(n)[:, None]
+    is_self = (I == rows)
+
+    Dk = np.empty((n, k), dtype=D.dtype)
+    Ik = np.empty((n, k), dtype=I.dtype)
+
+    for i in range(n):
+        keep = ~is_self[i]
+        Ii = I[i][keep]
+        Di = D[i][keep]
+
+        if Ii.shape[0] < k:
+            # Rare edge case fallback: request more neighbors from CPU exact index
+            # (e.g., pathological duplicate/self behavior)
+            # This keeps behavior safe and deterministic.
+            extra_cpu = faiss.IndexFlatIP(d) if metric == "ip" else faiss.IndexFlatL2(d)
+            extra_cpu.add(X)
+            D2, I2 = extra_cpu.search(X[i:i+1], min(n, k + 5))
+            I2 = I2[0]
+            D2 = D2[0]
+            mask2 = I2 != i
+            Ii = I2[mask2][:k]
+            Di = D2[mask2][:k]
+
+        Ik[i] = Ii[:k]
+        Dk[i] = Di[:k]
+
+    return Dk, Ik
+
+def _torch_knn_exact_remove_self(
+    X,
+    k,
+    metric="cosine",   # "cosine" or "euclidean"
+    device="cuda",
+    chunk_size=None,   # optional: set for memory-safe chunked search
+):
+    """
+    Exact kNN with PyTorch on GPU (or CPU), with self-loop removal.
+
+    Parameters
+    ----------
+    X : ndarray, shape (n_samples, d)
+    k : int
+        Number of non-self neighbors to return.
+    metric : {"cosine", "euclidean"}
+    device : str
+        "cuda" or "cpu"
+    chunk_size : int or None
+        If None, compute full pairwise matrix. If set, do query-chunked search.
+
+    Returns
+    -------
+    distances : ndarray, shape (n_samples, k)
+        cosine distance (1 - cosine sim) or Euclidean distance
+    indices : ndarray, shape (n_samples, k)
+    """
+    X = np.asarray(X, dtype=np.float32)
+    n, d = X.shape
+    if k >= n:
+        raise ValueError(f"k must be < n_samples (got k={k}, n_samples={n})")
+
+    dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
+    Xt = torch.from_numpy(X).to(dev)
+
+    # Optional normalization for cosine
+    if metric == "cosine":
+        Xt = torch.nn.functional.normalize(Xt, p=2, dim=1)
+
+    all_dists = []
+    all_inds = []
+
+    # Full-matrix mode
+    if chunk_size is None:
+        if metric == "cosine":
+            # similarity matrix
+            S = Xt @ Xt.T
+            # remove self by setting similarity to -inf
+            S.fill_diagonal_(-float("inf"))
+            vals, inds = torch.topk(S, k=k, dim=1, largest=True, sorted=True)
+            dists = 1.0 - vals  # cosine distance
+        elif metric == "euclidean":
+            D = torch.cdist(Xt, Xt, p=2)  # exact Euclidean
+            D.fill_diagonal_(float("inf"))
+            dists, inds = torch.topk(D, k=k, dim=1, largest=False, sorted=True)
+        else:
+            raise ValueError("metric must be 'cosine' or 'euclidean'")
+
+        return dists.detach().cpu().numpy(), inds.detach().cpu().numpy()
+
+    # Chunked mode (memory safer)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        Q = Xt[start:end]
+
+        if metric == "cosine":
+            S = Q @ Xt.T  # (chunk, n)
+            row_idx = torch.arange(start, end, device=dev)
+            S[torch.arange(end - start, device=dev), row_idx] = -float("inf")
+            vals, inds = torch.topk(S, k=k, dim=1, largest=True, sorted=True)
+            dists = 1.0 - vals
+        elif metric == "euclidean":
+            D = torch.cdist(Q, Xt, p=2)
+            row_idx = torch.arange(start, end, device=dev)
+            D[torch.arange(end - start, device=dev), row_idx] = float("inf")
+            dists, inds = torch.topk(D, k=k, dim=1, largest=False, sorted=True)
+        else:
+            raise ValueError("metric must be 'cosine' or 'euclidean'")
+
+        all_dists.append(dists.detach().cpu())
+        all_inds.append(inds.detach().cpu())
+
+    distances = torch.cat(all_dists, dim=0).numpy()
+    indices = torch.cat(all_inds, dim=0).numpy()
+    return distances, indices
+
+
+def mapping_matrix_to_spatial_net_affinity(M, obs_names, k, device="cuda", chunk_size=None):
+    """
+    Option B: build a cell-cell kNN graph from cosine similarity of M rows
+    using PyTorch exact search (GPU if available), with self-loops removed.
+
+    M : (n_cells, n_spots) ndarray
+    obs_names : array-like length n_cells
+    k : int
+    device : "cuda" or "cpu"
+    chunk_size : int or None
+        Use chunking if n_cells is large to avoid OOM.
+    """
+    M = np.asarray(M, dtype=np.float32)
+
+    # Exact cosine kNN (internally L2-normalizes and removes self)
+    distances, indices = _torch_knn_exact_remove_self(
+        M, k=k, metric="cosine", device=device, chunk_size=chunk_size
+    )
+
+    obs_names = np.asarray(obs_names)
     n_cells = M.shape[0]
-    cell1, cell2, dist_vals = [], [], []
-    for i in range(n_cells):
-        for rank in range(k):
-            j = int(indices[i, rank])
-            cell1.append(obs_names[i])
-            cell2.append(obs_names[j])
-            dist_vals.append(float(distances[i, rank]))
 
-    return pd.DataFrame({"Cell1": cell1, "Cell2": cell2, "Distance": dist_vals})
+    src_idx = np.repeat(np.arange(n_cells), k)
+    dst_idx = indices.reshape(-1)
+    dist_vals = distances.reshape(-1).astype(np.float32)
+
+    return pd.DataFrame({
+        "Cell1": obs_names[src_idx],
+        "Cell2": obs_names[dst_idx],
+        "Distance": dist_vals,
+    })
 
 
-def mapping_matrix_to_spatial_net_pseudocoords(M, obs_names, sp_coords, k):
+def mapping_matrix_to_spatial_net_pseudocoords(M, obs_names, sp_coords, k, device="cuda", chunk_size=None):
     """
-    Option A: assign pseudo-2-D coordinates to each sc cell via x̃ = M @ coords,
-    then build a kNN graph on those coordinates.
+    Option A: assign pseudo-2-D coordinates via x̃ = M @ coords,
+    then build a kNN graph on those coordinates (Euclidean)
+    using PyTorch exact search (GPU if available), with self-loops removed.
 
     M          : (n_cells, n_spots) ndarray
     obs_names  : array-like of length n_cells
-    sp_coords  : (n_spots, 2) ndarray — spatial coordinates of each spot
-    k          : int — number of nearest neighbours
-
-    Returns a DataFrame with columns Cell1, Cell2, Distance.
+    sp_coords  : (n_spots, 2) ndarray
+    k          : int
+    device     : "cuda" or "cpu"
+    chunk_size : int or None
     """
+    M = np.asarray(M, dtype=np.float32)
+    sp_coords = np.asarray(sp_coords, dtype=np.float32)
+
     pseudo_coords = M @ sp_coords  # (n_cells, 2)
 
-    nbrs = NearestNeighbors(n_neighbors=k + 1, metric="euclidean")
-    nbrs.fit(pseudo_coords)
-    distances, indices = nbrs.kneighbors(pseudo_coords)
+    distances, indices = _torch_knn_exact_remove_self(
+        pseudo_coords, k=k, metric="euclidean", device=device, chunk_size=chunk_size
+    )
 
-    distances = distances[:, 1:]
-    indices = indices[:, 1:]
+    obs_names = np.asarray(obs_names)
+    n_cells = pseudo_coords.shape[0]
 
-    n_cells = M.shape[0]
-    cell1, cell2, dist_vals = [], [], []
-    for i in range(n_cells):
-        for rank in range(k):
-            j = int(indices[i, rank])
-            cell1.append(obs_names[i])
-            cell2.append(obs_names[j])
-            dist_vals.append(float(distances[i, rank]))
+    src_idx = np.repeat(np.arange(n_cells), k)
+    dst_idx = indices.reshape(-1)
+    dist_vals = distances.reshape(-1).astype(np.float32)
 
-    return pd.DataFrame({"Cell1": cell1, "Cell2": cell2, "Distance": dist_vals})
+    return pd.DataFrame({
+        "Cell1": obs_names[src_idx],
+        "Cell2": obs_names[dst_idx],
+        "Distance": dist_vals,
+    })
 
 
 #%% ---------------------------------------------------------------------------
