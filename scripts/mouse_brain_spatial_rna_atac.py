@@ -1018,10 +1018,12 @@ def main():
 
     elif args.spatial_graph_type == 'tangram':
         tangram_net = pd.read_csv(os.path.join(os.getenv("OUTPATH"), "tangram", "tangram_spatial_net_affinity.csv"))
-        target_rna.uns['Spatial_Net'] = tangram_net
+        target_rna.uns['Spatial_Net'] = tangram_net.copy()
         target_atac.uns['Spatial_Net'] = tangram_net.copy()
         MultiGATE.Cal_gene_peak_Net_new(target_rna, target_atac, 150000, file=gtf_path)
         target_rna.uns["gene_peak_Net"] = target_atac.uns["gene_peak_Net"]
+        target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
+        target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
 
     elif args.spatial_graph_type == "knn":
         target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
@@ -1041,7 +1043,15 @@ def main():
         target_rna.uns["Spatial_Net"] = pd.DataFrame(columns=['Cell1', 'Cell2', 'Distance'])
         target_atac.uns["Spatial_Net"] = target_rna.uns["Spatial_Net"].copy()
         #MultiGATE.Stats_Spatial_Net(target_rna)
-        #MultiGATE.Stats_Spatial_Net(target_atac) 
+        #MultiGATE.Stats_Spatial_Net(target_atac)
+
+    print("[INFO] Pairing and subsampling target data...")
+    target_rna, target_atac = pair_and_subsample_target(
+        target_rna,
+        target_atac,
+        subsample_n=args.target_subsample_n,
+        seed=args.target_subsample_seed,
+    )
 
 
     #%% Build reusable graph/data inputs
