@@ -137,7 +137,7 @@ def parse_args(notebook=False):
         "--mode",
         type=str,
         choices=["cells", "clusters"],
-        default="cells",
+        default="clusters",
         help=(
             "Tangram mapping mode. 'cells' maps each sc cell individually "
             "(accurate, slower for large datasets).  'clusters' maps cell "
@@ -147,7 +147,7 @@ def parse_args(notebook=False):
     parser.add_argument(
         "--cluster-label",
         type=str,
-        default=None,
+        default='REF_arc_gex_graphclust_Cluster',
         help="obs key for pre-computed cluster labels. Required when --mode=clusters.",
     )
     parser.add_argument(
@@ -528,7 +528,7 @@ def main():
         )
     )
 
-    # ------------------------------------------------------------------
+    #%% ------------------------------------------------------------------
     # 4. Run Tangram mapping
     # ------------------------------------------------------------------
     print("\n[4] Running Tangram mapping (mode={}, n_epochs={}, device={})...".format(
@@ -552,11 +552,27 @@ def main():
 
     print("  Mapping matrix shape:", adata_map.X.shape)
 
-    # Plot Tangram results
+    #%% Plot Tangram results
     print("\nPlotting Tangram results...")
     tg.plot_training_scores(adata_map, bins=10, alpha=.5)
 
-    # ------------------------------------------------------------------
+    ad_ge = tg.project_genes(adata_map=adata_map, adata_sc=adata_sc_tg, cluster_label=args.cluster_label if args.mode == "clusters" else None)
+    df_all_genes = tg.compare_spatial_geneexp(ad_ge, adata_sp_tg, adata_sc_tg)
+
+    # create patch for seaborn scatterplot to accept x and y as positional arguments
+    import seaborn as sns
+    _sns_scatterplot_orig = sns.scatterplot
+    def _scatterplot_pos_to_kw(*args, **kwargs):
+        if len(args) >= 2 and "x" not in kwargs and "y" not in kwargs:
+            kwargs["x"], kwargs["y"] = args[0], args[1]
+            args = args[2:]
+        return _sns_scatterplot_orig(*args, **kwargs)
+    sns.scatterplot = _scatterplot_pos_to_kw
+
+    # plot AUC curve
+    tg.plot_auc(df_all_genes)
+
+    #%% ------------------------------------------------------------------
     # 5. Extract mapping matrix M
     # ------------------------------------------------------------------
     M = adata_map.X
