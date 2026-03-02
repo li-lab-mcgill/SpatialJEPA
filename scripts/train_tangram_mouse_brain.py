@@ -65,6 +65,7 @@ import scanpy as sc
 import scipy.sparse as sp
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
+import squidpy.datasets as sq_datasets
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -101,15 +102,15 @@ def parse_args(notebook=False):
     parser.add_argument(
         "--source-data",
         type=str,
-        choices=["spatial_rna_atac"],
-        default="spatial_rna_atac",
+        choices=["spatial_rna_atac", "sq_visium_fluo_adata_crop"],
+        default="visium_fluo_adata_crop",
         help="Source RNA data to use for Tangram training.",
     )
     parser.add_argument(
         "--target-data",
         type=str,
-        choices=["10x_mouse_brain", "10x_mouse_brain_AD"],
-        default="10x_mouse_brain",
+        choices=["10x_mouse_brain", "10x_mouse_brain_AD", "sq_sc_mouse_cortex"],
+        default="sq_sc_mouse_cortex",
         help="Target RNA data to use for Tangram mapping.",
     )
     parser.add_argument(
@@ -137,7 +138,7 @@ def parse_args(notebook=False):
         "--mode",
         type=str,
         choices=["cells", "clusters"],
-        default="clusters",
+        default="cells",
         help=(
             "Tangram mapping mode. 'cells' maps each sc cell individually "
             "(accurate, slower for large datasets).  'clusters' maps cell "
@@ -461,9 +462,13 @@ def main():
     
     if args.source_data == "spatial_rna_atac":
         adata_sp = sc.read_h5ad(os.path.join(os.getenv("DATAPATH"), "aligned_data", "source_rna_aligned.h5ad"))
+    elif args.source_data == "sq_visium_fluo_adata_crop":
+        adata_sp = sq_datasets.visium_fluo_adata_crop(path=os.path.join(os.getenv("DATAPATH"), "squidpy_data", "sq_visium_fluo_adata_crop"))
 
     if args.target_data == "10x_mouse_brain":
         adata_sc = sc.read_h5ad(os.path.join(os.getenv("DATAPATH"), "aligned_data", "target_rna_aligned.h5ad"))
+    elif args.target_data == "sq_sc_mouse_cortex":
+        adata_sc = sq_datasets.sc_mouse_cortex(path=os.path.join(os.getenv("DATAPATH"), "squidpy_data", "sq_sc_mouse_cortex"))
 
     print("  Spatial reference: {} cells, {} genes".format(adata_sp.n_obs, adata_sp.n_vars))
     print("  SC query:          {} cells, {} genes".format(adata_sc.n_obs, adata_sc.n_vars))
