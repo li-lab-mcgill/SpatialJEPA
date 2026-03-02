@@ -142,7 +142,7 @@ def parse_args(notebook: bool = False):
         "--spatial-graph-type",
         type=str,
         choices=["spatial", "knn", "identity", "tangram"],
-        default="spatial",
+        default="tangram",
         help="Type of graph to use for MultiGATE.",
     )
     if notebook:
@@ -169,13 +169,7 @@ def prepare_graph_data(adj):
     return (indices, adj.data, adj.shape)
 
 
-def build_graph_inputs(adata1, adata2, bp_width=450, graph_type="ATAC", protein_value=0.001):
-    if "highly_variable" in adata1.var.columns and "highly_variable" in adata2.var.columns:
-        adata_vars1 = adata1[:, adata1.var["highly_variable"]]
-        adata_vars2 = adata2[:, adata2.var["highly_variable"]]
-    else:
-        adata_vars1 = adata1
-        adata_vars2 = adata2
+def build_graph_inputs(adata_vars1, adata_vars2, bp_width=450, graph_type="ATAC", protein_value=0.001):
 
     x1 = _to_dense_df(adata_vars1)
     x2 = _to_dense_df(adata_vars2)
@@ -188,7 +182,7 @@ def build_graph_inputs(adata1, adata2, bp_width=450, graph_type="ATAC", protein_
     genes_id_tran = dict(zip(genes, range(genes.shape[0])))
     peaks_id_tran = dict(zip(peaks, range(peaks.shape[0])))
 
-    if "Spatial_Net" not in adata1.uns:
+    if "Spatial_Net" not in adata_vars1.uns:
         raise ValueError("Spatial_Net is not existed! Run Cal_Spatial_Net first!")
 
     spatial_net = adata_vars1.uns["Spatial_Net"]
@@ -204,7 +198,7 @@ def build_graph_inputs(adata1, adata2, bp_width=450, graph_type="ATAC", protein_
     )
     graph_tf = prepare_graph_data(graph)
 
-    if "gene_peak_Net" not in adata1.uns:
+    if "gene_peak_Net" not in adata_vars1.uns:
         raise ValueError("gene_peak_Net is not existed! Run Cal_gene_peak_Net first!")
 
     gene_peak_net = adata_vars1.uns["gene_peak_Net"]
@@ -1017,13 +1011,13 @@ def main():
         target_rna.uns["gene_peak_Net"] = target_atac.uns["gene_peak_Net"]
 
     elif args.spatial_graph_type == 'tangram':
+        target_rna = target_rna[:, target_rna.var_names.isin(source_rna.var_names)].copy()
+        target_atac = target_atac[:, target_atac.var_names.isin(source_atac.var_names)].copy()
         tangram_net = pd.read_csv(os.path.join(os.getenv("OUTPATH"), "tangram", "tangram_spatial_net_affinity.csv"))
         target_rna.uns['Spatial_Net'] = tangram_net.copy()
         target_atac.uns['Spatial_Net'] = tangram_net.copy()
-        MultiGATE.Cal_gene_peak_Net_new(target_rna, target_atac, 150000, file=gtf_path)
-        target_rna.uns["gene_peak_Net"] = target_atac.uns["gene_peak_Net"]
-        target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
-        target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
+        target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"].copy()
+        target_atac.uns["gene_peak_Net"] = source_atac.uns["gene_peak_Net"].copy()
 
     elif args.spatial_graph_type == "knn":
         target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
