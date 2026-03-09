@@ -1195,7 +1195,7 @@ def main():
         source_student_graph_tf = build_source_student_graph_tf(
             source_rna=source_rna,
             spatial_graph_type=args.spatial_graph_type,
-            knn_neighbors=15,
+            #knn_neighbors=15,
         )
         student_trainer = MultiGATETrainer(
             hidden_dims1=[source_x1.shape[1]] + hidden_dims,
@@ -1288,7 +1288,7 @@ def main():
 
                 student_clip_rna, student_clip_atac = student_outputs[5], student_outputs[6]
                 teacher_clip_rna, teacher_clip_atac = teacher_outputs[5], teacher_outputs[6]
-
+                '''
                 student_logits = compute_clip_logits(
                     student_clip_rna,
                     student_clip_atac,
@@ -1299,11 +1299,9 @@ def main():
                     teacher_clip_atac,
                     trainer.mgate.logit_scale,
                 )
-
-                stage1_kd_ot_loss = compute_ot_clip_loss(student_logits, teacher_logits, emd=stage1_emd)
-                stage1_kd_kl_loss = compute_kd_kl_loss(student_logits, teacher_logits)
-                stage1_kd_kl_loss = stage1_kd_kl_loss * 50
-                stage1_distill_loss = args.lambda_kd * (0.1 * stage1_kd_kl_loss + 0.9 * stage1_kd_ot_loss)
+                '''
+                #stage1_kd_kl_loss = compute_kd_kl_loss(student_logits, teacher_logits)
+                stage1_distill_loss = F.mse_loss(student_clip_rna, teacher_clip_rna) + F.mse_loss(student_clip_atac, teacher_clip_atac)
 
                 stage1_distill_loss.backward()
                 torch.nn.utils.clip_grad_norm_(student_trainer.mgate.parameters(), student_trainer.gradient_clipping)
@@ -1315,17 +1313,15 @@ def main():
                     step=epoch,
                 )
                 mlflow.log_metric(
-                    "stage1_student_kd_kl_loss",
-                    float(stage1_kd_kl_loss.detach().cpu().item()),
-                    step=epoch,
-                )
-                mlflow.log_metric(
-                    "stage1_student_kd_ot_clip_loss",
-                    float(stage1_kd_ot_loss.detach().cpu().item()),
+                    "stage1_student_distill_loss",
+                    float(stage1_distill_loss.detach().cpu().item()),
                     step=epoch,
                 )
 
-            should_eval = (epoch == 1) or (epoch % eval_every == 0) or (epoch == num_epochs)
+            should_eval = \
+                ((epoch == 1) or (epoch % eval_every == 0) or (epoch == num_epochs)) and \
+                eval_every > 0
+
             if not should_eval:
                 continue
 
