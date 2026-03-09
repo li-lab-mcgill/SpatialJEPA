@@ -64,8 +64,10 @@ class MGATE(nn.Module):
         self.W_t = nn.Parameter(torch.empty(emb_dim2, emb_dim2))
         self.logit_scale = nn.Parameter(torch.tensor(float(temp), dtype=torch.float32))
 
-        self.bn_rna = nn.BatchNorm1d(emb_dim1)
-        self.bn_atac = nn.BatchNorm1d(emb_dim2)
+        self.bn_rna = nn.LayerNorm(emb_dim1)
+        self.bn_atac = nn.LayerNorm(emb_dim2)
+        #self.bn_rna = nn.BatchNorm1d(emb_dim1)
+        #self.bn_atac = nn.BatchNorm1d(emb_dim2)
         #self.bn_rna = nn.Identity()
         #self.bn_atac = nn.Identity()
 
