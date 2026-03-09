@@ -145,6 +145,12 @@ def parse_args(notebook: bool = False):
         default="tangram",
         help="Type of graph to use for MultiGATE.",
     )
+    parser.add_argument(
+        "--switcharoo",
+        action="store_true",
+        default=False,
+        help="If set, swap source and target.",
+    )
     if notebook:
         return parser.parse_known_args()[0]
     else:
@@ -1047,6 +1053,18 @@ def main():
         seed=args.target_subsample_seed,
     )
 
+    #%% swap source and target
+
+    if args.switcharoo:
+
+        source_rna_tmp = source_rna.copy()
+        source_atac_tmp = source_atac.copy()
+
+        source_rna = target_rna.copy()
+        source_atac = target_atac.copy()
+
+        target_rna = source_rna_tmp.copy()
+        target_atac = source_atac_tmp.copy()
 
     #%% Build reusable graph/data inputs
     bp_width = 400
