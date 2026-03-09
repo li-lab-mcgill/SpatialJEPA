@@ -47,9 +47,8 @@ class MultiGATE(object):
             spot_num=spot_num,
             temp=temp,
             nonlinear=nonlinear,
-            weight_decay=weight_decay,
         ).to(self.device)
-        self.optimizer = torch.optim.Adam(self.mgate.parameters(), lr=self.lr)
+        self.optimizer = torch.optim.Adam(self.mgate.parameters(), lr=self.lr, weight_decay=weight_decay)
 
     def _resolve_device(self, config):
         if isinstance(config, dict) and config.get("device") is not None:

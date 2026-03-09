@@ -1261,6 +1261,7 @@ def main():
         target_scib_effective_label_key_logged = False
 
         for epoch in tqdm(range(1, num_epochs + 1), desc="Stage 1 training", unit="epoch"):
+
             teacher_loss = trainer.run_epoch(epoch, source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t)
             mlflow.log_metric("source_train_loss", float(teacher_loss), step=epoch)
 
@@ -1325,7 +1326,7 @@ def main():
             if not should_eval:
                 continue
 
-            source_embeddings = stage1_primary_trainer.infer(
+            source_embeddings = stage1_primary_trainer.infer( # if args.stage1_dual_source_kd is True, source_embeddings is the stage 1 student source embeddings. Else, source_embeddings is the teacher source embeddings.
                 stage1_primary_source_graph_tf,
                 stage1_primary_source_graph_tf,
                 source_gp_tf,
@@ -1388,6 +1389,7 @@ def main():
                 scib_n_jobs=args.scib_n_jobs,
             )
             log_scib_metrics(prefix="target", metrics=target_scib_metrics, step=epoch)
+
             if not target_scib_label_mode_logged:
                 mlflow.log_param("target_scib_label_mode", target_scib_metrics["label_mode"])
                 target_scib_label_mode_logged = True

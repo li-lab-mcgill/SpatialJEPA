@@ -23,7 +23,6 @@ class MGATE(nn.Module):
             raise ValueError("hidden_dims must define at least one encoder layer")
 
         self.nonlinear = nonlinear
-        self.weight_decay = weight_decay
         self.hidden_dims1 = hidden_dims1
         self.hidden_dims2 = hidden_dims2
         self.temp = temp
@@ -156,13 +155,9 @@ class MGATE(nn.Module):
         features_loss1 = torch.sqrt(torch.sum(torch.pow(X1 - X1_, 2)))
         features_loss2 = torch.sqrt(torch.sum(torch.pow(X2 - X2_, 2)))
 
-        # Manual weight decay to match previous TensorFlow behavior
-        weight_decay_loss = self._weight_decay_penalty()
-
-        self.loss = features_loss1 + features_loss2 + weight_decay_loss + clip_loss
+        self.loss = features_loss1 + features_loss2 + clip_loss
         self.loss_rna = features_loss1
         self.loss_atac = features_loss2
-        self.weight_decay_loss = weight_decay_loss
         self.clip_loss = clip_loss
 
         self.Att_l1 = self.C1
@@ -173,7 +168,7 @@ class MGATE(nn.Module):
             self.loss,
             self.loss_rna,
             self.loss_atac,
-            self.weight_decay_loss,
+            None,
             self.clip_loss,
             self.H1,
             self.H2,
@@ -198,16 +193,6 @@ class MGATE(nn.Module):
             return H # Eq. (10)
 
         return torch.sparse.mm(C[layer - 1], H)
-
-    def _weight_decay_penalty(self):
-        penalty = self.W_i.new_tensor(0.0)
-        for weight in self.W1:
-            penalty = penalty + 0.5 * torch.sum(weight * weight)
-        for weight in self.W2:
-            penalty = penalty + 0.5 * torch.sum(weight * weight)
-        penalty = penalty + 0.5 * torch.sum(self.W_i * self.W_i)
-        penalty = penalty + 0.5 * torch.sum(self.W_t * self.W_t)
-        return penalty * self.weight_decay
 
     def graph_attention_layer(self, A, M, v0, v1):
         A = A.coalesce() # prior feature-feature adjacency matrix, i.e. A_fg in Eq. (4)
