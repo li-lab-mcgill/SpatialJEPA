@@ -818,32 +818,34 @@ def run_stage2_distillation(
             loss_val = float(distill_loss.detach().cpu().item())
             pbar.set_postfix({"distill_loss": "{:.4f}".format(loss_val)})
 
-            set_multigate_embeddings(
-                target_rna,
-                target_atac,
-                student_clip_rna.detach().cpu().numpy(),
-                student_clip_atac.detach().cpu().numpy(),
-                key_added="MultiGATE",
-            )
+            if (epoch % 100 == 0) or (epoch == stage2_epochs):
 
-            # compute and log scib metrics for target data
-            target_scib_metrics = compute_scib_metrics_for_domain(
-                rna_adata=target_rna,
-                atac_adata=target_atac,
-                domain_name="target",
-                label_key=target_label_key,
-                scib_n_jobs=scib_n_jobs,
-            )
-            log_scib_metrics(prefix="stage2_target", metrics=target_scib_metrics, step=epoch)
-            if not target_scib_label_mode_logged:
-                mlflow.log_param("stage2_target_scib_label_mode", target_scib_metrics["label_mode"])
-                target_scib_label_mode_logged = True
-            if not target_scib_effective_label_key_logged:
-                mlflow.log_param(
-                    "stage2_target_scib_effective_label_key",
-                    target_scib_metrics["effective_label_key"],
+                set_multigate_embeddings(
+                    target_rna,
+                    target_atac,
+                    student_clip_rna.detach().cpu().numpy(),
+                    student_clip_atac.detach().cpu().numpy(),
+                    key_added="MultiGATE",
                 )
-                target_scib_effective_label_key_logged = True
+
+                # compute and log scib metrics for target data
+                target_scib_metrics = compute_scib_metrics_for_domain(
+                    rna_adata=target_rna,
+                    atac_adata=target_atac,
+                    domain_name="target",
+                    label_key=target_label_key,
+                    scib_n_jobs=scib_n_jobs,
+                )
+                log_scib_metrics(prefix="stage2_target", metrics=target_scib_metrics, step=epoch)
+                if not target_scib_label_mode_logged:
+                    mlflow.log_param("stage2_target_scib_label_mode", target_scib_metrics["label_mode"])
+                    target_scib_label_mode_logged = True
+                if not target_scib_effective_label_key_logged:
+                    mlflow.log_param(
+                        "stage2_target_scib_effective_label_key",
+                        target_scib_metrics["effective_label_key"],
+                    )
+                    target_scib_effective_label_key_logged = True
 
     final_target_embeddings = student_trainer.infer(
         target_graph_tf,
