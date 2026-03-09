@@ -32,7 +32,6 @@ class MultiGATE(object):
         self.loss_list_atac = []
         self.loss_list = []
         self.loss_list_clip = []
-        self.weight_decay_loss_list = []
 
         self.lr = lr
         self.n_epochs = n_epochs
@@ -117,7 +116,7 @@ class MultiGATE(object):
         self.optimizer.zero_grad()
 
         outputs = self.mgate(A, prune_A, GP, X1, X2)
-        loss, loss_rna, loss_atac, weight_decay_loss, clip_loss = outputs[:5]
+        loss, loss_rna, loss_atac, _, clip_loss = outputs[:5]
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.mgate.parameters(), self.gradient_clipping)
@@ -128,7 +127,6 @@ class MultiGATE(object):
         self.loss_list_atac.append(float(loss_atac.detach().cpu().item()))
         self.loss_list_rna.append(float(loss_rna.detach().cpu().item()))
         self.loss_list_clip.append(float(clip_loss.detach().cpu().item()))
-        self.weight_decay_loss_list.append(float(weight_decay_loss.detach().cpu().item()))
 
         return loss_scalar
 
