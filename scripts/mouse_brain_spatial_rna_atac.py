@@ -76,7 +76,7 @@ def parse_args(notebook: bool = False):
     parser.add_argument(
         "--target-subsample-n",
         type=int,
-        default=1000,
+        default=5000,
         help="Maximum number of paired target cells to keep for live evaluation.",
     )
     parser.add_argument(
@@ -645,24 +645,40 @@ def log_stage_umap_artifacts(
     compute_concat_umap(source_concat_adata, n_neighbors=10, resolution=1.5)
     compute_concat_umap(target_concat_adata, n_neighbors=10, resolution=1.5)
 
+    source_celltype_key = source_rna.uns['label_key']
+    target_celltype_key = target_rna.uns['label_key']
+
+    source_colors = ["modality", "leiden"]
+    source_titles = [
+        "Source Concat Modality ({})".format(stage_label),
+        "Source Concat Leiden ({})".format(stage_label),
+    ]
+    if source_celltype_key is not None:
+        source_colors.append(source_celltype_key)
+        source_titles.append("Source Concat Cell Type ({})".format(stage_label))
+
     log_umap_panel_to_mlflow(
         source_concat_adata,
         artifact_path="umap/{}/source_concat_adata_umap.png".format(stage_label),
-        colors=["modality", "leiden"],
-        titles=[
-            "Source Concat Modality ({})".format(stage_label),
-            "Source Concat Leiden ({})".format(stage_label),
-        ],
+        colors=source_colors,
+        titles=source_titles,
         size=20,
     )
+
+    target_colors = ["modality", "leiden"]
+    target_titles = [
+        "Target Concat Modality ({})".format(stage_label),
+        "Target Concat Leiden ({})".format(stage_label),
+    ]
+    if target_celltype_key is not None:
+        target_colors.append(target_celltype_key)
+        target_titles.append("Target Concat Cell Type ({})".format(stage_label))
+
     log_umap_panel_to_mlflow(
         target_concat_adata,
         artifact_path="umap/{}/target_concat_adata_umap.png".format(stage_label),
-        colors=["modality", "leiden"],
-        titles=[
-            "Target Concat Modality ({})".format(stage_label),
-            "Target Concat Leiden ({})".format(stage_label),
-        ],
+        colors=target_colors,
+        titles=target_titles,
         size=20,
     )
 
@@ -1018,6 +1034,10 @@ def main():
     target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
     assert target_rna.obs_names.equals(target_atac.obs_names), "Target RNA and ATAC must have matching obs_names"
 
+    # Set celltype keys
+    source_rna.uns['label_key'] = 'RNA_clusters'
+    target_rna.uns['label_key'] = 'REF_arc_gex_graphclust_Cluster'
+
     #%% TMP - redo HVG to limit number of features to fit inside GPU memory
     if socket.gethostname() != "ri-muhc-gpu":
         source_rna.var["highly_variable"] = False
@@ -1195,6 +1215,7 @@ def main():
     source_student_a_t = source_student_prune_t = source_student_gp_t = source_student_x1_t = source_student_x2_t = None
 
     if args.stage1_dual_source_kd:
+
         source_student_graph_tf = build_source_student_graph_tf(
             source_rna=source_rna,
             spatial_graph_type=args.spatial_graph_type,
