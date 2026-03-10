@@ -345,7 +345,6 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_mode="ze
         lr=source_trainer.lr,
         gradient_clipping=source_trainer.gradient_clipping,
         nonlinear=source_trainer.mgate.nonlinear,
-        weight_decay=source_trainer.mgate.weight_decay,
         verbose=False,
         random_seed=0,
         config={"device": str(source_trainer.device)},
@@ -803,7 +802,6 @@ def run_stage2_distillation(
         lr=source_trainer.lr,
         gradient_clipping=source_trainer.gradient_clipping,
         nonlinear=source_trainer.mgate.nonlinear,
-        weight_decay=source_trainer.mgate.weight_decay,
         verbose=False,
         random_seed=2021,
         config={"device": str(source_trainer.device)},
@@ -839,7 +837,7 @@ def run_stage2_distillation(
         pbar = tqdm(range(1, stage2_epochs + 1), desc="Stage 2 distillation", unit="epoch")
         for epoch in pbar:
             student_trainer.mgate.train()
-            student_trainer.optimizer.zero_grad()
+            student_trainer.optimizer.zero_grad(set_to_none=True)
 
             student_outputs = student_trainer.mgate(target_a_t, target_prune_t, target_gp_t, target_x1_t, target_x2_t)
             with torch.no_grad():
@@ -900,6 +898,11 @@ def run_stage2_distillation(
                         target_scib_metrics["effective_label_key"],
                     )
                     target_scib_effective_label_key_logged = True
+
+            del student_outputs, teacher_outputs
+            del student_clip_rna, student_clip_atac, teacher_clip_rna, teacher_clip_atac
+            del student_logits, teacher_logits, kd_ot_loss, kd_kl_loss, distill_loss
+            del model_clip_loss, reconstructed_clip_loss
 
     final_target_embeddings = student_trainer.infer(
         target_graph_tf,
@@ -1225,7 +1228,7 @@ def main():
 
     #%% MLflow setup
     experiment_id = setup_mlflow()
-    eval_every = 1000
+    eval_every = 1000 # set to -1 for very basic debugging only, since will skip the incorporation of MultiGATE embeddings into the anndatas
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("Training epochs for stage 1:", num_epochs)
@@ -1266,9 +1269,10 @@ def main():
             mlflow.log_metric("source_train_loss", float(teacher_loss), step=epoch)
 
             if args.stage1_dual_source_kd:
+
                 trainer.mgate.eval()
                 student_trainer.mgate.train()
-                student_trainer.optimizer.zero_grad()
+                student_trainer.optimizer.zero_grad(set_to_none=True)
 
                 with torch.no_grad():
                     teacher_outputs = trainer.mgate(
@@ -1318,6 +1322,9 @@ def main():
                     float(stage1_distill_loss.detach().cpu().item()),
                     step=epoch,
                 )
+                del teacher_outputs, student_outputs
+                del teacher_clip_rna, teacher_clip_atac, student_clip_rna, student_clip_atac
+                del stage1_distill_loss
 
             should_eval = \
                 ((epoch == 1) or (epoch % eval_every == 0) or (epoch == num_epochs)) and \
@@ -1360,6 +1367,10 @@ def main():
                 target_embeddings[1],
                 key_added="MultiGATE",
             )
+            if epoch != num_epochs:
+                del trainer_target, target_embeddings, source_embeddings
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             # compute and log scib metrics for source data
             source_scib_metrics = compute_scib_metrics_for_domain(
@@ -1411,6 +1422,32 @@ def main():
             log_mudata_umaps=args.log_mudata_umaps,
         )
 
+        if args.stage1_dual_source_kd:
+            
+            trainer.mgate.eval()
+            teacher_source_embeddings = trainer.infer(
+                source_graph_tf,
+                source_graph_tf,
+                source_gp_tf,
+                source_x1,
+                source_x2,
+            )
+            set_multigate_embeddings(
+                source_rna,
+                source_atac,
+                teacher_source_embeddings[0],
+                teacher_source_embeddings[1],
+                key_added="MultiGATE",
+            )
+            log_stage_umap_artifacts(
+                source_rna=source_rna,
+                source_atac=source_atac,
+                target_rna=target_rna,
+                target_atac=target_atac,
+                stage_label="stage1_teacher",
+                log_mudata_umaps=args.log_mudata_umaps,
+            )
+
         # log stage-1 model artifacts and attention matrix
         source_peak_gene_attention = source_embeddings[4][0] #peak_gene_attention = source_rna.uns['MultiGATE_gene_peak_attention'][0]
         model_stage1 = stage1_primary_trainer.mgate.state_dict()
@@ -1434,6 +1471,7 @@ def main():
                 local_path = os.path.join(tmpdir, "model_stage1_student.pth")
                 torch.save(model_stage1_student, local_path)
                 mlflow.log_artifact(local_path, artifact_path="models")
+
         #%% stage 2
         if args.stage2_epochs > 0:
             print(

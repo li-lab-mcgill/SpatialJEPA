@@ -113,7 +113,7 @@ class MultiGATE(object):
             A, prune_A, GP, X1, X2 = self._prepare_inputs(A, prune_A, GP, X1, X2)
 
         self.mgate.train()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
         outputs = self.mgate(A, prune_A, GP, X1, X2)
         loss, loss_rna, loss_atac, _, clip_loss = outputs[:5]
