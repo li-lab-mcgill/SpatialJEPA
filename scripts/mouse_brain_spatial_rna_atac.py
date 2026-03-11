@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 #%%
 import argparse
+import json
 import os
 import shutil
 import socket
@@ -840,6 +841,7 @@ def run_stage2_distillation(
     with mlflow.start_run(run_name=stage2_run_name, nested=True):
         mlflow.set_tag("training_stage", "stage2_distillation")
         mlflow.set_tag("teacher_student_distillation", "true")
+        mlflow.log_param("hidden_dims", json.dumps(source_trainer.mgate.hidden_dims1[1:])) # skip first dimension (input size)
         mlflow.log_param("stage2_epochs", stage2_epochs)
         mlflow.log_param("lambda_kd", lambda_kd)
         mlflow.log_param("kd_mix_kl", 0.1)
@@ -1038,105 +1040,47 @@ def main():
     source_rna.uns['label_key'] = 'RNA_clusters'
     target_rna.uns['label_key'] = 'REF_arc_gex_graphclust_Cluster'
 
-    #%% Scale target data to match source data mean expression levels
-    import anndata as ad
-    
-    def aggregate_cells(adata, groupby, agg="sum", layer=None):
-        X = adata.layers[layer] if layer is not None else adata.X
-
-        groups = adata.obs[groupby].astype("category")
-        codes = groups.cat.codes.to_numpy()
-        cats = groups.cat.categories
-
-        G = sp.csr_matrix(
-            (np.ones(adata.n_obs, dtype=np.float32), (codes, np.arange(adata.n_obs))),
-            shape=(len(cats), adata.n_obs),
-        )
-
-        X_agg = G @ X
-
-        if agg == "mean":
-            counts = np.bincount(codes, minlength=len(cats)).astype(np.float32)
-            counts[counts == 0] = 1.0
-            X_agg = sp.diags(1.0 / counts) @ X_agg if sp.issparse(X_agg) else X_agg / counts[:, None]
-        elif agg != "sum":
-            raise ValueError("agg must be 'sum' or 'mean'")
-
-        obs = pd.DataFrame(index=cats.astype(str))
-        obs[groupby] = cats.astype(str)
-
-        return ad.AnnData(X=X_agg, obs=obs, var=adata.var.copy())
-
-    n = target_rna.n_obs
-    group_size = 5
-
-    perm = np.random.permutation(n)
-    group_ids = np.arange(n) // group_size
-    pseudo_ids = np.empty(n, dtype=int)
-    pseudo_ids[perm] = group_ids
-
-    target_rna.obs["pseudo_pixel"] = pseudo_ids.astype(str)
-    target_atac.obs["pseudo_pixel"] = pseudo_ids.astype(str)
-
-    target_rna_pb = aggregate_cells(
-        target_rna,
-        groupby="pseudo_pixel",
-        agg="sum",
-    )
-
-    target_atac_pb = aggregate_cells(
-        target_atac,
-        groupby="pseudo_pixel",
-        agg="sum",
-    )
-
-    target_rna = ad.AnnData(
-        X=target_rna_pb.X,
-        var=target_rna.var,
-        obs = pd.DataFrame(index=target_rna_pb.obs_names),
-        uns = target_rna.uns | {'label_key':None},
-    )
-
-    target_atac = ad.AnnData(
-        X=target_atac_pb.X,
-        var=target_atac.var,
-        obs = pd.DataFrame(index=target_atac_pb.obs_names),
-        uns = target_atac.uns | {'label_key':None},
-    )
-
     #%% TMP - redo HVG to limit number of features to fit inside GPU memory
-    if socket.gethostname() != "ri-muhc-gpu":
-        source_rna.var["highly_variable"] = False
-        source_atac.var["highly_variable"] = False
+    #if socket.gethostname() != "ri-muhc-gpu":
+    source_rna.var["highly_variable"] = False
+    source_atac.var["highly_variable"] = False
 
-        target_rna.var["highly_variable"] = False
-        target_atac.var["highly_variable"] = False
+    target_rna.var["highly_variable"] = False
+    target_atac.var["highly_variable"] = False
 
-        top_n_genes = 2000
-        top_n_peaks = 10000
+    top_n_genes = 5000
+    top_n_peaks = 25000
 
-        if 'highly_variable_rank' not in source_rna.var.columns:
-            order = (-source_rna.var["dispersions_norm"]).argsort()
-            rank = np.empty(len(order), dtype=order.dtype)
-            rank[order] = np.arange(len(order))
-            source_rna.var["highly_variable_rank"] = rank
+    if 'highly_variable_rank' not in source_rna.var.columns:
+        source_rna.var["highly_variable_rank"] = \
+            source_rna.var["dispersions_norm"].rank(ascending=False)
 
-            order = (-source_atac.var["dispersions_norm"]).argsort()
-            rank = np.empty(len(order), dtype=order.dtype)
-            rank[order] = np.arange(len(order))
-            source_atac.var["highly_variable_rank"] = rank
-            
-        source_rna.var.loc[source_rna.var["highly_variable_rank"].le(top_n_genes - 1), "highly_variable"] = True
-        source_atac.var.loc[source_atac.var["highly_variable_rank"].le(top_n_peaks - 1), "highly_variable"] = True
+        source_atac.var["highly_variable_rank"] = \
+            source_atac.var["dispersions_norm"].rank(ascending=False)
 
-        target_rna.var.loc[
-            target_rna.var_names.isin(source_rna.var_names[source_rna.var["highly_variable"]]),
-            "highly_variable",
-        ] = True
-        target_atac.var.loc[
-            target_atac.var_names.isin(source_atac.var_names[source_atac.var["highly_variable"]]),
-            "highly_variable",
-        ] = True
+    if 'highly_variable_rank' not in target_rna.var.columns:
+        target_rna.var["highly_variable_rank"] = \
+            target_rna.var["dispersions_norm"].rank(ascending=False)
+
+        target_atac.var["highly_variable_rank"] = \
+            target_atac.var["dispersions_norm"].rank(ascending=False)
+
+    ## Compute combined rank. Note that may have more than n_top_genes/peaks due to rank ties.
+    rna_combined_rank = pd.concat([
+        source_rna.var["highly_variable_rank"],
+        target_rna.var["highly_variable_rank"]
+        ], axis=1).mean(axis=1).rank(ascending=True, method='min')
+
+    atac_combined_rank = pd.concat([
+        source_atac.var["highly_variable_rank"],
+        target_atac.var["highly_variable_rank"]
+        ], axis=1).mean(axis=1).rank(ascending=True, method='min')
+
+    source_rna.var.loc[rna_combined_rank.le(top_n_genes), "highly_variable"] = True
+    source_atac.var.loc[atac_combined_rank.le(top_n_peaks), "highly_variable"] = True
+
+    target_rna.var.loc[rna_combined_rank.le(top_n_genes), "highly_variable"] = True
+    target_atac.var.loc[atac_combined_rank.le(top_n_peaks), "highly_variable"] = True
 
     #%% source spatial graph
     MultiGATE.Cal_Spatial_Net(source_rna, rad_cutoff=40)
@@ -1327,6 +1271,7 @@ def main():
 
     with mlflow.start_run(run_name=run_name):
         mlflow.log_param("mlflow_experiment_id", experiment_id)
+        mlflow.log_param("hidden_dims", json.dumps(hidden_dims))
         mlflow.log_param("n_epochs", num_epochs)
         mlflow.log_param("stage2_epochs", args.stage2_epochs)
         mlflow.log_param("lambda_kd", args.lambda_kd)
