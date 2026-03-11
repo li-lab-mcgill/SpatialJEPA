@@ -1039,20 +1039,70 @@ def main():
     target_rna.uns['label_key'] = 'REF_arc_gex_graphclust_Cluster'
 
     #%% Scale target data to match source data mean expression levels
-    def nz_mean(adata):
-        X = adata.X.toarray() if sp.issparse(adata.X) else np.asarray(adata.X)
-        return X[X > 0].mean()
+    import anndata as ad
+    
+    def aggregate_cells(adata, groupby, agg="sum", layer=None):
+        X = adata.layers[layer] if layer is not None else adata.X
 
-    rna_scale  = nz_mean(source_rna)  / nz_mean(target_rna)
-    atac_scale = nz_mean(source_atac) / nz_mean(target_atac)
-    print(f"RNA  scale: {rna_scale:.6f}")
-    print(f"ATAC scale: {atac_scale:.6f}")
+        groups = adata.obs[groupby].astype("category")
+        codes = groups.cat.codes.to_numpy()
+        cats = groups.cat.categories
 
-    target_rna_dtype = target_rna.X.dtype
-    target_atac_dtype = target_atac.X.dtype
+        G = sp.csr_matrix(
+            (np.ones(adata.n_obs, dtype=np.float32), (codes, np.arange(adata.n_obs))),
+            shape=(len(cats), adata.n_obs),
+        )
 
-    target_rna.X = target_rna.X.multiply(rna_scale).astype(target_rna_dtype)
-    target_atac.X = target_atac.X.multiply(atac_scale).astype(target_atac_dtype)
+        X_agg = G @ X
+
+        if agg == "mean":
+            counts = np.bincount(codes, minlength=len(cats)).astype(np.float32)
+            counts[counts == 0] = 1.0
+            X_agg = sp.diags(1.0 / counts) @ X_agg if sp.issparse(X_agg) else X_agg / counts[:, None]
+        elif agg != "sum":
+            raise ValueError("agg must be 'sum' or 'mean'")
+
+        obs = pd.DataFrame(index=cats.astype(str))
+        obs[groupby] = cats.astype(str)
+
+        return ad.AnnData(X=X_agg, obs=obs, var=adata.var.copy())
+
+    n = target_rna.n_obs
+    group_size = 5
+
+    perm = np.random.permutation(n)
+    group_ids = np.arange(n) // group_size
+    pseudo_ids = np.empty(n, dtype=int)
+    pseudo_ids[perm] = group_ids
+
+    target_rna.obs["pseudo_pixel"] = pseudo_ids.astype(str)
+    target_atac.obs["pseudo_pixel"] = pseudo_ids.astype(str)
+
+    target_rna_pb = aggregate_cells(
+        target_rna,
+        groupby="pseudo_pixel",
+        agg="sum",
+    )
+
+    target_atac_pb = aggregate_cells(
+        target_atac,
+        groupby="pseudo_pixel",
+        agg="sum",
+    )
+
+    target_rna = ad.AnnData(
+        X=target_rna_pb.X,
+        var=target_rna.var,
+        obs = pd.DataFrame(index=target_rna_pb.obs_names),
+        uns = target_rna.uns | {'label_key':None},
+    )
+
+    target_atac = ad.AnnData(
+        X=target_atac_pb.X,
+        var=target_atac.var,
+        obs = pd.DataFrame(index=target_atac_pb.obs_names),
+        uns = target_atac.uns | {'label_key':None},
+    )
 
     #%% TMP - redo HVG to limit number of features to fit inside GPU memory
     if socket.gethostname() != "ri-muhc-gpu":
