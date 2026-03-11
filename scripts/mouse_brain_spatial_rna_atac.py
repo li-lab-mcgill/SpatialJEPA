@@ -1036,51 +1036,101 @@ def main():
     target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
     assert target_rna.obs_names.equals(target_atac.obs_names), "Target RNA and ATAC must have matching obs_names"
 
+    n_genes = len(target_rna.var_names)
+    n_peaks = len(target_atac.var_names)
+
     # Set celltype keys
     source_rna.uns['label_key'] = 'RNA_clusters'
     target_rna.uns['label_key'] = 'REF_arc_gex_graphclust_Cluster'
 
+    #%% compute gene-peak net
+    gtf_path = os.path.join(os.getenv("DATAPATH"), "gene_annotations", "gencode.vM25.chr_patch_hapl_scaff.annotation.gtf.gz")
+    if not os.path.exists(gtf_path):
+        raise FileNotFoundError("GTF annotation file not found: {}".format(gtf_path))
+
+    MultiGATE.Cal_gene_peak_Net_new(source_rna, source_atac, 150000, file=gtf_path)
+    gp_net = source_atac.uns["gene_peak_Net"].copy()
+    del source_atac.uns["gene_peak_Net"]
+
+    gp_net_genes = gp_net["Gene"].unique()
+    gp_net_peaks = gp_net["Peak"].unique()
+
+    source_rna = source_rna[:, source_rna.var_names.isin(gp_net_genes)].copy()
+    source_atac = source_atac[:, source_atac.var_names.isin(gp_net_peaks)].copy()
+    target_rna = target_rna[:, target_rna.var_names.isin(gp_net_genes)].copy()
+    target_atac = target_atac[:, target_atac.var_names.isin(gp_net_peaks)].copy()
+
+    n_genes = len(target_rna.var_names)
+    n_peaks = len(target_atac.var_names)
+
+    print(f"Filtered {n_genes} genes and {n_peaks} peaks from gene-peak net")
+
     #%% TMP - redo HVG to limit number of features to fit inside GPU memory
     #if socket.gethostname() != "ri-muhc-gpu":
+
+    rank_type = "fused"
+    assert rank_type in ["fused", "source", "target", "fused_genes_only"], "rank_type must be 'fused' or 'source' or 'target'"
+    
     source_rna.var["highly_variable"] = False
     source_atac.var["highly_variable"] = False
 
     target_rna.var["highly_variable"] = False
     target_atac.var["highly_variable"] = False
 
-    top_n_genes = 5000
-    top_n_peaks = 25000
+    top_n_genes = 1000
+    #top_n_peaks = 10000
 
-    if 'highly_variable_rank' not in source_rna.var.columns:
-        source_rna.var["highly_variable_rank"] = \
-            source_rna.var["dispersions_norm"].rank(ascending=False)
+    source_rna.var["highly_variable_rank"] = \
+        source_rna.var["dispersions_norm"].rank(ascending=False)
 
-        source_atac.var["highly_variable_rank"] = \
-            source_atac.var["dispersions_norm"].rank(ascending=False)
+    target_rna.var["highly_variable_rank"] = \
+        target_rna.var["dispersions_norm"].rank(ascending=False)
+    '''
+    source_atac.var["highly_variable_rank"] = \
+        source_atac.var["dispersions_norm"].rank(ascending=False)
 
-    if 'highly_variable_rank' not in target_rna.var.columns:
-        target_rna.var["highly_variable_rank"] = \
-            target_rna.var["dispersions_norm"].rank(ascending=False)
-
-        target_atac.var["highly_variable_rank"] = \
-            target_atac.var["dispersions_norm"].rank(ascending=False)
-
+    target_atac.var["highly_variable_rank"] = \
+        target_atac.var["dispersions_norm"].rank(ascending=False)
+    '''
     ## Compute combined rank. Note that may have more than n_top_genes/peaks due to rank ties.
-    rna_combined_rank = pd.concat([
-        source_rna.var["highly_variable_rank"],
-        target_rna.var["highly_variable_rank"]
-        ], axis=1).mean(axis=1).rank(ascending=True, method='min')
+    def _rank_fused(source_adata, target_adata, rank_type):
+        if rank_type == "fused":
+            return pd.concat([
+                source_adata.var["highly_variable_rank"],
+                target_adata.var["highly_variable_rank"]
+            ], axis=1).mean(axis=1).rank(ascending=True, method='min')
+        elif rank_type == "source":
+            return source_adata.var["highly_variable_rank"]
+        elif rank_type == "target":
+            return target_adata.var["highly_variable_rank"]
+        elif rank_type == "fused_genes_only":
+            NotImplementedError("fused_genes_only not implemented yet - idea is filter by genes first, then filter by peaks in-cis with filtered genes")
 
-    atac_combined_rank = pd.concat([
-        source_atac.var["highly_variable_rank"],
-        target_atac.var["highly_variable_rank"]
-        ], axis=1).mean(axis=1).rank(ascending=True, method='min')
+    rna_combined_rank = _rank_fused(source_rna, target_rna, rank_type)
+    gene_filt = rna_combined_rank.le(top_n_genes)
+    source_rna.var.loc[gene_filt, "highly_variable"] = True
+    target_rna.var.loc[gene_filt, "highly_variable"] = True
 
-    source_rna.var.loc[rna_combined_rank.le(top_n_genes), "highly_variable"] = True
-    source_atac.var.loc[atac_combined_rank.le(top_n_peaks), "highly_variable"] = True
+    # filter peaks in-cis with filtered genes
+    peak_filt = gp_net.loc[
+        gp_net["Gene"].isin(gene_filt.loc[gene_filt].index),
+        "Peak"].unique()
 
-    target_rna.var.loc[rna_combined_rank.le(top_n_genes), "highly_variable"] = True
-    target_atac.var.loc[atac_combined_rank.le(top_n_peaks), "highly_variable"] = True
+    source_atac.var.loc[source_atac.var_names.isin(peak_filt), "highly_variable"] = True
+    target_atac.var.loc[target_atac.var_names.isin(peak_filt), "highly_variable"] = True
+
+    #atac_combined_rank = _rank_fused(source_atac, target_atac, rank_type)
+    #source_atac.var.loc[atac_combined_rank.le(top_n_peaks), "highly_variable"] = True
+    #target_atac.var.loc[atac_combined_rank.le(top_n_peaks), "highly_variable"] = True
+
+    #%% re-introduce gp-net based on filtered genes and peaks
+    gp_net = gp_net[
+        gp_net["Gene"].isin(gene_filt.loc[gene_filt].index) &
+        gp_net["Peak"].isin(peak_filt)
+        ]
+    source_rna.uns["gene_peak_Net"] = gp_net.copy()
+    target_rna.uns["gene_peak_Net"] = gp_net.copy()
+    del gp_net
 
     #%% source spatial graph
     MultiGATE.Cal_Spatial_Net(source_rna, rad_cutoff=40)
@@ -1092,12 +1142,14 @@ def main():
     source_rna = source_rna[:, source_rna.var["highly_variable"]].copy()
     source_atac = source_atac[:, source_atac.var["highly_variable"]].copy()
 
+    '''
     gtf_path = os.path.join(os.getenv("DATAPATH"), "gene_annotations", "gencode.vM25.chr_patch_hapl_scaff.annotation.gtf.gz")
     if not os.path.exists(gtf_path):
         raise FileNotFoundError("GTF annotation file not found: {}".format(gtf_path))
 
     MultiGATE.Cal_gene_peak_Net_new(source_rna, source_atac, 150000, file=gtf_path)
     source_rna.uns["gene_peak_Net"] = source_atac.uns["gene_peak_Net"]
+    '''
 
     #%% target prep for live zero-shot eval
 

@@ -242,6 +242,7 @@ def Cal_gene_peak_Net_new(rna, atac, range=2000,
     df['Gene'] = [genes.index[row] for row in non_zero_rows]
     df['Peak'] = [peaks.index[col] for col in non_zero_cols]
     if verbose:
+        print('Used gene annotation file (make sure proper species is used): %s' % file)
         print('The graph contains %d edges, %d genes.' % (dist_graph.number_of_edges(), len(set(df['Gene']))))
         print('%.4f peaks per gene on average.' % (dist_graph.number_of_edges() / len(set(df['Gene']))))
     atac.uns['gene_peak_Net'] = df
