@@ -1038,6 +1038,22 @@ def main():
     source_rna.uns['label_key'] = 'RNA_clusters'
     target_rna.uns['label_key'] = 'REF_arc_gex_graphclust_Cluster'
 
+    #%% Scale target data to match source data mean expression levels
+    def nz_mean(adata):
+        X = adata.X.toarray() if sp.issparse(adata.X) else np.asarray(adata.X)
+        return X[X > 0].mean()
+
+    rna_scale  = nz_mean(source_rna)  / nz_mean(target_rna)
+    atac_scale = nz_mean(source_atac) / nz_mean(target_atac)
+    print(f"RNA  scale: {rna_scale:.6f}")
+    print(f"ATAC scale: {atac_scale:.6f}")
+
+    target_rna_dtype = target_rna.X.dtype
+    target_atac_dtype = target_atac.X.dtype
+
+    target_rna.X = target_rna.X.multiply(rna_scale).astype(target_rna_dtype)
+    target_atac.X = target_atac.X.multiply(atac_scale).astype(target_atac_dtype)
+
     #%% TMP - redo HVG to limit number of features to fit inside GPU memory
     if socket.gethostname() != "ri-muhc-gpu":
         source_rna.var["highly_variable"] = False
