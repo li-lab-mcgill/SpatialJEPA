@@ -105,6 +105,12 @@ def parse_args(notebook: bool = False):
         help="Number of top genes to keep for filtering.",
     )
     parser.add_argument(
+        "--top-n-peaks",
+        type=int,
+        default=10000,
+        help="Number of top in-cis peaks to keep for filtering.",
+    )
+    parser.add_argument(
         "--lambda-kd",
         type=float,
         default=1.0,
@@ -1074,8 +1080,8 @@ def main():
     #%% TMP - redo HVG to limit number of features to fit inside GPU memory
     #if socket.gethostname() != "ri-muhc-gpu":
 
-    rank_type = "source"
-    assert rank_type in ["fused", "source", "target", "fused_genes_only"], "rank_type must be 'fused' or 'source' or 'target'"
+    rank_type = "fused"
+    assert rank_type in ["fused", "source", "target"], "rank_type must be 'fused' or 'source' or 'target'"
     
     source_rna.var["highly_variable"] = False
     source_atac.var["highly_variable"] = False
@@ -1084,20 +1090,20 @@ def main():
     target_atac.var["highly_variable"] = False
 
     top_n_genes = args.top_n_genes
-    #top_n_peaks = 10000
+    top_n_peaks = args.top_n_peaks
 
     source_rna.var["highly_variable_rank"] = \
         source_rna.var["dispersions_norm"].rank(ascending=False)
 
     target_rna.var["highly_variable_rank"] = \
         target_rna.var["dispersions_norm"].rank(ascending=False)
-    '''
+
     source_atac.var["highly_variable_rank"] = \
         source_atac.var["dispersions_norm"].rank(ascending=False)
 
     target_atac.var["highly_variable_rank"] = \
         target_atac.var["dispersions_norm"].rank(ascending=False)
-    '''
+
     ## Compute combined rank. Note that may have more than n_top_genes/peaks due to rank ties.
     def _rank_fused(source_adata, target_adata, rank_type):
         if rank_type == "fused":
@@ -1109,18 +1115,25 @@ def main():
             return source_adata.var["highly_variable_rank"]
         elif rank_type == "target":
             return target_adata.var["highly_variable_rank"]
-        elif rank_type == "fused_genes_only":
-            NotImplementedError("fused_genes_only not implemented yet - idea is filter by genes first, then filter by peaks in-cis with filtered genes")
 
+    ## compute combined rank for genes
     rna_combined_rank = _rank_fused(source_rna, target_rna, rank_type)
     gene_filt = rna_combined_rank.le(top_n_genes)
     source_rna.var.loc[gene_filt, "highly_variable"] = True
     target_rna.var.loc[gene_filt, "highly_variable"] = True
 
-    # filter peaks in-cis with filtered genes
+
+    ## filter peaks in-cis with filtered genes
     peak_filt = gp_net.loc[
         gp_net["Gene"].isin(gene_filt.loc[gene_filt].index),
         "Peak"].unique()
+
+    ## compute combined rank for peaks
+    atac_combined_rank = _rank_fused(source_atac, target_atac, rank_type)
+    atac_combined_rank_filt = atac_combined_rank.loc[source_atac.var_names.isin(peak_filt)]
+    atac_combined_rank_filt = atac_combined_rank_filt.rank(ascending=True, method='min')
+    peak_filt = atac_combined_rank_filt.le(top_n_peaks)
+    peak_filt = peak_filt.loc[peak_filt].index
 
     source_atac.var.loc[source_atac.var_names.isin(peak_filt), "highly_variable"] = True
     target_atac.var.loc[target_atac.var_names.isin(peak_filt), "highly_variable"] = True
@@ -1343,6 +1356,8 @@ def main():
         mlflow.log_param("eval_every", eval_every)
         mlflow.log_param("source_cells", int(source_rna.n_obs))
         mlflow.log_param("target_cells", int(target_rna.n_obs))
+        mlflow.log_param("n_genes", int(source_rna.n_vars))
+        mlflow.log_param("n_peaks", int(source_atac.n_vars))
         mlflow.log_param("graph_type", graph_type)
         mlflow.log_param("stage1_dual_source_kd", bool(args.stage1_dual_source_kd))
         mlflow.log_param("stage1_primary_model", stage1_primary_model_name)
