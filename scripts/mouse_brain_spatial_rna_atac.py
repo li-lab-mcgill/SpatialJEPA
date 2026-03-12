@@ -99,6 +99,12 @@ def parse_args(notebook: bool = False):
         help="Number of teacher-student distillation epochs on target data for stage 2.",
     )
     parser.add_argument(
+        "--top-n-genes",
+        type=int,
+        default=2000,
+        help="Number of top genes to keep for filtering.",
+    )
+    parser.add_argument(
         "--lambda-kd",
         type=float,
         default=1.0,
@@ -1068,7 +1074,7 @@ def main():
     #%% TMP - redo HVG to limit number of features to fit inside GPU memory
     #if socket.gethostname() != "ri-muhc-gpu":
 
-    rank_type = "fused"
+    rank_type = "source"
     assert rank_type in ["fused", "source", "target", "fused_genes_only"], "rank_type must be 'fused' or 'source' or 'target'"
     
     source_rna.var["highly_variable"] = False
@@ -1077,7 +1083,7 @@ def main():
     target_rna.var["highly_variable"] = False
     target_atac.var["highly_variable"] = False
 
-    top_n_genes = 1000
+    top_n_genes = args.top_n_genes
     #top_n_peaks = 10000
 
     source_rna.var["highly_variable_rank"] = \
