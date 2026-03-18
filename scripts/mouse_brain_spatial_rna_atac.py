@@ -1620,7 +1620,7 @@ def main():
                     args.lambda_kd,
                 )
             )
-            run_stage2_distillation(
+            stage2_trainer = run_stage2_distillation(
                 source_trainer=stage1_primary_trainer,
                 target_rna=target_rna,
                 target_atac=target_atac,
@@ -1634,6 +1634,8 @@ def main():
                 scib_n_jobs=args.scib_n_jobs,
                 vgp_mode=args.vgp_mode,
             )
+            if stage2_trainer is None:
+                raise RuntimeError("Stage-2 trainer was not returned despite stage2_epochs > 0.")
             set_multigate_embeddings(
                 source_rna,
                 source_atac,
@@ -1652,8 +1654,15 @@ def main():
             )
 
             # log stage-2 model artifacts and attention matrix
-            target_peak_gene_attention = target_embeddings[4][0] #target_peak_gene_attention = target_rna.uns['MultiGATE_gene_peak_attention'][0]
-            model_stage2 = trainer_target.mgate.state_dict()
+            stage2_target_embeddings = stage2_trainer.infer(
+                target_graph_tf,
+                target_graph_tf,
+                target_gp_tf,
+                target_x1,
+                target_x2,
+            )
+            target_peak_gene_attention = stage2_target_embeddings[4][0] # target_rna.uns['MultiGATE_gene_peak_attention'][0]
+            model_stage2 = stage2_trainer.mgate.state_dict()
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 local_path = os.path.join(tmpdir, "target_peak_gene_attention.npz")
