@@ -880,6 +880,21 @@ def main():
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
+    #%% Plot source and target embeddings
+    multigate_adata = sc.AnnData(
+        X=np.concatenate([source_rna_emb, source_atac_emb, target_rna_emb, target_atac_emb], axis=0),
+        obs=pd.concat([
+            source_rna.obs.assign(modality="rna", source_or_target="source"),
+            source_atac.obs.assign(modality="atac", source_or_target="source"),
+            target_rna.obs.assign(modality="rna", source_or_target="target"),
+            target_atac.obs.assign(modality="atac", source_or_target="target"),
+            ], axis=0),
+    )
+    sc.pp.neighbors(multigate_adata, use_rep='X', n_neighbors=100)
+    sc.tl.leiden(multigate_adata, resolution=0.5)
+    sc.tl.umap(multigate_adata, min_dist=0.3)
+    sc.pl.umap(multigate_adata, color=['modality', 'source_or_target', 'leiden'], ncols=3, wspace=0.1, size=25)
+
     #%% ── Save outputs ─────────────────────────────────────────────────────────
     if args.save_h5ad:
         print("\nSaving h5ad files to {}...".format(output_dir))
