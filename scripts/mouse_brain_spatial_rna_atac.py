@@ -402,6 +402,136 @@ def pair_and_subsample_target(target_rna, target_atac, subsample_n, seed):
     return target_rna, target_atac
 
 
+def apply_hvg_and_gp_filtering(
+    source_rna,
+    source_atac,
+    target_rna,
+    target_atac,
+    gp_net,
+    top_n_genes,
+    top_n_peaks,
+    rank_type="fused",
+):
+    """Shared source/target feature filtering logic used by training and co-embed scripts."""
+    assert rank_type in ["fused", "source", "target"], "rank_type must be 'fused' or 'source' or 'target'"
+
+    gp_net_genes = gp_net["Gene"].unique()
+    gp_net_peaks = gp_net["Peak"].unique()
+
+    source_rna = source_rna[:, source_rna.var_names.isin(gp_net_genes)].copy()
+    source_atac = source_atac[:, source_atac.var_names.isin(gp_net_peaks)].copy()
+    target_rna = target_rna[:, target_rna.var_names.isin(gp_net_genes)].copy()
+    target_atac = target_atac[:, target_atac.var_names.isin(gp_net_peaks)].copy()
+
+    source_rna.var["highly_variable"] = False
+    source_atac.var["highly_variable"] = False
+    target_rna.var["highly_variable"] = False
+    target_atac.var["highly_variable"] = False
+
+    source_rna.var["highly_variable_rank"] = source_rna.var["dispersions_norm"].rank(ascending=False)
+    target_rna.var["highly_variable_rank"] = target_rna.var["dispersions_norm"].rank(ascending=False)
+    source_atac.var["highly_variable_rank"] = source_atac.var["dispersions_norm"].rank(ascending=False)
+    target_atac.var["highly_variable_rank"] = target_atac.var["dispersions_norm"].rank(ascending=False)
+
+    # Compute combined rank. Note that may have more than n_top_genes/peaks due to rank ties.
+    def _rank_fused(source_adata, target_adata, local_rank_type):
+        if local_rank_type == "fused":
+            return pd.concat(
+                [
+                    source_adata.var["highly_variable_rank"],
+                    target_adata.var["highly_variable_rank"],
+                ],
+                axis=1,
+            ).mean(axis=1).rank(ascending=True, method="min")
+        elif local_rank_type == "source":
+            return source_adata.var["highly_variable_rank"]
+        elif local_rank_type == "target":
+            return target_adata.var["highly_variable_rank"]
+
+    # Compute combined rank for genes.
+    rna_combined_rank = _rank_fused(source_rna, target_rna, rank_type)
+    gene_filt = rna_combined_rank.le(top_n_genes)
+    source_rna.var.loc[gene_filt, "highly_variable"] = True
+    target_rna.var.loc[gene_filt, "highly_variable"] = True
+
+    # Filter peaks in-cis with filtered genes.
+    peak_filt = gp_net.loc[
+        gp_net["Gene"].isin(gene_filt.loc[gene_filt].index),
+        "Peak",
+    ].unique()
+
+    # Compute combined rank for peaks.
+    atac_combined_rank = _rank_fused(source_atac, target_atac, rank_type)
+    atac_combined_rank_filt = atac_combined_rank.loc[source_atac.var_names.isin(peak_filt)]
+    atac_combined_rank_filt = atac_combined_rank_filt.rank(ascending=True, method="min")
+    peak_filt = atac_combined_rank_filt.le(top_n_peaks)
+    peak_filt = peak_filt.loc[peak_filt].index
+
+    source_atac.var.loc[source_atac.var_names.isin(peak_filt), "highly_variable"] = True
+    target_atac.var.loc[target_atac.var_names.isin(peak_filt), "highly_variable"] = True
+
+    # Re-introduce gp-net based on filtered genes and peaks.
+    gp_net = gp_net[
+        gp_net["Gene"].isin(gene_filt.loc[gene_filt].index)
+        & gp_net["Peak"].isin(peak_filt)
+    ]
+    source_rna.uns["gene_peak_Net"] = gp_net.copy()
+    target_rna.uns["gene_peak_Net"] = gp_net.copy()
+
+    return source_rna, source_atac, target_rna, target_atac, gp_net
+
+
+def prepare_target_for_spatial_graph_type(
+    target_rna,
+    target_atac,
+    source_rna,
+    source_atac,
+    spatial_graph_type,
+    gtf_path,
+):
+    """Shared target graph preparation used by training and co-embed scripts."""
+    if spatial_graph_type == "spatial":
+        MultiGATE.Cal_Spatial_Net(target_rna, rad_cutoff=40)
+        MultiGATE.Stats_Spatial_Net(target_rna)
+        MultiGATE.Cal_Spatial_Net(target_atac, rad_cutoff=40)
+        MultiGATE.Stats_Spatial_Net(target_atac)
+        target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
+        target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
+        MultiGATE.Cal_gene_peak_Net_new(target_rna, target_atac, 150000, file=gtf_path)
+        target_rna.uns["gene_peak_Net"] = target_atac.uns["gene_peak_Net"]
+
+    elif spatial_graph_type == "tangram":
+        target_rna = target_rna[:, target_rna.var_names.isin(source_rna.var_names)].copy()
+        target_atac = target_atac[:, target_atac.var_names.isin(source_atac.var_names)].copy()
+        tangram_net = pd.read_csv(os.path.join(os.getenv("OUTPATH"), "tangram", "tangram_spatial_net_affinity.csv"))
+        target_rna.uns["Spatial_Net"] = tangram_net.copy()
+        target_atac.uns["Spatial_Net"] = tangram_net.copy()
+        target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"].copy()
+        target_atac.uns["gene_peak_Net"] = source_atac.uns["gene_peak_Net"].copy()
+
+    elif spatial_graph_type == "knn":
+        target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
+        target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
+        target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
+        target_atac.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
+        build_knn_graph_as_spatial_net(target_rna, n_neighbors=15)
+        target_atac.uns["Spatial_Net"] = target_rna.uns["Spatial_Net"].copy()
+        MultiGATE.Stats_Spatial_Net(target_rna)
+        MultiGATE.Stats_Spatial_Net(target_atac)
+
+    elif spatial_graph_type == "identity":
+        target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
+        target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
+        target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
+        target_atac.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
+        target_rna.uns["Spatial_Net"] = pd.DataFrame(columns=["Cell1", "Cell2", "Distance"])
+        target_atac.uns["Spatial_Net"] = target_rna.uns["Spatial_Net"].copy()
+    else:
+        raise ValueError("Unknown spatial_graph_type '{}'".format(spatial_graph_type))
+
+    return target_rna, target_atac
+
+
 _SCIB_BACKEND = None
 
 
@@ -1068,91 +1198,22 @@ def main():
     gp_net = source_atac.uns["gene_peak_Net"].copy()
     del source_atac.uns["gene_peak_Net"]
 
-    gp_net_genes = gp_net["Gene"].unique()
-    gp_net_peaks = gp_net["Peak"].unique()
-
-    source_rna = source_rna[:, source_rna.var_names.isin(gp_net_genes)].copy()
-    source_atac = source_atac[:, source_atac.var_names.isin(gp_net_peaks)].copy()
-    target_rna = target_rna[:, target_rna.var_names.isin(gp_net_genes)].copy()
-    target_atac = target_atac[:, target_atac.var_names.isin(gp_net_peaks)].copy()
+    rank_type = "fused"
+    source_rna, source_atac, target_rna, target_atac, gp_net = apply_hvg_and_gp_filtering(
+        source_rna=source_rna,
+        source_atac=source_atac,
+        target_rna=target_rna,
+        target_atac=target_atac,
+        gp_net=gp_net,
+        top_n_genes=args.top_n_genes,
+        top_n_peaks=args.top_n_peaks,
+        rank_type=rank_type,
+    )
 
     n_genes = len(target_rna.var_names)
     n_peaks = len(target_atac.var_names)
-
     print(f"Filtered {n_genes} genes and {n_peaks} peaks from gene-peak net")
 
-    #%% TMP - redo HVG to limit number of features to fit inside GPU memory
-    #if socket.gethostname() != "ri-muhc-gpu":
-
-    rank_type = "fused"
-    assert rank_type in ["fused", "source", "target"], "rank_type must be 'fused' or 'source' or 'target'"
-    
-    source_rna.var["highly_variable"] = False
-    source_atac.var["highly_variable"] = False
-
-    target_rna.var["highly_variable"] = False
-    target_atac.var["highly_variable"] = False
-
-    top_n_genes = args.top_n_genes
-    top_n_peaks = args.top_n_peaks
-
-    source_rna.var["highly_variable_rank"] = \
-        source_rna.var["dispersions_norm"].rank(ascending=False)
-
-    target_rna.var["highly_variable_rank"] = \
-        target_rna.var["dispersions_norm"].rank(ascending=False)
-
-    source_atac.var["highly_variable_rank"] = \
-        source_atac.var["dispersions_norm"].rank(ascending=False)
-
-    target_atac.var["highly_variable_rank"] = \
-        target_atac.var["dispersions_norm"].rank(ascending=False)
-
-    ## Compute combined rank. Note that may have more than n_top_genes/peaks due to rank ties.
-    def _rank_fused(source_adata, target_adata, rank_type):
-        if rank_type == "fused":
-            return pd.concat([
-                source_adata.var["highly_variable_rank"],
-                target_adata.var["highly_variable_rank"]
-            ], axis=1).mean(axis=1).rank(ascending=True, method='min')
-        elif rank_type == "source":
-            return source_adata.var["highly_variable_rank"]
-        elif rank_type == "target":
-            return target_adata.var["highly_variable_rank"]
-
-    ## compute combined rank for genes
-    rna_combined_rank = _rank_fused(source_rna, target_rna, rank_type)
-    gene_filt = rna_combined_rank.le(top_n_genes)
-    source_rna.var.loc[gene_filt, "highly_variable"] = True
-    target_rna.var.loc[gene_filt, "highly_variable"] = True
-
-
-    ## filter peaks in-cis with filtered genes
-    peak_filt = gp_net.loc[
-        gp_net["Gene"].isin(gene_filt.loc[gene_filt].index),
-        "Peak"].unique()
-
-    ## compute combined rank for peaks
-    atac_combined_rank = _rank_fused(source_atac, target_atac, rank_type)
-    atac_combined_rank_filt = atac_combined_rank.loc[source_atac.var_names.isin(peak_filt)]
-    atac_combined_rank_filt = atac_combined_rank_filt.rank(ascending=True, method='min')
-    peak_filt = atac_combined_rank_filt.le(top_n_peaks)
-    peak_filt = peak_filt.loc[peak_filt].index
-
-    source_atac.var.loc[source_atac.var_names.isin(peak_filt), "highly_variable"] = True
-    target_atac.var.loc[target_atac.var_names.isin(peak_filt), "highly_variable"] = True
-
-    #atac_combined_rank = _rank_fused(source_atac, target_atac, rank_type)
-    #source_atac.var.loc[atac_combined_rank.le(top_n_peaks), "highly_variable"] = True
-    #target_atac.var.loc[atac_combined_rank.le(top_n_peaks), "highly_variable"] = True
-
-    #%% re-introduce gp-net based on filtered genes and peaks
-    gp_net = gp_net[
-        gp_net["Gene"].isin(gene_filt.loc[gene_filt].index) &
-        gp_net["Peak"].isin(peak_filt)
-        ]
-    source_rna.uns["gene_peak_Net"] = gp_net.copy()
-    target_rna.uns["gene_peak_Net"] = gp_net.copy()
     del gp_net
 
     #%% source spatial graph
@@ -1176,44 +1237,14 @@ def main():
 
     #%% target prep for live zero-shot eval
 
-    if args.spatial_graph_type == "spatial":
-        MultiGATE.Cal_Spatial_Net(target_rna, rad_cutoff=40)
-        MultiGATE.Stats_Spatial_Net(target_rna)
-        MultiGATE.Cal_Spatial_Net(target_atac, rad_cutoff=40)
-        MultiGATE.Stats_Spatial_Net(target_atac)
-        target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
-        target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
-        MultiGATE.Cal_gene_peak_Net_new(target_rna, target_atac, 150000, file=gtf_path)
-        target_rna.uns["gene_peak_Net"] = target_atac.uns["gene_peak_Net"]
-
-    elif args.spatial_graph_type == 'tangram':
-        target_rna = target_rna[:, target_rna.var_names.isin(source_rna.var_names)].copy()
-        target_atac = target_atac[:, target_atac.var_names.isin(source_atac.var_names)].copy()
-        tangram_net = pd.read_csv(os.path.join(os.getenv("OUTPATH"), "tangram", "tangram_spatial_net_affinity.csv"))
-        target_rna.uns['Spatial_Net'] = tangram_net.copy()
-        target_atac.uns['Spatial_Net'] = tangram_net.copy()
-        target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"].copy()
-        target_atac.uns["gene_peak_Net"] = source_atac.uns["gene_peak_Net"].copy()
-
-    elif args.spatial_graph_type == "knn":
-        target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
-        target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
-        target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
-        target_atac.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
-        build_knn_graph_as_spatial_net(target_rna, n_neighbors=15)
-        target_atac.uns["Spatial_Net"] = target_rna.uns["Spatial_Net"].copy()
-        MultiGATE.Stats_Spatial_Net(target_rna)
-        MultiGATE.Stats_Spatial_Net(target_atac)
-
-    elif args.spatial_graph_type == "identity":
-        target_rna = target_rna[:, target_rna.var["highly_variable"]].copy()
-        target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
-        target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
-        target_atac.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"]
-        target_rna.uns["Spatial_Net"] = pd.DataFrame(columns=['Cell1', 'Cell2', 'Distance'])
-        target_atac.uns["Spatial_Net"] = target_rna.uns["Spatial_Net"].copy()
-        #MultiGATE.Stats_Spatial_Net(target_rna)
-        #MultiGATE.Stats_Spatial_Net(target_atac)
+    target_rna, target_atac = prepare_target_for_spatial_graph_type(
+        target_rna=target_rna,
+        target_atac=target_atac,
+        source_rna=source_rna,
+        source_atac=source_atac,
+        spatial_graph_type=args.spatial_graph_type,
+        gtf_path=gtf_path,
+    )
 
     print("[INFO] Pairing and subsampling target data...")
     target_rna, target_atac = pair_and_subsample_target(
