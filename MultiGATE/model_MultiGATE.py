@@ -16,16 +16,29 @@ class LegacyTFMGATE(object):
 
 class MGATE(nn.Module):
 
-    def __init__(self, hidden_dims1, hidden_dims2, spot_num, temp=1.0, nonlinear=True, weight_decay=0.0001):
+    def __init__(
+        self,
+        hidden_dims1,
+        hidden_dims2,
+        spot_num,
+        temp=1.0,
+        nonlinear=True,
+        weight_decay=0.0001,
+        vgp_anchor_mode="spot",
+    ):
         super(MGATE, self).__init__()
         self.n_layers = len(hidden_dims1) - 1
         if self.n_layers < 1:
             raise ValueError("hidden_dims must define at least one encoder layer")
+        if vgp_anchor_mode not in {"spot", "feature"}:
+            raise ValueError("vgp_anchor_mode must be one of {'spot', 'feature'}")
 
         self.nonlinear = nonlinear
         self.hidden_dims1 = hidden_dims1
         self.hidden_dims2 = hidden_dims2
         self.temp = temp
+        self.spot_num = int(spot_num)
+        self.vgp_anchor_mode = vgp_anchor_mode
 
         self.W1 = nn.ParameterList([
             nn.Parameter(torch.empty(hidden_dims1[i], hidden_dims1[i + 1]))
@@ -53,9 +66,13 @@ class MGATE(nn.Module):
             for i in range(self.n_layers - 1)
         ])
 
-        feat_num = hidden_dims1[0] + hidden_dims2[0]
-        self.vgp0 = nn.Parameter(torch.empty(feat_num, 1))
-        self.vgp1 = nn.Parameter(torch.empty(feat_num, 1))
+        if self.vgp_anchor_mode == "feature":
+            feat_num = hidden_dims1[0] + hidden_dims2[0]
+            self.vgp0 = nn.Parameter(torch.empty(feat_num, 1))
+            self.vgp1 = nn.Parameter(torch.empty(feat_num, 1))
+        else:
+            self.vgp0 = nn.Parameter(torch.empty(self.spot_num, 1))
+            self.vgp1 = nn.Parameter(torch.empty(self.spot_num, 1))
 
         emb_dim1 = hidden_dims1[-1]
         emb_dim2 = hidden_dims2[-1]
@@ -100,7 +117,16 @@ class MGATE(nn.Module):
 
         # Encoder
         H = torch.cat([X1.transpose(0, 1), X2.transpose(0, 1)], dim=0)
-        self.Cgp[0] = self._gp_attention_layer(GP, self.vgp0, self.vgp1) # att_fg of Eq. (3)
+        if self.vgp_anchor_mode == "feature":
+            self.Cgp[0] = self._gp_attention_layer(GP, self.vgp0, self.vgp1)  # att_fg of Eq. (3), feature-anchored
+        else:
+            if X1.shape[0] != self.vgp0.shape[0]:
+                raise ValueError(
+                    "Spot-anchored vgp expects {} cells, but got {}. "
+                    "Instantiate MGATE with matching spot_num for this dataset."
+                    .format(self.vgp0.shape[0], X1.shape[0])
+                )
+            self.Cgp[0] = self.graph_attention_layer(GP, H, self.vgp0, self.vgp1)  # att_fg of Eq. (3), spot-anchored
         H = torch.sparse.mm(self.Cgp[0], H)
         H = F.relu(H) # after relu, H is output of Eq. (1) in the paper, i.e. ~X^T_(f)
 
@@ -195,7 +221,7 @@ class MGATE(nn.Module):
         return torch.sparse.mm(C[layer - 1], H)
 
     def graph_attention_layer(self, A, M, v0, v1):
-        A = A.coalesce() # prior feature-feature adjacency matrix, i.e. A_fg in Eq. (4)
+        A = A.coalesce()
         indices = A.indices()
         row = indices[0]
         col = indices[1]
@@ -218,7 +244,7 @@ class MGATE(nn.Module):
 
     def _gp_attention_layer(self, A, v0, v1):
         """GP attention using feature-anchored keys (transferable across cell counts)."""
-        A = A.coalesce()
+        A = A.coalesce() # prior feature-feature adjacency matrix, i.e. A_fg in Eq. (4)
         indices = A.indices()
         row = indices[0]
         col = indices[1]
@@ -226,7 +252,7 @@ class MGATE(nn.Module):
         f1 = v0.squeeze(-1)  # (n_features,) — direct per-feature attention key
         f2 = v1.squeeze(-1)
         logits = f1[row] + f2[col]
-        e_fg = torch.sigmoid(logits)
+        e_fg = torch.sigmoid(logits) # Eq. (2) in the paper
 
         weighted_logits = torch.log(torch.clamp(A.values(), min=1e-12)) * e_fg
         unnormalized_attentions = torch.sparse_coo_tensor(

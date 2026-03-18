@@ -152,6 +152,16 @@ def parse_args(notebook: bool = False):
         ),
     )
     p.add_argument(
+        "--vgp-anchor-mode",
+        choices=["spot", "feature"],
+        default=None,
+        help=(
+            "Override the vgp anchoring mode for zero-shot target construction. "
+            "If omitted, uses run param 'vgp_anchor_mode' when available, else "
+            "infers from the source checkpoint."
+        ),
+    )
+    p.add_argument(
         "--spatial-graph-type",
         choices=["spatial", "knn", "identity", "tangram"],
         default=None,
@@ -318,43 +328,70 @@ def mgate_from_state_dict(state_dict, device):
     hidden_dims1 = hidden_dims_from_state_dict(state_dict, "W1")
     hidden_dims2 = hidden_dims_from_state_dict(state_dict, "W2")
     temp = float(state_dict.get("logit_scale", torch.tensor(1.0)).item())
+    feat_num = hidden_dims1[0] + hidden_dims2[0]
+    if "vgp0" not in state_dict:
+        raise KeyError("State dict missing required key 'vgp0'.")
+    vgp_len = int(state_dict["vgp0"].shape[0])
+    if vgp_len == feat_num:
+        vgp_anchor_mode = "feature"
+        inferred_spot_num = 1
+    else:
+        vgp_anchor_mode = "spot"
+        inferred_spot_num = vgp_len
 
     mgate = MGATE(
         hidden_dims1=hidden_dims1,
         hidden_dims2=hidden_dims2,
-        spot_num=1,   # vestigial in the PyTorch MGATE; not used in any parameter shape
+        spot_num=inferred_spot_num,
         temp=temp,
         nonlinear=True,
+        vgp_anchor_mode=vgp_anchor_mode,
     ).to(device)
     mgate.load_state_dict(state_dict, strict=False)
     mgate.eval()
-    return mgate, hidden_dims1, hidden_dims2
+    return mgate, hidden_dims1, hidden_dims2, vgp_anchor_mode
 
 
 def load_mgate(client, run_id, artifact_name, device, dst_dir):
     """Download a model .pth artifact and return a reconstructed, eval-mode MGATE."""
     local_path = download_model_artifact(client, run_id, artifact_name, dst_dir)
     state_dict = torch.load(local_path, map_location=device, weights_only=False)
-    mgate, hidden_dims1, hidden_dims2 = mgate_from_state_dict(state_dict, device)
-    print("    hidden_dims1={}, hidden_dims2={}".format(hidden_dims1, hidden_dims2))
-    return mgate, hidden_dims1, hidden_dims2
+    mgate, hidden_dims1, hidden_dims2, vgp_anchor_mode = mgate_from_state_dict(state_dict, device)
+    print(
+        "    hidden_dims1={}, hidden_dims2={}, vgp_anchor_mode={}".format(
+            hidden_dims1, hidden_dims2, vgp_anchor_mode
+        )
+    )
+    return mgate, hidden_dims1, hidden_dims2, vgp_anchor_mode
 
 
-def build_zero_shot_mgate(source_mgate, vgp_mode, device):
+def build_zero_shot_mgate(source_mgate, target_spot_num, vgp_mode, vgp_anchor_mode, device):
     """
     Build a target MGATE by copying all transferable source weights.
     vgp_mode='zero'    : zero out vgp0/vgp1 (prior-only GP attention).
-    vgp_mode='feature' : copy trained feature-anchored vgp vectors directly.
+    vgp_mode='feature' : copy trained source vgp vectors directly.
     """
+    if vgp_anchor_mode is None:
+        vgp_anchor_mode = getattr(source_mgate, "vgp_anchor_mode", "spot")
+
     target_mgate = MGATE(
         hidden_dims1=source_mgate.hidden_dims1,
         hidden_dims2=source_mgate.hidden_dims2,
-        spot_num=1,
+        spot_num=target_spot_num,
         temp=float(source_mgate.logit_scale.detach().cpu().item()),
         nonlinear=source_mgate.nonlinear,
+        vgp_anchor_mode=vgp_anchor_mode,
     ).to(device)
 
     if vgp_mode == "feature":
+        if vgp_anchor_mode == "spot":
+            source_spot_num = int(source_mgate.vgp0.shape[0])
+            if int(target_spot_num) != source_spot_num:
+                raise ValueError(
+                    "Cannot copy spot-anchored vgp when source and target cell counts differ "
+                    "(source={}, target={}). Use --vgp-mode zero or --vgp-anchor-mode feature."
+                    .format(source_spot_num, target_spot_num)
+                )
         target_mgate.load_state_dict(source_mgate.state_dict(), strict=False)
     else:  # vgp_mode == "zero"
         state_dict = {
@@ -581,7 +618,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmpdir:
 
         print("Source model ({}) :".format(source_artifact_name))
-        source_mgate, hidden_dims1, hidden_dims2 = load_mgate(
+        source_mgate, hidden_dims1, hidden_dims2, source_vgp_anchor_mode = load_mgate(
             client, run_id, source_artifact_name, device, tmpdir
         )
 
@@ -602,20 +639,12 @@ def main():
 
         if args.target_model == "stage2":
             print("Target model (model_stage2.pth):")
-            target_mgate, _, _ = load_mgate(
+            target_mgate, _, _, _ = load_mgate(
                 client, run_id, "model_stage2.pth", device, tmpdir
             )
         else:
             # Zero-shot: built after download, outside the tmpdir block
             target_mgate = None
-
-    # Build zero-shot target model outside the tmpdir context (weights already loaded)
-    if args.target_model == "zero_shot":
-        print(
-            "\nBuilding zero-shot target model from source weights "
-            "(vgp_mode='{}')...".format(args.vgp_mode)
-        )
-        target_mgate = build_zero_shot_mgate(source_mgate, args.vgp_mode, device)
 
     #%% ── Source spatial graph ─────────────────────────────────────────────────
     print("\nBuilding source spatial graph...")
@@ -677,15 +706,38 @@ def main():
     )
     print("  Target graph built: {} cells".format(target_rna.n_obs))
 
+    # Build zero-shot target model after target pairing/subsampling so spot-anchored
+    # vgp has the correct target cell count.
+    if args.target_model == "zero_shot":
+        run_vgp_anchor_mode = run_params.get("vgp_anchor_mode")
+        effective_vgp_anchor_mode = (
+            args.vgp_anchor_mode
+            or run_vgp_anchor_mode
+            or source_vgp_anchor_mode
+        )
+        print(
+            "\nBuilding zero-shot target model from source weights "
+            "(vgp_mode='{}', vgp_anchor_mode='{}')...".format(
+                args.vgp_mode, effective_vgp_anchor_mode
+            )
+        )
+        target_mgate = build_zero_shot_mgate(
+            source_mgate=source_mgate,
+            target_spot_num=target_rna.n_obs,
+            vgp_mode=args.vgp_mode,
+            vgp_anchor_mode=effective_vgp_anchor_mode,
+            device=device,
+        )
+
     #%% ── Inference ────────────────────────────────────────────────────────────
     source_rna_emb, source_atac_emb = run_inference(
-        target_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+        source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
     print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
     target_rna_emb, target_atac_emb = run_inference(
-        target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
+        source_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
     )
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))

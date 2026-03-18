@@ -14,6 +14,7 @@ class MultiGATE(object):
         hidden_dims2,
         spot_num,
         temp,
+        vgp_anchor_mode="spot",
         n_epochs=500,
         lr=0.0001,
         gradient_clipping=5,
@@ -46,6 +47,7 @@ class MultiGATE(object):
             spot_num=spot_num,
             temp=temp,
             nonlinear=nonlinear,
+            vgp_anchor_mode=vgp_anchor_mode,
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.mgate.parameters(), lr=self.lr, weight_decay=weight_decay)
 

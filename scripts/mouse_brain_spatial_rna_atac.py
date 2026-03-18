@@ -156,8 +156,19 @@ def parse_args(notebook: bool = False):
         default="zero",
         help=(
             "How to initialise GP gating vectors (vgp0/vgp1) when transferring to the target. "
-            "'zero': zero out vgp (prior-only GP attention, Option 1). "
-            "'feature': transfer trained feature-anchored vgp directly (Option 2)."
+            "'zero': zero out vgp (prior-only GP attention). "
+            "'feature': copy trained vgp directly."
+        ),
+    )
+    parser.add_argument(
+        "--vgp-anchor-mode",
+        type=str,
+        choices=["spot", "feature"],
+        default="spot",
+        help=(
+            "How vgp0/vgp1 are parameterized inside MGATE. "
+            "'spot': vgp shape is (n_cells, 1), i.e. spot-anchored (legacy behavior). "
+            "'feature': vgp shape is (n_features_total, 1), i.e. feature-anchored."
         ),
     )
     parser.add_argument(
@@ -345,15 +356,19 @@ def build_source_student_graph_tf(source_rna, spatial_graph_type, knn_neighbors=
     )
 
 
-def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_mode="zero"):
+def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_mode="zero", vgp_anchor_mode=None):
     # Rebuild MGATE with target N and load transferable weights.
-    # vgp_mode="zero":    zero out vgp0/vgp1 (prior-only GP attention, Option 1).
-    # vgp_mode="feature": transfer trained feature-anchored vgp directly (Option 2).
+    # vgp_mode="zero":    zero out vgp0/vgp1 (prior-only GP attention).
+    # vgp_mode="feature": transfer trained vgp directly.
+    if vgp_anchor_mode is None:
+        vgp_anchor_mode = getattr(source_trainer.mgate, "vgp_anchor_mode", "spot")
+
     target_trainer = MultiGATETrainer(
         hidden_dims1=source_trainer.mgate.hidden_dims1,
         hidden_dims2=source_trainer.mgate.hidden_dims2,
         spot_num=target_spot_num,
         temp=float(source_trainer.mgate.logit_scale.detach().cpu().item()),
+        vgp_anchor_mode=vgp_anchor_mode,
         n_epochs=1,
         lr=source_trainer.lr,
         gradient_clipping=source_trainer.gradient_clipping,
@@ -364,7 +379,14 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_mode="ze
     )
 
     if vgp_mode == "feature":
-        # vgp0/vgp1 are now (feat_num, 1) — same shape regardless of cell count, so load directly.
+        if vgp_anchor_mode == "spot":
+            source_spot_num = int(source_trainer.mgate.vgp0.shape[0])
+            if source_spot_num != int(target_spot_num):
+                raise ValueError(
+                    "Cannot transfer spot-anchored vgp with vgp_mode='feature' when source and target "
+                    "cell counts differ (source={}, target={}). Use --vgp-mode zero, or "
+                    "--vgp-anchor-mode feature.".format(source_spot_num, target_spot_num)
+                )
         state_dict = source_trainer.mgate.state_dict()
         target_trainer.mgate.load_state_dict(state_dict, strict=False)
 
@@ -940,13 +962,19 @@ def run_stage2_distillation(
     target_label_key,
     scib_n_jobs,
     vgp_mode="zero",
+    vgp_anchor_mode=None,
 ):
     if stage2_epochs <= 0:
         return None
 
     emd = require_ot_backend()
 
-    teacher_trainer = build_zero_shot_target_trainer(source_trainer, target_rna.n_obs, vgp_mode=vgp_mode)
+    teacher_trainer = build_zero_shot_target_trainer(
+        source_trainer,
+        target_rna.n_obs,
+        vgp_mode=vgp_mode,
+        vgp_anchor_mode=vgp_anchor_mode,
+    )
     teacher_model = teacher_trainer.mgate
     teacher_model.eval()
     for teacher_param in teacher_model.parameters():
@@ -957,6 +985,7 @@ def run_stage2_distillation(
         hidden_dims2=source_trainer.mgate.hidden_dims2,
         spot_num=target_rna.n_obs,
         temp=float(source_trainer.mgate.logit_scale.detach().cpu().item()),
+        vgp_anchor_mode=(vgp_anchor_mode or getattr(source_trainer.mgate, "vgp_anchor_mode", "spot")),
         n_epochs=stage2_epochs,
         lr=source_trainer.lr,
         gradient_clipping=source_trainer.gradient_clipping,
@@ -1309,6 +1338,7 @@ def main():
         hidden_dims2=[source_x2.shape[1]] + hidden_dims,
         spot_num=source_x1.shape[0],
         temp=1,
+        vgp_anchor_mode=args.vgp_anchor_mode,
         n_epochs=num_epochs,
         lr=0.0001,
         gradient_clipping=5,
@@ -1342,6 +1372,7 @@ def main():
             hidden_dims2=[source_x2.shape[1]] + hidden_dims,
             spot_num=source_x1.shape[0],
             temp=1,
+            vgp_anchor_mode=args.vgp_anchor_mode,
             n_epochs=num_epochs,
             lr=0.0001,
             gradient_clipping=5,
@@ -1398,6 +1429,7 @@ def main():
         mlflow.log_param("stage1_primary_model", stage1_primary_model_name)
         mlflow.log_param("stage1_teacher_graph", "spatial")
         mlflow.log_param("stage1_student_graph", args.spatial_graph_type if args.stage1_dual_source_kd else "NA")
+        mlflow.log_param("vgp_anchor_mode", args.vgp_anchor_mode)
         source_scib_label_mode_logged = False
         target_scib_label_mode_logged = False
         source_scib_effective_label_key_logged = False
@@ -1492,6 +1524,7 @@ def main():
                 stage1_primary_trainer,
                 target_rna.n_obs,
                 vgp_mode=args.vgp_mode,
+                vgp_anchor_mode=args.vgp_anchor_mode,
             )
             target_embeddings = trainer_target.infer(
                 target_graph_tf,
@@ -1633,6 +1666,7 @@ def main():
                 target_label_key=args.target_label_key,
                 scib_n_jobs=args.scib_n_jobs,
                 vgp_mode=args.vgp_mode,
+                vgp_anchor_mode=args.vgp_anchor_mode,
             )
             if stage2_trainer is None:
                 raise RuntimeError("Stage-2 trainer was not returned despite stage2_epochs > 0.")
