@@ -169,25 +169,6 @@ def parse_args(notebook: bool = False):
         ),
     )
     p.add_argument(
-        "--top-n-genes",
-        type=int,
-        default=2000,
-        help=(
-            "Number of top HVGs to keep. Should match the value used during "
-            "training (default 2000). The script verifies this against the "
-            "loaded model's input dimension."
-        ),
-    )
-    p.add_argument(
-        "--top-n-peaks",
-        type=int,
-        default=10000,
-        help=(
-            "Number of top in-cis peaks to keep. Should match training "
-            "(default 10000)."
-        ),
-    )
-    p.add_argument(
         "--target-subsample-n",
         type=int,
         default=5000,
@@ -771,13 +752,13 @@ def main():
     # ── Feature selection ────────────────────────────────────────────────────
     print(
         "Replicating feature selection "
-        "(top_n_genes={}, top_n_peaks={})...".format(args.top_n_genes, args.top_n_peaks)
+        "(top_n_genes={}, top_n_peaks={})...".format(run_params.get("n_genes"), run_params.get("n_peaks"))
     )
     source_rna, source_atac, target_rna, target_atac, gp_net = replicate_feature_selection(
         source_rna, source_atac, target_rna, target_atac,
         gp_net,
-        top_n_genes=args.top_n_genes,
-        top_n_peaks=args.top_n_peaks,
+        top_n_genes=int(run_params.get("n_genes")),
+        top_n_peaks=int(run_params.get("n_peaks")),
     )
 
     # Attach gene-peak net before HVG slicing (needed by build_graph_inputs)
@@ -840,7 +821,7 @@ def main():
             # Zero-shot: built after download, outside the tmpdir block
             target_mgate = None
 
-    #%% Build zero-shot target model outside the tmpdir context (weights already loaded)
+    # Build zero-shot target model outside the tmpdir context (weights already loaded)
     if args.target_model == "zero_shot":
         print(
             "\nBuilding zero-shot target model from source weights "
@@ -848,7 +829,7 @@ def main():
         )
         target_mgate = build_zero_shot_mgate(source_mgate, args.vgp_mode, device)
 
-    # ── Source spatial graph ─────────────────────────────────────────────────
+    #%% ── Source spatial graph ─────────────────────────────────────────────────
     print("\nBuilding source spatial graph...")
     MultiGATE.Cal_Spatial_Net(source_rna, rad_cutoff=40)
     MultiGATE.Stats_Spatial_Net(source_rna)
@@ -880,7 +861,7 @@ def main():
     )
     print("  Target graph built: {} cells".format(target_rna.n_obs))
 
-    # ── Inference ────────────────────────────────────────────────────────────
+    #%% ── Inference ────────────────────────────────────────────────────────────
     print("\nRunning source inference ({})...".format(source_artifact_name))
     source_rna_emb, source_atac_emb = run_inference(
         source_mgate, source_graph_tf, source_gp_tf, source_x1, source_x2, device
@@ -899,7 +880,7 @@ def main():
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
-    # ── Save outputs ─────────────────────────────────────────────────────────
+    #%% ── Save outputs ─────────────────────────────────────────────────────────
     if args.save_h5ad:
         print("\nSaving h5ad files to {}...".format(output_dir))
         paths = {
@@ -919,6 +900,6 @@ def main():
     )
     return source_rna, source_atac, target_rna, target_atac
 
-
+#%%
 if __name__ == "__main__":
     main()
