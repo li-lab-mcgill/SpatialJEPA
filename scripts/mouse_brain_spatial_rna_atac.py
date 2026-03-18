@@ -1053,7 +1053,11 @@ def main():
 
     # Set celltype keys
     source_rna.uns['label_key'] = 'RNA_clusters'
-    target_rna.uns['label_key'] = 'REF_arc_gex_graphclust_Cluster'
+    target_rna.uns['label_key'] = 'arc_gex_kmeans_5_clusters_Cluster'
+
+    # Ensure that label_key is categorical
+    source_rna.obs[source_rna.uns['label_key']] = source_rna.obs[source_rna.uns['label_key']].astype('category')
+    target_rna.obs[target_rna.uns['label_key']] = target_rna.obs[target_rna.uns['label_key']].astype('category')
 
     #%% compute gene-peak net
     gtf_path = os.path.join(os.getenv("DATAPATH"), "gene_annotations", "gencode.vM25.chr_patch_hapl_scaff.annotation.gtf.gz")
@@ -1598,6 +1602,13 @@ def main():
                 target_label_key=args.target_label_key,
                 scib_n_jobs=args.scib_n_jobs,
                 vgp_mode=args.vgp_mode,
+            )
+            set_multigate_embeddings(
+                source_rna,
+                source_atac,
+                source_embeddings[0], # source embeddings are the stage 1 student source embeddings
+                source_embeddings[1],
+                key_added="MultiGATE",
             )
             # log stage-2 UMAP artifacts
             log_stage_umap_artifacts(
