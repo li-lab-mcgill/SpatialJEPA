@@ -32,7 +32,6 @@ Usage:
 """
 #%%
 import argparse
-import json
 import os
 import shutil
 import sys
@@ -78,16 +77,10 @@ warnings.filterwarnings("ignore")
 import mlflow
 from mlflow.tracking import MlflowClient
 import numpy as np
-import pandas as pd
 import scanpy as sc
-import scipy.sparse as sp
 import torch
-from anndata import AnnData
-from sklearn.preprocessing import Normalizer
-from tqdm import tqdm
 
 import MultiGATE
-from MultiGATE.MultiGATE import MultiGATE as MultiGATETrainer
 from MultiGATE.model_MultiGATE import MGATE
 
 print("Using MultiGATE module:", MultiGATE.__file__)
@@ -412,129 +405,14 @@ if _scripts_dir not in sys.path:
 
 from mouse_brain_spatial_rna_atac import (  # noqa: E402
     build_graph_inputs,
-    build_knn_graph_as_spatial_net,
+    build_source_student_graph_tf,
     set_multigate_embeddings,
     pair_and_subsample_target,
+    apply_hvg_and_gp_filtering,
+    prepare_target_for_spatial_graph_type,
+    build_concat_adata_for_umap,
+    compute_concat_umap,
 )
-
-
-# ─── Feature selection (mirrors mouse_brain_spatial_rna_atac.py exactly) ──────
-
-def replicate_feature_selection(
-    source_rna, source_atac, target_rna, target_atac,
-    gp_net, top_n_genes, top_n_peaks, rank_type="fused",
-):
-    """
-    Reproduce the HVG + gene-peak-network filtering from training.
-    Returns updated (source_rna, source_atac, target_rna, target_atac, gp_net).
-    All returned adatas have uns['gene_peak_Net'] NOT yet attached; that is done
-    after HVG slicing in main().
-    """
-    # Restrict to features covered by the gene-peak network
-    gp_genes = gp_net["Gene"].unique()
-    gp_peaks = gp_net["Peak"].unique()
-    source_rna  = source_rna[:,  source_rna.var_names.isin(gp_genes)].copy()
-    source_atac = source_atac[:, source_atac.var_names.isin(gp_peaks)].copy()
-    target_rna  = target_rna[:,  target_rna.var_names.isin(gp_genes)].copy()
-    target_atac = target_atac[:, target_atac.var_names.isin(gp_peaks)].copy()
-
-    for adata in (source_rna, source_atac, target_rna, target_atac):
-        adata.var["highly_variable"] = False
-
-    def _fused_rank(src, tgt):
-        if rank_type == "fused":
-            return (
-                pd.concat(
-                    [src.var["dispersions_norm"], tgt.var["dispersions_norm"]],
-                    axis=1,
-                )
-                .mean(axis=1)
-                .rank(ascending=True, method="min")
-            )
-        if rank_type == "source":
-            return src.var["dispersions_norm"].rank(ascending=False)
-        if rank_type == "target":
-            return tgt.var["dispersions_norm"].rank(ascending=False)
-        raise ValueError("Unknown rank_type: {}".format(rank_type))
-
-    # Gene filtering
-    rna_rank = _fused_rank(source_rna, target_rna)
-    gene_mask = rna_rank.le(top_n_genes)
-    source_rna.var.loc[gene_mask, "highly_variable"] = True
-    target_rna.var.loc[gene_mask, "highly_variable"] = True
-
-    # Peak filtering: only consider peaks in-cis with kept genes
-    peak_candidates = gp_net.loc[
-        gp_net["Gene"].isin(gene_mask.loc[gene_mask].index), "Peak"
-    ].unique()
-    atac_rank = _fused_rank(source_atac, target_atac)
-    atac_rank_filt = atac_rank.loc[source_atac.var_names.isin(peak_candidates)]
-    atac_rank_filt = atac_rank_filt.rank(ascending=True, method="min")
-    peak_mask = atac_rank_filt.le(top_n_peaks)
-    peak_mask = peak_mask.loc[peak_mask].index
-    source_atac.var.loc[source_atac.var_names.isin(peak_mask), "highly_variable"] = True
-    target_atac.var.loc[target_atac.var_names.isin(peak_mask), "highly_variable"] = True
-
-    # Restrict gene-peak network to the surviving features
-    gp_net_filtered = gp_net[
-        gp_net["Gene"].isin(gene_mask.loc[gene_mask].index)
-        & gp_net["Peak"].isin(peak_mask)
-    ]
-    return source_rna, source_atac, target_rna, target_atac, gp_net_filtered
-
-
-# ─── Target graph construction ────────────────────────────────────────────────
-
-def prepare_target_graphs(
-    target_rna, target_atac, source_rna, spatial_graph_type, gtf_path,
-):
-    """
-    Attach uns['Spatial_Net'] and uns['gene_peak_Net'] to the (already
-    HVG-filtered) target adatas, matching the graph strategy used in training.
-    Returns (target_rna, target_atac).
-    """
-    if spatial_graph_type == "spatial":
-        MultiGATE.Cal_Spatial_Net(target_rna, rad_cutoff=40)
-        MultiGATE.Stats_Spatial_Net(target_rna)
-        MultiGATE.Cal_Spatial_Net(target_atac, rad_cutoff=40)
-        MultiGATE.Stats_Spatial_Net(target_atac)
-        # Recompute gene-peak net on already-filtered target features
-        MultiGATE.Cal_gene_peak_Net_new(target_rna, target_atac, 150000, file=gtf_path)
-        target_rna.uns["gene_peak_Net"] = target_atac.uns["gene_peak_Net"]
-
-    elif spatial_graph_type == "tangram":
-        tangram_csv = os.path.join(
-            os.getenv("OUTPATH"), "tangram", "tangram_spatial_net_affinity.csv"
-        )
-        if not os.path.exists(tangram_csv):
-            raise FileNotFoundError(
-                "Tangram affinity CSV not found: {}".format(tangram_csv)
-            )
-        tangram_net = pd.read_csv(tangram_csv)
-        target_rna.uns["Spatial_Net"] = tangram_net.copy()
-        target_atac.uns["Spatial_Net"] = tangram_net.copy()
-        target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"].copy()
-        target_atac.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"].copy()
-
-    elif spatial_graph_type == "knn":
-        target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"].copy()
-        target_atac.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"].copy()
-        build_knn_graph_as_spatial_net(target_rna, n_neighbors=15)
-        target_atac.uns["Spatial_Net"] = target_rna.uns["Spatial_Net"].copy()
-        MultiGATE.Stats_Spatial_Net(target_rna)
-        MultiGATE.Stats_Spatial_Net(target_atac)
-
-    elif spatial_graph_type == "identity":
-        target_rna.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"].copy()
-        target_atac.uns["gene_peak_Net"] = source_rna.uns["gene_peak_Net"].copy()
-        empty_net = pd.DataFrame(columns=["Cell1", "Cell2", "Distance"])
-        target_rna.uns["Spatial_Net"] = empty_net
-        target_atac.uns["Spatial_Net"] = empty_net.copy()
-
-    else:
-        raise ValueError("Unknown spatial_graph_type: '{}'".format(spatial_graph_type))
-
-    return target_rna, target_atac
 
 
 # ─── Inference ────────────────────────────────────────────────────────────────
@@ -660,11 +538,15 @@ def main():
         "Replicating feature selection "
         "(top_n_genes={}, top_n_peaks={})...".format(run_params.get("n_genes"), run_params.get("n_peaks"))
     )
-    source_rna, source_atac, target_rna, target_atac, gp_net = replicate_feature_selection(
-        source_rna, source_atac, target_rna, target_atac,
-        gp_net,
+    source_rna, source_atac, target_rna, target_atac, gp_net = apply_hvg_and_gp_filtering(
+        source_rna=source_rna,
+        source_atac=source_atac,
+        target_rna=target_rna,
+        target_atac=target_atac,
+        gp_net=gp_net,
         top_n_genes=int(run_params.get("n_genes")),
         top_n_peaks=int(run_params.get("n_peaks")),
+        rank_type="fused",
     )
 
     # Attach gene-peak net before HVG slicing (needed by build_graph_inputs)
@@ -749,6 +631,29 @@ def main():
     )
     print("  Source graph built: {} cells".format(source_rna.n_obs))
 
+    source_student_graph_type = run_params.get("stage1_student_graph", "identity")
+
+    if args.source_model == "stage1_teacher":
+        source_infer_graph_tf = source_graph_tf
+        source_graph_mode = "spatial_teacher_graph"
+    elif args.source_model == "stage1_student":
+        source_infer_graph_tf = build_source_student_graph_tf(
+            source_rna=source_rna,
+            spatial_graph_type=source_student_graph_type,
+        )
+        source_graph_mode = "student_graph({})".format(source_student_graph_type)
+    else:
+        if dual_source_kd:
+            source_infer_graph_tf = build_source_student_graph_tf(
+                source_rna=source_rna,
+                spatial_graph_type=source_student_graph_type,
+            )
+            source_graph_mode = "stage1_primary_student_graph({})".format(source_student_graph_type)
+        else:
+            source_infer_graph_tf = source_graph_tf
+            source_graph_mode = "stage1_primary_teacher_graph(spatial)"
+    print("  Source inference graph:", source_graph_mode)
+
     # ── Target graphs ────────────────────────────────────────────────────────
     print("\nPairing and subsampling target cells...")
     target_rna, target_atac = pair_and_subsample_target(
@@ -759,8 +664,13 @@ def main():
     print("  {} cells after pairing/subsampling".format(target_rna.n_obs))
 
     print("Building target graph (type: '{}')...".format(spatial_graph_type))
-    target_rna, target_atac = prepare_target_graphs(
-        target_rna, target_atac, source_rna, spatial_graph_type, gtf_path
+    target_rna, target_atac = prepare_target_for_spatial_graph_type(
+        target_rna=target_rna,
+        target_atac=target_atac,
+        source_rna=source_rna,
+        source_atac=source_atac,
+        spatial_graph_type=spatial_graph_type,
+        gtf_path=gtf_path,
     )
     target_graph_tf, target_gp_tf, target_x1, target_x2 = build_graph_inputs(
         target_rna, target_atac, bp_width=bp_width, graph_type=graph_type
@@ -768,38 +678,44 @@ def main():
     print("  Target graph built: {} cells".format(target_rna.n_obs))
 
     #%% ── Inference ────────────────────────────────────────────────────────────
-    print("\nRunning source inference ({})...".format(source_artifact_name))
     source_rna_emb, source_atac_emb = run_inference(
-        source_mgate, source_graph_tf, source_gp_tf, source_x1, source_x2, device
+        target_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
     print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
-    target_model_label = (
-        "model_stage2.pth" if args.target_model == "stage2"
-        else "zero_shot_from_{}".format(source_artifact_name)
-    )
-    print("Running target inference ({})...".format(target_model_label))
     target_rna_emb, target_atac_emb = run_inference(
         target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
     )
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
-    #%% Plot source and target embeddings
-    multigate_adata = sc.AnnData(
-        X=np.concatenate([source_rna_emb, source_atac_emb, target_rna_emb, target_atac_emb], axis=0),
-        obs=pd.concat([
-            source_rna.obs.assign(modality="rna", source_or_target="source"),
-            source_atac.obs.assign(modality="atac", source_or_target="source"),
-            target_rna.obs.assign(modality="rna", source_or_target="target"),
-            target_atac.obs.assign(modality="atac", source_or_target="target"),
-            ], axis=0),
+    #%% Plot source/target concat UMAPs with the same helper as training script.
+    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
+    target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
+    compute_concat_umap(source_concat_adata, n_neighbors=10, resolution=1.5)
+    compute_concat_umap(target_concat_adata, n_neighbors=10, resolution=1.5)
+    sc.pl.umap(source_concat_adata, color=["modality", "leiden"], ncols=2, wspace=0.2, size=25)
+    sc.pl.umap(target_concat_adata, color=["modality", "leiden"], ncols=2, wspace=0.2, size=25)
+
+    #%%
+    source_target_rna = sc.concat([source_rna, target_rna], axis=0)
+    source_target_atac = sc.concat([source_atac, target_atac], axis=0)
+    source_target_rna.obs["source_or_target"] = ["source"] * source_rna.n_obs + ["target"] * target_rna.n_obs
+    source_target_atac.obs["source_or_target"] = ["source"] * source_atac.n_obs + ["target"] * target_atac.n_obs
+
+    source_target_rna_adata = build_concat_adata_for_umap(source_target_rna, source_target_atac, embedding_key="MultiGATE")
+    compute_concat_umap(source_target_rna_adata, n_neighbors=10, resolution=1.5)
+    # Randomly permute the rows before plotting the UMAP
+    permuted_idx = np.random.permutation(source_target_rna_adata.n_obs)
+    sc.pl.umap(
+        source_target_rna_adata[permuted_idx],
+        color=["modality", "source_or_target", "leiden"],
+        ncols=3,
+        wspace=0.2,
+        size=25,
     )
-    sc.pp.neighbors(multigate_adata, use_rep='X', n_neighbors=100)
-    sc.tl.leiden(multigate_adata, resolution=0.5)
-    sc.tl.umap(multigate_adata, min_dist=0.3)
-    sc.pl.umap(multigate_adata, color=['modality', 'source_or_target', 'leiden'], ncols=3, wspace=0.1, size=25)
+
 
     #%% ── Save outputs ─────────────────────────────────────────────────────────
     if args.save_h5ad:
