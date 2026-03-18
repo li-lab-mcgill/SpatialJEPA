@@ -378,138 +378,44 @@ def build_zero_shot_mgate(source_mgate, vgp_mode, device):
     return target_mgate
 
 
-# ─── Graph helpers (replicated from mouse_brain_spatial_rna_atac.py) ──────────
+# ─── Import shared helpers from mouse_brain_spatial_rna_atac.py ───────────────
+#
+# The training script's `else` branch (executed when imported as a module rather
+# than run directly) calls `from gene_peak_attention_utils import ...`, but that
+# module does not exist on disk.  We inject a lightweight stub into sys.modules
+# *before* the import so Python does not raise an ImportError.  The stub names
+# are only used inside run_gene_peak_attention_tutorial(), which we don't call.
 
-def _to_dense_df(adata):
-    matrix = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()
-    return pd.DataFrame(matrix, index=adata.obs.index, columns=adata.var.index)
+import types as _types
 
+_gpa_stub = _types.ModuleType("gene_peak_attention_utils")
+for _fn_name in [
+    "add_gene_and_peak_columns",
+    "assign_regulatory_region",
+    "compute_gene_peak_distance",
+    "extract_peak_gene_connections",
+    "filter_by_attention_threshold",
+    "get_gmm_attention_threshold",
+    "merge_with_gene_annotations",
+    "parse_gtf_file",
+    "plot_attention_distribution",
+    "plot_distance_distribution",
+    "save_attention_outputs",
+]:
+    setattr(_gpa_stub, _fn_name, None)
+sys.modules.setdefault("gene_peak_attention_utils", _gpa_stub)
 
-def prepare_graph_data(adj):
-    num_nodes = adj.shape[0]
-    adj = adj + sp.eye(num_nodes)
-    if not sp.isspmatrix_coo(adj):
-        adj = adj.tocoo()
-    adj = adj.astype(np.float32)
-    indices = np.vstack((adj.col, adj.row)).transpose()
-    return (indices, adj.data, adj.shape)
+# Add the scripts directory so Python can find mouse_brain_spatial_rna_atac.
+_scripts_dir = os.path.dirname(os.path.abspath(__file__))
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
 
-
-def build_graph_inputs(adata_rna, adata_atac, bp_width=400, graph_type="ATAC", protein_value=0.001):
-    """
-    Build (cell_graph_tf, gene_peak_graph_tf, x1_df, x2_df) from annotated
-    AnnData objects that already carry uns['Spatial_Net'] and uns['gene_peak_Net'].
-    Mirrors build_graph_inputs() in mouse_brain_spatial_rna_atac.py exactly.
-    """
-    x1 = _to_dense_df(adata_rna)
-    x2 = _to_dense_df(adata_atac)
-
-    cells = np.array(x1.index)
-    cells_id_tran = dict(zip(cells, range(len(cells))))
-    genes = np.array(x1.columns)
-    peaks = np.array(x2.columns)
-    genes_id_tran = dict(zip(genes, range(len(genes))))
-    peaks_id_tran = dict(zip(peaks, range(len(peaks))))
-
-    if "Spatial_Net" not in adata_rna.uns:
-        raise ValueError("Spatial_Net missing from adata_rna.uns.")
-
-    spatial_net = adata_rna.uns["Spatial_Net"]
-    graph_df = spatial_net.copy()
-    graph_df["Cell1"] = graph_df["Cell1"].map(cells_id_tran)
-    graph_df["Cell2"] = graph_df["Cell2"].map(cells_id_tran)
-    graph_df = graph_df.dropna(subset=["Cell1", "Cell2"])
-    graph_df[["Cell1", "Cell2"]] = graph_df[["Cell1", "Cell2"]].astype(int)
-
-    graph = sp.coo_matrix(
-        (np.ones(graph_df.shape[0]), (graph_df["Cell1"], graph_df["Cell2"])),
-        shape=(adata_rna.n_obs, adata_rna.n_obs),
-    )
-    graph_tf = prepare_graph_data(graph)
-
-    if "gene_peak_Net" not in adata_rna.uns:
-        raise ValueError("gene_peak_Net missing from adata_rna.uns.")
-
-    gene_peak_net = adata_rna.uns["gene_peak_Net"]
-    if graph_type == "protein":
-        gene_peak_net = gene_peak_net.copy()
-        gene_peak_net.columns = ["Gene", "Peak"]
-
-    gp_df = gene_peak_net.copy()
-    gp_df["Gene"] = gp_df["Gene"].map(genes_id_tran)
-    gp_df["Peak"] = gp_df["Peak"].map(peaks_id_tran)
-    gp_df = gp_df.dropna(subset=["Gene", "Peak"]).copy()
-    if gp_df.empty:
-        raise ValueError("gene_peak_Net has no overlap with the selected RNA/ATAC features.")
-
-    gp_df["Gene"] = gp_df["Gene"].astype(int)
-    gp_df["Peak"] = gp_df["Peak"].astype(int) + adata_rna.n_vars
-
-    if graph_type in ["ATAC", "ATAC_RNA"]:
-        dist = gp_df["Distance"].astype(float)
-        gp_bp_width = bp_width if graph_type == "ATAC" else 2000
-        weights = np.concatenate(
-            (
-                ((dist + gp_bp_width) / gp_bp_width) ** (-0.75),
-                ((dist + gp_bp_width) / gp_bp_width) ** (-0.75),
-            ),
-            axis=0,
-        )
-    else:
-        weights = np.ones(gp_df.shape[0] * 2) * protein_value
-
-    gp_graph = sp.coo_matrix(
-        (
-            weights,
-            (
-                np.concatenate((gp_df["Gene"], gp_df["Peak"]), axis=0),
-                np.concatenate((gp_df["Peak"], gp_df["Gene"]), axis=0),
-            ),
-        ),
-        shape=(adata_rna.n_vars + adata_atac.n_vars, adata_rna.n_vars + adata_atac.n_vars),
-    )
-    gp_graph_tf = prepare_graph_data(gp_graph)
-    return graph_tf, gp_graph_tf, x1, x2
-
-
-def build_knn_graph_as_spatial_net(adata, n_neighbors=15):
-    """Build a kNN cell graph and store it as uns['Spatial_Net'] (MultiGATE format)."""
-    sc.pp.neighbors(adata, n_neighbors=n_neighbors)
-    conn = adata.obsp["connectivities"].tocoo()
-    mask = conn.row != conn.col
-    adata.uns["Spatial_Net"] = pd.DataFrame(
-        {
-            "Cell1": adata.obs_names[conn.row[mask]].to_numpy(),
-            "Cell2": adata.obs_names[conn.col[mask]].to_numpy(),
-            "Distance": np.zeros(int(mask.sum()), dtype=float),
-        }
-    )
-
-
-def set_multigate_embeddings(adata_rna, adata_atac, emb_rna, emb_atac, key="MultiGATE"):
-    """Store per-modality embeddings and their L2-normalised average."""
-    adata_rna.obsm[key] = emb_rna
-    adata_atac.obsm[key] = emb_atac
-    norm2 = Normalizer(norm="l2")
-    clip_all = (norm2.fit_transform(emb_rna) + norm2.fit_transform(emb_atac)) / 2.0
-    adata_rna.obsm[key + "_clip_all"] = clip_all
-    adata_atac.obsm[key + "_clip_all"] = clip_all
-
-
-def pair_and_subsample_target(target_rna, target_atac, subsample_n, seed):
-    shared_obs = target_rna.obs_names.intersection(target_atac.obs_names)
-    if len(shared_obs) == 0:
-        raise ValueError("Target RNA and ATAC share no cells after preprocessing.")
-    target_rna = target_rna[shared_obs].copy()
-    target_atac = target_atac[shared_obs].copy()
-    if target_rna.n_obs > subsample_n:
-        rng = np.random.RandomState(seed)
-        selected = np.array(target_rna.obs_names)[
-            rng.choice(target_rna.n_obs, size=subsample_n, replace=False)
-        ]
-        target_rna = target_rna[selected].copy()
-        target_atac = target_atac[selected].copy()
-    return target_rna, target_atac
+from mouse_brain_spatial_rna_atac import (  # noqa: E402
+    build_graph_inputs,
+    build_knn_graph_as_spatial_net,
+    set_multigate_embeddings,
+    pair_and_subsample_target,
+)
 
 
 # ─── Feature selection (mirrors mouse_brain_spatial_rna_atac.py exactly) ──────
@@ -681,7 +587,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
-    # ── MLflow setup ────────────────────────────────────────────────────────
+    #%% ── MLflow setup ────────────────────────────────────────────────────────
     setup_mlflow_tracking()
     client = MlflowClient()
     run_id = resolve_run_id_from_name(client, args.run_name)
