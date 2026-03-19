@@ -85,6 +85,17 @@ from MultiGATE.model_MultiGATE import MGATE
 
 print("Using MultiGATE module:", MultiGATE.__file__)
 
+from mouse_brain_spatial_rna_atac import (  # noqa: E402
+    build_graph_inputs,
+    build_source_student_graph_tf,
+    set_multigate_embeddings,
+    pair_and_subsample_target,
+    apply_hvg_and_gp_filtering,
+    prepare_target_for_spatial_graph_type,
+    build_concat_adata_for_umap,
+    compute_concat_umap,
+)
+
 
 #%% ─── Argument parsing ─────────────────────────────────────────────────────────
 
@@ -390,50 +401,6 @@ def build_zero_shot_mgate(source_mgate, target_spot_num, vgp_anchor_mode, device
     return target_mgate
 
 
-# ─── Import shared helpers from mouse_brain_spatial_rna_atac.py ───────────────
-#
-# The training script's `else` branch (executed when imported as a module rather
-# than run directly) calls `from gene_peak_attention_utils import ...`, but that
-# module does not exist on disk.  We inject a lightweight stub into sys.modules
-# *before* the import so Python does not raise an ImportError.  The stub names
-# are only used inside run_gene_peak_attention_tutorial(), which we don't call.
-
-import types as _types
-
-_gpa_stub = _types.ModuleType("gene_peak_attention_utils")
-for _fn_name in [
-    "add_gene_and_peak_columns",
-    "assign_regulatory_region",
-    "compute_gene_peak_distance",
-    "extract_peak_gene_connections",
-    "filter_by_attention_threshold",
-    "get_gmm_attention_threshold",
-    "merge_with_gene_annotations",
-    "parse_gtf_file",
-    "plot_attention_distribution",
-    "plot_distance_distribution",
-    "save_attention_outputs",
-]:
-    setattr(_gpa_stub, _fn_name, None)
-sys.modules.setdefault("gene_peak_attention_utils", _gpa_stub)
-
-# Add the scripts directory so Python can find mouse_brain_spatial_rna_atac.
-_scripts_dir = os.path.dirname(os.path.abspath(__file__))
-if _scripts_dir not in sys.path:
-    sys.path.insert(0, _scripts_dir)
-
-from mouse_brain_spatial_rna_atac import (  # noqa: E402
-    build_graph_inputs,
-    build_source_student_graph_tf,
-    set_multigate_embeddings,
-    pair_and_subsample_target,
-    apply_hvg_and_gp_filtering,
-    prepare_target_for_spatial_graph_type,
-    build_concat_adata_for_umap,
-    compute_concat_umap,
-)
-
-
 # ─── Inference ────────────────────────────────────────────────────────────────
 
 def _as_sparse_tensor(graph_tf, device):
@@ -632,7 +599,7 @@ def main():
     print("[TMP] Subsampling source cells to match target cells...")
     source_rna, source_atac = pair_and_subsample_target(
         source_rna, source_atac,
-        subsample_n=target_rna.n_obs,
+        subsample_n=args.target_subsample_n,
         seed=args.target_subsample_seed,
     )
     print("  {} cells after pairing/subsampling".format(source_rna.n_obs))
@@ -772,6 +739,20 @@ def main():
         size=25,
     )
 
+    #%%
+    from post_hoc_utils import run_gene_peak_attention_tutorial
+    import scipy.sparse as sp
+
+    # Find the artifact path for the attention matrix
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        local_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path="matrices/source_peak_gene_attention.npz", dst_path=tmp_dir)
+        source_peak_gene_attention = sp.load_npz(local_path)
+
+    attention_analysis_summary = run_gene_peak_attention_tutorial(
+        peak_gene_attention=source_peak_gene_attention,
+        adata_rna=source_rna,
+        adata_atac=source_atac,
+    )
 
     #%% ── Save outputs ─────────────────────────────────────────────────────────
     if args.save_h5ad:
