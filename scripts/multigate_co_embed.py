@@ -25,7 +25,7 @@ Usage:
   python multigate_co_embed.py --run-name 20260314_095952 --save-h5ad
 
   # Use zero-shot target transfer instead of stage2:
-  python multigate_co_embed.py --run-name 20260314_095952 --target-model zero_shot --vgp-mode zero
+  python multigate_co_embed.py --run-name 20260314_095952 --target-model zero_shot
 
   # Use the spatial teacher for source and zero-shot for target:
   python multigate_co_embed.py --run-name 20260314_095952 --source-model stage1_teacher --target-model zero_shot
@@ -139,16 +139,6 @@ def parse_args(notebook: bool = False):
             "Which model to use for target inference. "
             "'stage2' loads model_stage2.pth (requires stage2_epochs > 0). "
             "'zero_shot' zero-shot transfers the chosen source model weights."
-        ),
-    )
-    p.add_argument(
-        "--vgp-mode",
-        choices=["zero", "feature"],
-        default="zero",
-        help=(
-            "How to initialise vgp0/vgp1 when --target-model zero_shot is used. "
-            "'zero': zero out GP gating vectors (prior-only attention). "
-            "'feature': copy trained source vgp weights directly."
         ),
     )
     p.add_argument(
@@ -365,11 +355,11 @@ def load_mgate(client, run_id, artifact_name, device, dst_dir):
     return mgate, hidden_dims1, hidden_dims2, vgp_anchor_mode
 
 
-def build_zero_shot_mgate(source_mgate, target_spot_num, vgp_mode, vgp_anchor_mode, device):
+def build_zero_shot_mgate(source_mgate, target_spot_num, vgp_anchor_mode, device):
     """
-    Build a target MGATE by copying all transferable source weights.
-    vgp_mode='zero'    : zero out vgp0/vgp1 (prior-only GP attention).
-    vgp_mode='feature' : copy trained source vgp vectors directly.
+    Build a target MGATE by copying transferable source weights.
+    If vgp_anchor_mode == 'feature': copy trained vgp vectors directly.
+    If vgp_anchor_mode == 'spot': zero out vgp0/vgp1 (prior-only GP attention).
     """
     if vgp_anchor_mode is None:
         vgp_anchor_mode = getattr(source_mgate, "vgp_anchor_mode", "spot")
@@ -383,17 +373,9 @@ def build_zero_shot_mgate(source_mgate, target_spot_num, vgp_mode, vgp_anchor_mo
         vgp_anchor_mode=vgp_anchor_mode,
     ).to(device)
 
-    if vgp_mode == "feature":
-        if vgp_anchor_mode == "spot":
-            source_spot_num = int(source_mgate.vgp0.shape[0])
-            if int(target_spot_num) != source_spot_num:
-                raise ValueError(
-                    "Cannot copy spot-anchored vgp when source and target cell counts differ "
-                    "(source={}, target={}). Use --vgp-mode zero or --vgp-anchor-mode feature."
-                    .format(source_spot_num, target_spot_num)
-                )
+    if vgp_anchor_mode == "feature":
         target_mgate.load_state_dict(source_mgate.state_dict(), strict=False)
-    else:  # vgp_mode == "zero"
+    else:  # vgp_anchor_mode == "spot"
         state_dict = {
             k: v
             for k, v in source_mgate.state_dict().items()
@@ -646,6 +628,15 @@ def main():
             # Zero-shot: built after download, outside the tmpdir block
             target_mgate = None
 
+    #%% ── Subsample source cells to match target cells ────────────────────────────────────────────────────────────
+    print("[TMP] Subsampling source cells to match target cells...")
+    source_rna, source_atac = pair_and_subsample_target(
+        source_rna, source_atac,
+        subsample_n=target_rna.n_obs,
+        seed=args.target_subsample_seed,
+    )
+    print("  {} cells after pairing/subsampling".format(source_rna.n_obs))
+
     #%% ── Source spatial graph ─────────────────────────────────────────────────
     print("\nBuilding source spatial graph...")
     MultiGATE.Cal_Spatial_Net(source_rna, rad_cutoff=40)
@@ -717,19 +708,18 @@ def main():
         )
         print(
             "\nBuilding zero-shot target model from source weights "
-            "(vgp_mode='{}', vgp_anchor_mode='{}')...".format(
-                args.vgp_mode, effective_vgp_anchor_mode
+            "(vgp_anchor_mode='{}')...".format(
+                effective_vgp_anchor_mode
             )
         )
         target_mgate = build_zero_shot_mgate(
             source_mgate=source_mgate,
             target_spot_num=target_rna.n_obs,
-            vgp_mode=args.vgp_mode,
             vgp_anchor_mode=effective_vgp_anchor_mode,
             device=device,
         )
 
-    #%% ── Inference ────────────────────────────────────────────────────────────
+    #%% ── Inference, by dataset ────────────────────────────────────────────────────────────
     source_rna_emb, source_atac_emb = run_inference(
         source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
@@ -737,20 +727,34 @@ def main():
     print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
     target_rna_emb, target_atac_emb = run_inference(
-        source_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
+        target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
     )
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
-    #%% Plot source/target concat UMAPs with the same helper as training script.
+    # Plot source/target concat UMAPs with the same helper as training script.
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
     compute_concat_umap(source_concat_adata, n_neighbors=10, resolution=1.5)
     compute_concat_umap(target_concat_adata, n_neighbors=10, resolution=1.5)
-    sc.pl.umap(source_concat_adata, color=["modality", "leiden"], ncols=2, wspace=0.2, size=25)
-    sc.pl.umap(target_concat_adata, color=["modality", "leiden"], ncols=2, wspace=0.2, size=25)
+    target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
+    sc.pl.umap(source_concat_adata, color=["modality", "leiden", "RNA_clusters"], ncols=3, wspace=0.2, size=25)
+    sc.pl.umap(target_concat_adata, color=["modality", "leiden", "arc_gex_kmeans_5_clusters_Cluster"], ncols=3, wspace=0.2, size=25)
 
-    #%%
+    #%% ── Inference, combined target embeddings ────────────────────────────────────────────────────────────
+    source_rna_emb, source_atac_emb = run_inference(
+        target_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+    )
+    set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
+    print("  Source embeddings: shape {}".format(source_rna_emb.shape))
+
+    target_rna_emb, target_atac_emb = run_inference(
+        target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
+    )
+    set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
+    print("  Target embeddings: shape {}".format(target_rna_emb.shape))
+
+    # Plot combined UMAP
     source_target_rna = sc.concat([source_rna, target_rna], axis=0)
     source_target_atac = sc.concat([source_atac, target_atac], axis=0)
     source_target_rna.obs["source_or_target"] = ["source"] * source_rna.n_obs + ["target"] * target_rna.n_obs
