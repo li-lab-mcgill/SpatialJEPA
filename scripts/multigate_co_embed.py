@@ -510,8 +510,8 @@ def main():
     target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
 
     # Flip spatial coordinates (same convention as training)
-    source_rna.obsm["spatial"]  = source_rna.obsm["spatial"][:,  [1, 0]] * -1
-    source_atac.obsm["spatial"] = source_atac.obsm["spatial"][:, [1, 0]] * -1
+    source_rna.obsm["spatial"]  = source_rna.obsm["spatial"] * -1
+    source_atac.obsm["spatial"] = source_atac.obsm["spatial"] * -1
 
     # ── Gene-peak network ────────────────────────────────────────────────────
     print("\nComputing gene-peak network on source...")
@@ -727,19 +727,29 @@ def main():
     source_target_rna.obs["source_or_target"] = ["source"] * source_rna.n_obs + ["target"] * target_rna.n_obs
     source_target_atac.obs["source_or_target"] = ["source"] * source_atac.n_obs + ["target"] * target_atac.n_obs
 
-    source_target_rna_adata = build_concat_adata_for_umap(source_target_rna, source_target_atac, embedding_key="MultiGATE")
-    compute_concat_umap(source_target_rna_adata, n_neighbors=10, resolution=1.5)
+    source_target_adata = build_concat_adata_for_umap(source_target_rna, source_target_atac, embedding_key="MultiGATE")
+    compute_concat_umap(source_target_adata, n_neighbors=10, resolution=1.5)
     # Randomly permute the rows before plotting the UMAP
-    permuted_idx = np.random.permutation(source_target_rna_adata.n_obs)
+    permuted_idx = np.random.permutation(source_target_adata.n_obs)
     sc.pl.umap(
-        source_target_rna_adata[permuted_idx],
+        source_target_adata[permuted_idx],
         color=["modality", "source_or_target", "leiden"],
         ncols=3,
         wspace=0.2,
         size=25,
     )
 
-    #%%
+    #%% plot source and target spatial and UMAP
+    import matplotlib.pyplot as plt
+
+    plt.rcParams["figure.figsize"] = (7, 3)
+    fig, axs = plt.subplots(1, 2)
+    sc.pl.embedding(source_rna, basis="spatial", color="RNA_clusters", s=20, show=False, title='MultiGATE Spatial', ax=axs[0], legend_loc='None')
+    sc.pl.umap(source_rna, color="RNA_clusters", title='MultiGATE UMAP', ax=axs[1], size=20)
+    plt.tight_layout()
+    plt.show()
+    
+    #%% attention matrix analysis
     from post_hoc_utils import run_gene_peak_attention_tutorial
     import scipy.sparse as sp
 

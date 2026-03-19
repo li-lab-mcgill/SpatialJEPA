@@ -1182,8 +1182,8 @@ def main():
     source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned.h5ad"))
     source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned.h5ad"))
 
-    source_rna.obsm["spatial"] = source_rna.obsm["spatial"][:, [1, 0]] * -1
-    source_atac.obsm["spatial"] = source_atac.obsm["spatial"][:, [1, 0]] * -1
+    source_rna.obsm["spatial"] = source_rna.obsm["spatial"] * -1
+    source_atac.obsm["spatial"] = source_atac.obsm["spatial"] * -1
 
     # TARGET
     target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
