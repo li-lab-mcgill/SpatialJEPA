@@ -150,17 +150,6 @@ def parse_args(notebook: bool = False):
         help="Number of jobs for scib-metrics neighbor search.",
     )
     parser.add_argument(
-        "--vgp-mode",
-        type=str,
-        choices=["zero", "feature"],
-        default="zero",
-        help=(
-            "How to initialise GP gating vectors (vgp0/vgp1) when transferring to the target. "
-            "'zero': zero out vgp (prior-only GP attention). "
-            "'feature': copy trained vgp directly."
-        ),
-    )
-    parser.add_argument(
         "--vgp-anchor-mode",
         type=str,
         choices=["spot", "feature"],
@@ -356,10 +345,10 @@ def build_source_student_graph_tf(source_rna, spatial_graph_type, knn_neighbors=
     )
 
 
-def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_mode="zero", vgp_anchor_mode=None):
+def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_anchor_mode=None):
     # Rebuild MGATE with target N and load transferable weights.
-    # vgp_mode="zero":    zero out vgp0/vgp1 (prior-only GP attention).
-    # vgp_mode="feature": transfer trained vgp directly.
+    # If vgp_anchor_mode == "feature": transfer trained vgp directly.
+    # If vgp_anchor_mode == "spot":    zero out vgp0/vgp1 (prior-only GP attention).
     if vgp_anchor_mode is None:
         vgp_anchor_mode = getattr(source_trainer.mgate, "vgp_anchor_mode", "spot")
 
@@ -378,19 +367,10 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_mode="ze
         config={"device": str(source_trainer.device)},
     )
 
-    if vgp_mode == "feature":
-        if vgp_anchor_mode == "spot":
-            source_spot_num = int(source_trainer.mgate.vgp0.shape[0])
-            if source_spot_num != int(target_spot_num):
-                raise ValueError(
-                    "Cannot transfer spot-anchored vgp with vgp_mode='feature' when source and target "
-                    "cell counts differ (source={}, target={}). Use --vgp-mode zero, or "
-                    "--vgp-anchor-mode feature.".format(source_spot_num, target_spot_num)
-                )
+    if vgp_anchor_mode == "feature":
         state_dict = source_trainer.mgate.state_dict()
         target_trainer.mgate.load_state_dict(state_dict, strict=False)
-
-    else:  # vgp_mode == "zero"
+    else:  # vgp_anchor_mode == "spot"
         state_dict = {
             key: value
             for key, value in source_trainer.mgate.state_dict().items()
@@ -961,7 +941,6 @@ def run_stage2_distillation(
     lambda_kd,
     target_label_key,
     scib_n_jobs,
-    vgp_mode="zero",
     vgp_anchor_mode=None,
 ):
     if stage2_epochs <= 0:
@@ -972,7 +951,6 @@ def run_stage2_distillation(
     teacher_trainer = build_zero_shot_target_trainer(
         source_trainer,
         target_rna.n_obs,
-        vgp_mode=vgp_mode,
         vgp_anchor_mode=vgp_anchor_mode,
     )
     teacher_model = teacher_trainer.mgate
@@ -1018,7 +996,12 @@ def run_stage2_distillation(
         mlflow.log_param("kd_mix_kl", 0.1)
         mlflow.log_param("kd_mix_ot", 0.9)
         mlflow.log_param("student_init", "random")
-        mlflow.log_param("teacher_init", "source_to_target_zero_shot_vgp0")
+        teacher_init_mode = (
+            "source_to_target_zero_shot_copy_vgp"
+            if (vgp_anchor_mode or getattr(source_trainer.mgate, "vgp_anchor_mode", "spot")) == "feature"
+            else "source_to_target_zero_shot_zero_vgp"
+        )
+        mlflow.log_param("teacher_init", teacher_init_mode)
         mlflow.log_param("stage2_target_label_key", target_label_key if target_label_key is not None else "None")
         target_scib_label_mode_logged = False
         target_scib_effective_label_key_logged = False
@@ -1523,7 +1506,6 @@ def main():
             trainer_target = build_zero_shot_target_trainer(
                 stage1_primary_trainer,
                 target_rna.n_obs,
-                vgp_mode=args.vgp_mode,
                 vgp_anchor_mode=args.vgp_anchor_mode,
             )
             target_embeddings = trainer_target.infer(
@@ -1665,7 +1647,6 @@ def main():
                 lambda_kd=args.lambda_kd,
                 target_label_key=args.target_label_key,
                 scib_n_jobs=args.scib_n_jobs,
-                vgp_mode=args.vgp_mode,
                 vgp_anchor_mode=args.vgp_anchor_mode,
             )
             if stage2_trainer is None:
