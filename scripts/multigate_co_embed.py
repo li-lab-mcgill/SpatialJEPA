@@ -741,11 +741,39 @@ def main():
 
     #%% plot source and target spatial and UMAP
     import matplotlib.pyplot as plt
+    from scipy.optimize import linear_sum_assignment
+
+    bounds = [
+        source_rna.n_obs,
+        source_rna.n_obs + target_rna.n_obs,
+        source_rna.n_obs + target_rna.n_obs + source_atac.n_obs,
+    ]
+
+    conns = source_target_adata.obsp['connectivities']
+
+    conns_source_target_rna = conns[:bounds[0], bounds[0]:bounds[1]].toarray()
+    conns_source_target_atac = conns[bounds[1]:bounds[2], bounds[2]:].toarray()
+
+    rna_source_idx, rna_target_idx = linear_sum_assignment(1 - conns_source_target_rna)
+    atac_source_idx, atac_target_idx = linear_sum_assignment(1 - conns_source_target_atac)
+
+    target_rna_spatial = np.empty((target_rna.n_obs, source_rna.obsm["spatial"].shape[1]))
+    target_atac_spatial = np.empty((target_atac.n_obs, source_atac.obsm["spatial"].shape[1]))
+
+    target_rna_spatial[rna_target_idx] = source_rna.obsm["spatial"][rna_source_idx]
+    target_atac_spatial[atac_target_idx] = source_atac.obsm["spatial"][atac_source_idx]
+
+    source_target_adata.obsm["spatial"] = np.concatenate([
+        source_rna.obsm["spatial"],
+        target_rna_spatial,
+        source_atac.obsm["spatial"],
+        target_atac_spatial,
+    ], axis=0)
 
     plt.rcParams["figure.figsize"] = (7, 3)
     fig, axs = plt.subplots(1, 2)
-    sc.pl.embedding(source_rna, basis="spatial", color="RNA_clusters", s=20, show=False, title='MultiGATE Spatial', ax=axs[0], legend_loc='None')
-    sc.pl.umap(source_rna, color="RNA_clusters", title='MultiGATE UMAP', ax=axs[1], size=20)
+    sc.pl.embedding(source_target_adata, basis="spatial", color="leiden", s=20, show=False, title='MultiGATE Spatial', ax=axs[0], legend_loc='None')
+    sc.pl.umap(source_target_adata, color="leiden", title='MultiGATE UMAP', ax=axs[1], size=20)
     plt.tight_layout()
     plt.show()
     
