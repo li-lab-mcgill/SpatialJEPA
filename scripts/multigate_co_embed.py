@@ -37,6 +37,7 @@ import shutil
 import sys
 import tempfile
 from pprint import pprint
+import matplotlib.pyplot as plt
 
 #%%
 
@@ -171,18 +172,6 @@ def parse_args(notebook: bool = False):
             "If omitted, reads 'stage1_student_graph' from the run params. "
             "The source always uses its spatial graph."
         ),
-    )
-    p.add_argument(
-        "--target-subsample-n",
-        type=int,
-        default=5000,
-        help="Maximum number of paired target cells to keep.",
-    )
-    p.add_argument(
-        "--target-subsample-seed",
-        type=int,
-        default=0,
-        help="Random seed for target subsampling.",
     )
     p.add_argument(
         "--output-dir",
@@ -458,16 +447,19 @@ def main():
     run_params = load_run_params(client, run_id, args.run_name)
 
     #%% Resolve graph type for the target (arg takes precedence over run param)
-    spatial_graph_type = (
-        args.spatial_graph_type
-        or run_params.get("stage1_student_graph", "identity")
-    )
+    spatial_graph_type = args.spatial_graph_type or run_params.get("stage1_student_graph", "identity")
+    if spatial_graph_type in {"NA", "na", "None", "none", "", None}:
+        spatial_graph_type = "identity"
     print("Target spatial graph type:", spatial_graph_type)
 
     bp_width       = int(run_params.get("bp_width", 400))
     graph_type     = run_params.get("graph_type", "ATAC")
     dual_source_kd = run_params.get("stage1_dual_source_kd", "False").lower() == "true"
     has_stage2     = int(run_params.get("stage2_epochs", 0)) > 0
+    target_subsample_n = int(run_params.get("target_subsample_n", 5000))
+    target_subsample_seed = int(run_params.get("target_subsample_seed", 0))
+    if target_subsample_n <= 0:
+        raise ValueError("--target-subsample-n must be a positive integer.")
 
     # Validate model selections against available artifacts
     if args.source_model in ("stage1_teacher", "stage1_student") and not dual_source_kd:
@@ -508,6 +500,8 @@ def main():
     source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned.h5ad"))
     target_rna  = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
     target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
+    if not target_rna.obs_names.equals(target_atac.obs_names):
+        raise AssertionError("Target RNA and ATAC must have matching obs_names")
 
     # Flip spatial coordinates (same convention as training)
     source_rna.obsm["spatial"]  = source_rna.obsm["spatial"] * -1
@@ -596,6 +590,7 @@ def main():
             target_mgate = None
 
     #%% ── Subsample source cells to match target cells ────────────────────────────────────────────────────────────
+    '''
     print("[TMP] Subsampling source cells to match target cells...")
     source_rna, source_atac = pair_and_subsample_target(
         source_rna, source_atac,
@@ -603,7 +598,7 @@ def main():
         seed=args.target_subsample_seed,
     )
     print("  {} cells after pairing/subsampling".format(source_rna.n_obs))
-
+    '''
     #%% ── Source spatial graph ─────────────────────────────────────────────────
     print("\nBuilding source spatial graph...")
     MultiGATE.Cal_Spatial_Net(source_rna, rad_cutoff=40)
@@ -642,14 +637,6 @@ def main():
     print("  Source inference graph:", source_graph_mode)
 
     # ── Target graphs ────────────────────────────────────────────────────────
-    print("\nPairing and subsampling target cells...")
-    target_rna, target_atac = pair_and_subsample_target(
-        target_rna, target_atac,
-        subsample_n=args.target_subsample_n,
-        seed=args.target_subsample_seed,
-    )
-    print("  {} cells after pairing/subsampling".format(target_rna.n_obs))
-
     print("Building target graph (type: '{}')...".format(spatial_graph_type))
     target_rna, target_atac = prepare_target_for_spatial_graph_type(
         target_rna=target_rna,
@@ -659,6 +646,14 @@ def main():
         spatial_graph_type=spatial_graph_type,
         gtf_path=gtf_path,
     )
+    print("\nPairing and subsampling target cells...")
+    target_rna, target_atac = pair_and_subsample_target(
+        target_rna,
+        target_atac,
+        subsample_n=target_subsample_n,
+        seed=target_subsample_seed,
+    )
+    print("  {} cells after pairing/subsampling".format(target_rna.n_obs))
     target_graph_tf, target_gp_tf, target_x1, target_x2 = build_graph_inputs(
         target_rna, target_atac, bp_width=bp_width, graph_type=graph_type
     )
@@ -705,8 +700,18 @@ def main():
     compute_concat_umap(source_concat_adata, n_neighbors=10, resolution=1.5)
     compute_concat_umap(target_concat_adata, n_neighbors=10, resolution=1.5)
     target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
-    sc.pl.umap(source_concat_adata, color=["modality", "leiden", "RNA_clusters"], ncols=3, wspace=0.2, size=25)
-    sc.pl.umap(target_concat_adata, color=["modality", "leiden", "arc_gex_kmeans_5_clusters_Cluster"], ncols=3, wspace=0.2, size=25)
+
+    source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
+    fig, axs = plt.subplots(1, len(source_umap_colors), figsize=(18, 5))
+    for i, color in enumerate(source_umap_colors):
+        sc.pl.umap(source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+    plt.tight_layout(); plt.show()
+
+    target_umap_colors = ['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster']
+    fig, axs = plt.subplots(1, len(target_umap_colors), figsize=(18, 5))
+    for i, color in enumerate(target_umap_colors):
+        sc.pl.umap(target_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+    plt.tight_layout(); plt.show()
 
     #%% ── Inference, combined target embeddings ────────────────────────────────────────────────────────────
     source_rna_emb, source_atac_emb = run_inference(
