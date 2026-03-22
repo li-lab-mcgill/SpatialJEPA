@@ -903,13 +903,6 @@ def compute_clip_logits(clip_rna, clip_atac, logit_scale):
     return torch.matmul(clip_rna, clip_atac.transpose(0, 1)) * torch.exp(logit_scale)
 
 
-def compute_clip_loss_from_logits(logits):
-    labels = torch.arange(logits.shape[0], device=logits.device)
-    loss_rna = F.cross_entropy(logits, labels, reduction="none")
-    loss_atac = F.cross_entropy(logits.transpose(0, 1), labels, reduction="none")
-    return ((loss_rna + loss_atac) / 2.0).mean()
-
-
 def compute_kd_kl_loss(student_logits, teacher_logits):
     kd_cols = F.kl_div(
         F.log_softmax(student_logits, dim=1),
@@ -1049,14 +1042,9 @@ def run_stage2_distillation(
             torch.nn.utils.clip_grad_norm_(student_trainer.mgate.parameters(), student_trainer.gradient_clipping)
             student_trainer.optimizer.step()
 
-            model_clip_loss = student_outputs[4]
-            reconstructed_clip_loss = compute_clip_loss_from_logits(student_logits)
-            clip_parity_absdiff = torch.abs(model_clip_loss - reconstructed_clip_loss).detach().cpu().item()
-
             mlflow.log_metric("stage2_distill_loss", float(distill_loss.detach().cpu().item()), step=epoch)
             mlflow.log_metric("stage2_kd_kl_loss", float(kd_kl_loss.detach().cpu().item()), step=epoch)
             mlflow.log_metric("stage2_kd_ot_clip_loss", float(kd_ot_loss.detach().cpu().item()), step=epoch)
-            mlflow.log_metric("stage2_clip_logits_parity_absdiff", float(clip_parity_absdiff), step=epoch)
 
             loss_val = float(distill_loss.detach().cpu().item())
             pbar.set_postfix({"distill_loss": "{:.4f}".format(loss_val)})
@@ -1093,7 +1081,6 @@ def run_stage2_distillation(
             del student_outputs, teacher_outputs
             del student_clip_rna, student_clip_atac, teacher_clip_rna, teacher_clip_atac
             del student_logits, teacher_logits, kd_ot_loss, kd_kl_loss, distill_loss
-            del model_clip_loss, reconstructed_clip_loss
 
     final_target_embeddings = student_trainer.infer(
         target_graph_tf,
