@@ -757,13 +757,13 @@ def main():
 
     #%% ── Inference, combined target embeddings ────────────────────────────────────────────────────────────
     source_rna_emb, source_atac_emb = run_inference(
-        target_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+        source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
     print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
     target_rna_emb, target_atac_emb = run_inference(
-        target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
+        source_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
     )
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
@@ -818,16 +818,24 @@ def main():
     target_rna_spatial[rna_target_idx] = source_rna.obsm["spatial"][rna_source_idx]
     target_atac_spatial[atac_target_idx] = source_atac.obsm["spatial"][atac_source_idx]
 
+    ## add spatial coordinates to source_target_adata
+    source_target_adata.obsm["spatial"] = np.concatenate([
+        source_rna.obsm["spatial"],
+        target_rna_spatial,
+        source_atac.obsm["spatial"],
+        target_atac_spatial,
+    ], axis=0)
+
     ## assign target spatial coordinates to source_target_adata
     source_adata = source_target_adata[source_target_adata.obs["source_or_target"].eq("source")]
     target_adata = source_target_adata[source_target_adata.obs["source_or_target"].eq("target")]
 
     ## plot source and target spatial and UMAP
     _, axs = plt.subplots(2, 2, figsize=(10, 8))
-    sc.pl.embedding(source_adata, basis="spatial", color="leiden", s=20, show=False, ax=axs[0, 0], legend_loc='None')
-    sc.pl.umap(source_adata, color="leiden", ax=axs[0, 1], size=20, show=False)
-    sc.pl.embedding(target_adata, basis="spatial", color="leiden", s=20, show=False, ax=axs[1, 0], legend_loc='None')
-    sc.pl.umap(target_adata, color="leiden", ax=axs[1, 1], size=20, show=False)
+    sc.pl.embedding(source_adata, basis="spatial", color="leiden", s=50, show=False, ax=axs[0, 0], legend_loc='None')
+    sc.pl.umap(source_adata, color="leiden", ax=axs[0, 1], size=50, show=False)
+    sc.pl.embedding(target_adata, basis="spatial", color="leiden", s=50, show=False, ax=axs[1, 0], legend_loc='None')
+    sc.pl.umap(target_adata, color="leiden", ax=axs[1, 1], size=50, show=False)
     axs[0, 0].set_title('Source Spatial'); axs[0, 1].set_title('Source UMAP'); axs[1, 0].set_title('Target Spatial'); axs[1, 1].set_title('Target UMAP')
     plt.tight_layout(); plt.show()
     
