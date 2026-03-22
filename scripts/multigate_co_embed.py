@@ -727,6 +727,7 @@ def main():
     # Plot source/target concat UMAPs with the same helper as training script.
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
+    
     compute_concat_umap(
         source_concat_adata,
         n_neighbors=10,
@@ -757,13 +758,13 @@ def main():
 
     #%% ── Inference, combined target embeddings ────────────────────────────────────────────────────────────
     source_rna_emb, source_atac_emb = run_inference(
-        source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+        target_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
     print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
     target_rna_emb, target_atac_emb = run_inference(
-        source_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
+        target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
     )
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
