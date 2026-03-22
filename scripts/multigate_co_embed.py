@@ -33,11 +33,22 @@ Usage:
 #%%
 import argparse
 import os
+import random
 import shutil
 import sys
 import tempfile
 from pprint import pprint
 import matplotlib.pyplot as plt
+
+# Determinism knobs that should be set before importing numpy/torch/scanpy.
+os.environ.setdefault("PYTHONHASHSEED", "0")
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("NUMBA_NUM_THREADS", "1")
 
 #%%
 
@@ -437,8 +448,27 @@ def main():
     #%%
     NOTEBOOK = is_notebook()
     args = parse_args(notebook=NOTEBOOK)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device:", device)
+    
+    deterministic_seed = 0
+    random.seed(deterministic_seed)
+    np.random.seed(deterministic_seed)
+    sc.settings.n_jobs = 1
+
+    torch.manual_seed(deterministic_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(deterministic_seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    try:
+        torch.use_deterministic_algorithms(True)
+    except Exception as exc:
+        warnings.warn("Could not enable full deterministic torch algorithms: {}".format(exc))
+    torch.set_num_threads(1)
+
+    # CPU inference avoids residual GPU sparse-op nondeterminism.
+    device = torch.device("cpu")
+    print("Device:", device, "(deterministic mode)")
 
     #%% ── MLflow setup ────────────────────────────────────────────────────────
     setup_mlflow_tracking()
@@ -697,8 +727,20 @@ def main():
     # Plot source/target concat UMAPs with the same helper as training script.
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
-    compute_concat_umap(source_concat_adata, n_neighbors=10, resolution=1.5)
-    compute_concat_umap(target_concat_adata, n_neighbors=10, resolution=1.5)
+    compute_concat_umap(
+        source_concat_adata,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    compute_concat_umap(
+        target_concat_adata,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
     target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
 
     source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
@@ -733,9 +775,15 @@ def main():
     source_target_atac.obs["source_or_target"] = ["source"] * source_atac.n_obs + ["target"] * target_atac.n_obs
 
     source_target_adata = build_concat_adata_for_umap(source_target_rna, source_target_atac, embedding_key="MultiGATE")
-    compute_concat_umap(source_target_adata, n_neighbors=10, resolution=1.5)
+    compute_concat_umap(
+        source_target_adata,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
     # Randomly permute the rows before plotting the UMAP
-    permuted_idx = np.random.permutation(source_target_adata.n_obs)
+    permuted_idx = np.random.RandomState(deterministic_seed).permutation(source_target_adata.n_obs)
     sc.pl.umap(
         source_target_adata[permuted_idx],
         color=["modality", "source_or_target", "leiden"],

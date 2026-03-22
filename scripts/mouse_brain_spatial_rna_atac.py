@@ -720,10 +720,29 @@ def build_concat_adata_for_umap(rna_adata, atac_adata, embedding_key="MultiGATE"
     return concat_adata
 
 
-def compute_concat_umap(concat_adata, n_neighbors=10, resolution=1.5):
-    sc.pp.neighbors(concat_adata, n_neighbors=n_neighbors)
-    sc.tl.umap(concat_adata)
-    sc.tl.leiden(concat_adata, resolution=resolution)
+def compute_concat_umap(
+    concat_adata,
+    n_neighbors=10,
+    resolution=1.5,
+    deterministic=False,
+    random_state=0,
+):
+    if deterministic:
+        sc.pp.neighbors(
+            concat_adata,
+            n_neighbors=n_neighbors,
+            use_rep="X",
+            knn=True,
+            method="umap",
+            metric="euclidean",
+            random_state=random_state,
+        )
+        sc.tl.umap(concat_adata, random_state=random_state, init_pos="spectral")
+        sc.tl.leiden(concat_adata, resolution=resolution, random_state=random_state)
+    else:
+        sc.pp.neighbors(concat_adata, n_neighbors=n_neighbors)
+        sc.tl.umap(concat_adata)
+        sc.tl.leiden(concat_adata, resolution=resolution)
 
 
 def log_umap_panel_to_mlflow(adata, artifact_path, colors, titles, size=20):
