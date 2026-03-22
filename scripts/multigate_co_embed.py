@@ -796,39 +796,40 @@ def main():
     import matplotlib.pyplot as plt
     from scipy.optimize import linear_sum_assignment
 
+    ## define bounding indices for source and target data
     bounds = [
         source_rna.n_obs,
         source_rna.n_obs + target_rna.n_obs,
         source_rna.n_obs + target_rna.n_obs + source_atac.n_obs,
     ]
 
+    ## get connectivities between source and target data
     conns = source_target_adata.obsp['connectivities']
-
     conns_source_target_rna = conns[:bounds[0], bounds[0]:bounds[1]].toarray()
     conns_source_target_atac = conns[bounds[1]:bounds[2], bounds[2]:].toarray()
 
+    ## get optimal assignment of source and target data
     rna_source_idx, rna_target_idx = linear_sum_assignment(1 - conns_source_target_rna)
     atac_source_idx, atac_target_idx = linear_sum_assignment(1 - conns_source_target_atac)
 
+    ## create arrays for target spatial coordinates
     target_rna_spatial = np.empty((target_rna.n_obs, source_rna.obsm["spatial"].shape[1]))
     target_atac_spatial = np.empty((target_atac.n_obs, source_atac.obsm["spatial"].shape[1]))
-
     target_rna_spatial[rna_target_idx] = source_rna.obsm["spatial"][rna_source_idx]
     target_atac_spatial[atac_target_idx] = source_atac.obsm["spatial"][atac_source_idx]
 
-    source_target_adata.obsm["spatial"] = np.concatenate([
-        source_rna.obsm["spatial"],
-        target_rna_spatial,
-        source_atac.obsm["spatial"],
-        target_atac_spatial,
-    ], axis=0)
+    ## assign target spatial coordinates to source_target_adata
+    source_adata = source_target_adata[source_target_adata.obs["source_or_target"].eq("source")]
+    target_adata = source_target_adata[source_target_adata.obs["source_or_target"].eq("target")]
 
-    plt.rcParams["figure.figsize"] = (7, 3)
-    fig, axs = plt.subplots(1, 2)
-    sc.pl.embedding(source_target_adata, basis="spatial", color="leiden", s=20, show=False, title='MultiGATE Spatial', ax=axs[0], legend_loc='None')
-    sc.pl.umap(source_target_adata, color="leiden", title='MultiGATE UMAP', ax=axs[1], size=20)
-    plt.tight_layout()
-    plt.show()
+    ## plot source and target spatial and UMAP
+    _, axs = plt.subplots(2, 2, figsize=(10, 8))
+    sc.pl.embedding(source_adata, basis="spatial", color="leiden", s=20, show=False, ax=axs[0, 0], legend_loc='None')
+    sc.pl.umap(source_adata, color="leiden", ax=axs[0, 1], size=20, show=False)
+    sc.pl.embedding(target_adata, basis="spatial", color="leiden", s=20, show=False, ax=axs[1, 0], legend_loc='None')
+    sc.pl.umap(target_adata, color="leiden", ax=axs[1, 1], size=20, show=False)
+    axs[0, 0].set_title('Source Spatial'); axs[0, 1].set_title('Source UMAP'); axs[1, 0].set_title('Target Spatial'); axs[1, 1].set_title('Target UMAP')
+    plt.tight_layout(); plt.show()
     
     #%% attention matrix analysis
     from post_hoc_utils import run_gene_peak_attention_tutorial
