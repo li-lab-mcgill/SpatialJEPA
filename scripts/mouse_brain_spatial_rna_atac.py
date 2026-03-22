@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import shutil
-import socket
 import sys
 from datetime import datetime
 from pprint import pprint
@@ -61,6 +60,7 @@ import torch
 import torch.nn.functional as F
 from anndata import AnnData
 from sklearn.preprocessing import Normalizer
+from ignite.metrics import MaximumMeanDiscrepancy as MMD
 from tqdm import tqdm
 import tempfile
 
@@ -1572,6 +1572,17 @@ def main():
                 )
                 target_scib_effective_label_key_logged = True
 
+            # compute alignment metrics between source and target
+            x = np.concatenate([source_rna.obsm["MultiGATE"], source_atac.obsm["MultiGATE"]], axis=0)
+            y = np.concatenate([target_rna.obsm["MultiGATE"], target_atac.obsm["MultiGATE"]], axis=0)
+            min_n = min(x.shape[0], y.shape[0])
+            x = x[:min_n, :]
+            y = y[:min_n, :]
+            mmd = MMD(var=1.0)
+            mmd.reset()
+            mmd.update((torch.from_numpy(x), torch.from_numpy(y)))
+            mmd_value = mmd.compute()
+            mlflow.log_metric("stage1_source_target_balanced_mmd", float(mmd_value), step=epoch)
 
         # log stage-1 UMAP artifacts
         log_stage_umap_artifacts(
