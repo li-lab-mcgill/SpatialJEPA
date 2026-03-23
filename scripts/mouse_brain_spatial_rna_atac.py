@@ -941,8 +941,22 @@ def compute_ot_clip_loss(student_logits, teacher_logits, emd):
     return 0.5 * (ot_clip_loss.mean() + ot_clip_loss_t.mean())
 
 
+def compute_balanced_source_target_mmd(source_rna_embed, source_atac_embed, target_rna_embed, target_atac_embed):
+    x = np.concatenate([source_rna_embed, source_atac_embed], axis=0)
+    y = np.concatenate([target_rna_embed, target_atac_embed], axis=0)
+    min_n = min(x.shape[0], y.shape[0])
+    x = x[:min_n, :]
+    y = y[:min_n, :]
+    mmd = MMD(var=1.0)
+    mmd.reset()
+    mmd.update((torch.from_numpy(x), torch.from_numpy(y)))
+    return float(mmd.compute())
+
+
 def run_stage2_distillation(
     source_trainer,
+    source_rna_embeddings,
+    source_atac_embeddings,
     target_rna,
     target_atac,
     target_graph_tf,
@@ -1045,6 +1059,15 @@ def run_stage2_distillation(
             mlflow.log_metric("stage2_distill_loss", float(distill_loss.detach().cpu().item()), step=epoch)
             mlflow.log_metric("stage2_kd_kl_loss", float(kd_kl_loss.detach().cpu().item()), step=epoch)
             mlflow.log_metric("stage2_kd_ot_clip_loss", float(kd_ot_loss.detach().cpu().item()), step=epoch)
+            student_clip_rna_np = student_clip_rna.detach().cpu().numpy()
+            student_clip_atac_np = student_clip_atac.detach().cpu().numpy()
+            stage2_mmd_value = compute_balanced_source_target_mmd(
+                source_rna_embeddings,
+                source_atac_embeddings,
+                student_clip_rna_np,
+                student_clip_atac_np,
+            )
+            mlflow.log_metric("stage2_source_target_balanced_mmd", stage2_mmd_value, step=epoch)
 
             loss_val = float(distill_loss.detach().cpu().item())
             pbar.set_postfix({"distill_loss": "{:.4f}".format(loss_val)})
@@ -1054,8 +1077,8 @@ def run_stage2_distillation(
                 set_multigate_embeddings(
                     target_rna,
                     target_atac,
-                    student_clip_rna.detach().cpu().numpy(),
-                    student_clip_atac.detach().cpu().numpy(),
+                    student_clip_rna_np,
+                    student_clip_atac_np,
                     key_added="MultiGATE",
                 )
 
@@ -1081,6 +1104,7 @@ def run_stage2_distillation(
             del student_outputs, teacher_outputs
             del student_clip_rna, student_clip_atac, teacher_clip_rna, teacher_clip_atac
             del student_logits, teacher_logits, kd_ot_loss, kd_kl_loss, distill_loss
+            del student_clip_rna_np, student_clip_atac_np, stage2_mmd_value
 
     final_target_embeddings = student_trainer.infer(
         target_graph_tf,
@@ -1573,16 +1597,13 @@ def main():
                 target_scib_effective_label_key_logged = True
 
             # compute alignment metrics between source and target
-            x = np.concatenate([source_rna.obsm["MultiGATE"], source_atac.obsm["MultiGATE"]], axis=0)
-            y = np.concatenate([target_rna.obsm["MultiGATE"], target_atac.obsm["MultiGATE"]], axis=0)
-            min_n = min(x.shape[0], y.shape[0])
-            x = x[:min_n, :]
-            y = y[:min_n, :]
-            mmd = MMD(var=1.0)
-            mmd.reset()
-            mmd.update((torch.from_numpy(x), torch.from_numpy(y)))
-            mmd_value = mmd.compute()
-            mlflow.log_metric("stage1_source_target_balanced_mmd", float(mmd_value), step=epoch)
+            mmd_value = compute_balanced_source_target_mmd(
+                source_rna.obsm["MultiGATE"],
+                source_atac.obsm["MultiGATE"],
+                target_rna.obsm["MultiGATE"],
+                target_atac.obsm["MultiGATE"],
+            )
+            mlflow.log_metric("stage1_source_target_balanced_mmd", mmd_value, step=epoch)
 
         # log stage-1 UMAP artifacts
         log_stage_umap_artifacts(
@@ -1654,6 +1675,8 @@ def main():
             )
             stage2_trainer = run_stage2_distillation(
                 source_trainer=stage1_primary_trainer,
+                source_rna_embeddings=source_embeddings[0],
+                source_atac_embeddings=source_embeddings[1],
                 target_rna=target_rna,
                 target_atac=target_atac,
                 target_graph_tf=target_graph_tf,
