@@ -153,7 +153,7 @@ def parse_args(notebook: bool = False):
         "--vgp-anchor-mode",
         type=str,
         choices=["spot", "feature"],
-        default="spot",
+        default="feature",
         help=(
             "How vgp0/vgp1 are parameterized inside MGATE. "
             "'spot': vgp shape is (n_cells, 1), i.e. spot-anchored (legacy behavior). "
@@ -955,14 +955,16 @@ def compute_balanced_source_target_mmd(source_rna_embed, source_atac_embed, targ
 
 def run_stage2_distillation(
     source_trainer,
-    source_rna_embeddings,
-    source_atac_embeddings,
     target_rna,
     target_atac,
     target_graph_tf,
     target_gp_tf,
     target_x1,
     target_x2,
+    source_graph_tf,
+    source_gp_tf,
+    source_x1,
+    source_x2,
     stage2_epochs,
     lambda_kd,
     target_label_key,
@@ -997,6 +999,14 @@ def run_stage2_distillation(
         verbose=False,
         random_seed=2021,
         config={"device": str(source_trainer.device)},
+    )
+
+    source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t = student_trainer._prepare_inputs(
+        source_graph_tf,
+        source_graph_tf,
+        source_gp_tf,
+        source_x1,
+        source_x2,
     )
 
     target_a_t, target_prune_t, target_gp_t, target_x1_t, target_x2_t = student_trainer._prepare_inputs(
@@ -1059,26 +1069,27 @@ def run_stage2_distillation(
             mlflow.log_metric("stage2_distill_loss", float(distill_loss.detach().cpu().item()), step=epoch)
             mlflow.log_metric("stage2_kd_kl_loss", float(kd_kl_loss.detach().cpu().item()), step=epoch)
             mlflow.log_metric("stage2_kd_ot_clip_loss", float(kd_ot_loss.detach().cpu().item()), step=epoch)
-            student_clip_rna_np = student_clip_rna.detach().cpu().numpy()
-            student_clip_atac_np = student_clip_atac.detach().cpu().numpy()
-            stage2_mmd_value = compute_balanced_source_target_mmd(
-                source_rna_embeddings,
-                source_atac_embeddings,
-                student_clip_rna_np,
-                student_clip_atac_np,
-            )
-            mlflow.log_metric("stage2_source_target_balanced_mmd", stage2_mmd_value, step=epoch)
 
             loss_val = float(distill_loss.detach().cpu().item())
             pbar.set_postfix({"distill_loss": "{:.4f}".format(loss_val)})
 
-            if (epoch % 100 == 0) or (epoch == stage2_epochs):
+            if (epoch==1) or (epoch % 100 == 0) or (epoch == stage2_epochs):
+
+                student_trainer.mgate.eval()
+                with torch.no_grad():
+                    source_student_outputs = student_trainer.mgate(source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t)
+                    source_student_rna_embeddings = source_student_outputs[5].detach().cpu().numpy()
+                    source_student_atac_embeddings = source_student_outputs[6].detach().cpu().numpy()
+
+                    target_student_outputs = student_trainer.mgate(target_a_t, target_prune_t, target_gp_t, target_x1_t, target_x2_t)
+                    target_student_rna_embeddings = target_student_outputs[5].detach().cpu().numpy()
+                    target_student_atac_embeddings = target_student_outputs[6].detach().cpu().numpy()
 
                 set_multigate_embeddings(
                     target_rna,
                     target_atac,
-                    student_clip_rna_np,
-                    student_clip_atac_np,
+                    target_student_rna_embeddings,
+                    target_student_atac_embeddings,
                     key_added="MultiGATE",
                 )
 
@@ -1101,10 +1112,18 @@ def run_stage2_distillation(
                     )
                     target_scib_effective_label_key_logged = True
 
+                stage2_mmd_value = compute_balanced_source_target_mmd(
+                    source_student_rna_embeddings,
+                    source_student_atac_embeddings,
+                    target_student_rna_embeddings,
+                    target_student_atac_embeddings,
+                )
+                mlflow.log_metric("stage2_source_target_balanced_mmd", stage2_mmd_value, step=epoch)
+                del source_student_rna_embeddings, source_student_atac_embeddings, target_student_rna_embeddings, target_student_atac_embeddings, stage2_mmd_value
+
             del student_outputs, teacher_outputs
             del student_clip_rna, student_clip_atac, teacher_clip_rna, teacher_clip_atac
             del student_logits, teacher_logits, kd_ot_loss, kd_kl_loss, distill_loss
-            del student_clip_rna_np, student_clip_atac_np, stage2_mmd_value
 
     final_target_embeddings = student_trainer.infer(
         target_graph_tf,
@@ -1450,6 +1469,7 @@ def main():
 
         for epoch in tqdm(range(1, num_epochs + 1), desc="Stage 1 training", unit="epoch"):
 
+            trainer.mgate.train()
             teacher_loss = trainer.run_epoch(epoch, source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t)
             mlflow.log_metric("source_train_loss", float(teacher_loss), step=epoch)
 
@@ -1518,92 +1538,96 @@ def main():
             if not should_eval:
                 continue
 
-            source_embeddings = stage1_primary_trainer.infer( # if args.stage1_dual_source_kd is True, source_embeddings is the stage 1 student source embeddings. Else, source_embeddings is the teacher source embeddings.
-                stage1_primary_source_graph_tf,
-                stage1_primary_source_graph_tf,
-                source_gp_tf,
-                source_x1,
-                source_x2,
-            )
-            set_multigate_embeddings(
-                source_rna,
-                source_atac,
-                source_embeddings[0],
-                source_embeddings[1],
-                key_added="MultiGATE",
-            )
-
             trainer_target = build_zero_shot_target_trainer(
                 stage1_primary_trainer,
                 target_rna.n_obs,
                 vgp_anchor_mode=args.vgp_anchor_mode,
             )
-            target_embeddings = trainer_target.infer(
-                target_graph_tf,
-                target_graph_tf,
-                target_gp_tf,
-                target_x1,
-                target_x2,
-            )
-            set_multigate_embeddings(
-                target_rna,
-                target_atac,
-                target_embeddings[0],
-                target_embeddings[1],
-                key_added="MultiGATE",
-            )
-            if epoch != num_epochs:
-                del trainer_target, target_embeddings, source_embeddings
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
-            # compute and log scib metrics for source data
-            source_scib_metrics = compute_scib_metrics_for_domain(
-                rna_adata=source_rna,
-                atac_adata=source_atac,
-                domain_name="source",
-                label_key=args.source_label_key,
-                scib_n_jobs=args.scib_n_jobs,
-            )
-            log_scib_metrics(prefix="source", metrics=source_scib_metrics, step=epoch)
-            if not source_scib_label_mode_logged:
-                mlflow.log_param("source_scib_label_mode", source_scib_metrics["label_mode"])
-                source_scib_label_mode_logged = True
-            if not source_scib_effective_label_key_logged:
-                mlflow.log_param(
-                    "source_scib_effective_label_key",
-                    source_scib_metrics["effective_label_key"],
+            stage1_primary_trainer.mgate.eval()
+            trainer_target.mgate.eval()
+            with torch.no_grad():
+
+                source_embeddings = stage1_primary_trainer.infer( # if args.stage1_dual_source_kd is True, source_embeddings is the stage 1 student source embeddings. Else, source_embeddings is the teacher source embeddings.
+                    stage1_primary_source_graph_tf,
+                    stage1_primary_source_graph_tf,
+                    source_gp_tf,
+                    source_x1,
+                    source_x2,
                 )
-                source_scib_effective_label_key_logged = True
-
-            # compute and log scib metrics for target data
-            target_scib_metrics = compute_scib_metrics_for_domain(
-                rna_adata=target_rna,
-                atac_adata=target_atac,
-                domain_name="target",
-                label_key=args.target_label_key,
-                scib_n_jobs=args.scib_n_jobs,
-            )
-            log_scib_metrics(prefix="target", metrics=target_scib_metrics, step=epoch)
-
-            if not target_scib_label_mode_logged:
-                mlflow.log_param("target_scib_label_mode", target_scib_metrics["label_mode"])
-                target_scib_label_mode_logged = True
-            if not target_scib_effective_label_key_logged:
-                mlflow.log_param(
-                    "target_scib_effective_label_key",
-                    target_scib_metrics["effective_label_key"],
+                target_embeddings = trainer_target.infer(
+                    target_graph_tf,
+                    target_graph_tf,
+                    target_gp_tf,
+                    target_x1,
+                    target_x2,
                 )
-                target_scib_effective_label_key_logged = True
+                set_multigate_embeddings(
+                    source_rna,
+                    source_atac,
+                    source_embeddings[0],
+                    source_embeddings[1],
+                    key_added="MultiGATE",
+                )
+                set_multigate_embeddings(
+                    target_rna,
+                    target_atac,
+                    target_embeddings[0],
+                    target_embeddings[1],
+                    key_added="MultiGATE",
+                )
+                if epoch != num_epochs:
+                    del trainer_target, target_embeddings, source_embeddings
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-            # compute alignment metrics between source and target
-            mmd_value = compute_balanced_source_target_mmd(
-                source_rna.obsm["MultiGATE"],
-                source_atac.obsm["MultiGATE"],
-                target_rna.obsm["MultiGATE"],
-                target_atac.obsm["MultiGATE"],
-            )
-            mlflow.log_metric("stage1_source_target_balanced_mmd", mmd_value, step=epoch)
+                # compute and log scib metrics for source data
+                source_scib_metrics = compute_scib_metrics_for_domain(
+                    rna_adata=source_rna,
+                    atac_adata=source_atac,
+                    domain_name="source",
+                    label_key=args.source_label_key,
+                    scib_n_jobs=args.scib_n_jobs,
+                )
+                log_scib_metrics(prefix="source", metrics=source_scib_metrics, step=epoch)
+                if not source_scib_label_mode_logged:
+                    mlflow.log_param("source_scib_label_mode", source_scib_metrics["label_mode"])
+                    source_scib_label_mode_logged = True
+                if not source_scib_effective_label_key_logged:
+                    mlflow.log_param(
+                        "source_scib_effective_label_key",
+                        source_scib_metrics["effective_label_key"],
+                    )
+                    source_scib_effective_label_key_logged = True
+
+                # compute and log scib metrics for target data
+                target_scib_metrics = compute_scib_metrics_for_domain(
+                    rna_adata=target_rna,
+                    atac_adata=target_atac,
+                    domain_name="target",
+                    label_key=args.target_label_key,
+                    scib_n_jobs=args.scib_n_jobs,
+                )
+                log_scib_metrics(prefix="target", metrics=target_scib_metrics, step=epoch)
+
+                if not target_scib_label_mode_logged:
+                    mlflow.log_param("target_scib_label_mode", target_scib_metrics["label_mode"])
+                    target_scib_label_mode_logged = True
+                if not target_scib_effective_label_key_logged:
+                    mlflow.log_param(
+                        "target_scib_effective_label_key",
+                        target_scib_metrics["effective_label_key"],
+                    )
+                    target_scib_effective_label_key_logged = True
+
+                # compute alignment metrics between source and target
+                mmd_value = compute_balanced_source_target_mmd(
+                    source_rna.obsm["MultiGATE"],
+                    source_atac.obsm["MultiGATE"],
+                    target_rna.obsm["MultiGATE"],
+                    target_atac.obsm["MultiGATE"],
+                )
+                mlflow.log_metric("stage1_source_target_balanced_mmd", mmd_value, step=epoch)
 
         # log stage-1 UMAP artifacts
         log_stage_umap_artifacts(
@@ -1673,16 +1697,20 @@ def main():
                     args.lambda_kd,
                 )
             )
+
+            # run stage 2 distillation
             stage2_trainer = run_stage2_distillation(
                 source_trainer=stage1_primary_trainer,
-                source_rna_embeddings=source_embeddings[0],
-                source_atac_embeddings=source_embeddings[1],
                 target_rna=target_rna,
                 target_atac=target_atac,
                 target_graph_tf=target_graph_tf,
                 target_gp_tf=target_gp_tf,
                 target_x1=target_x1,
                 target_x2=target_x2,
+                source_graph_tf=source_graph_tf,
+                source_gp_tf=source_gp_tf,
+                source_x1=source_x1,
+                source_x2=source_x2,
                 stage2_epochs=args.stage2_epochs,
                 lambda_kd=args.lambda_kd,
                 target_label_key=args.target_label_key,

@@ -744,12 +744,14 @@ def main():
     )
     target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
 
+    # plot source UMAPs
     source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
     fig, axs = plt.subplots(1, len(source_umap_colors), figsize=(18, 5))
     for i, color in enumerate(source_umap_colors):
         sc.pl.umap(source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
     plt.tight_layout(); plt.show()
 
+    # plot target UMAPs
     target_umap_colors = ['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster']
     fig, axs = plt.subplots(1, len(target_umap_colors), figsize=(18, 5))
     for i, color in enumerate(target_umap_colors):
