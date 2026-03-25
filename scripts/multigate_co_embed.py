@@ -738,7 +738,7 @@ def main():
     compute_concat_umap(
         target_concat_adata,
         n_neighbors=10,
-        resolution=1.5,
+        resolution=0.5,
         deterministic=True,
         random_state=deterministic_seed,
     )
@@ -780,8 +780,8 @@ def main():
     source_target_adata = build_concat_adata_for_umap(source_target_rna, source_target_atac, embedding_key="MultiGATE")
     compute_concat_umap(
         source_target_adata,
-        n_neighbors=10,
-        resolution=1.5,
+        n_neighbors=50,
+        resolution=0.5,
         deterministic=True,
         random_state=deterministic_seed,
     )

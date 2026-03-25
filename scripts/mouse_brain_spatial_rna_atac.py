@@ -51,6 +51,7 @@ if env_bin and env_bin not in current_path_entries:
 
 import matplotlib.pyplot as plt
 import mlflow
+from mlflow.tracking import MlflowClient
 import muon as mu
 import numpy as np
 import pandas as pd
@@ -166,6 +167,12 @@ def parse_args(notebook: bool = False):
         choices=["spatial", "knn", "identity", "tangram"],
         default="identity",
         help="Type of graph to use for MultiGATE.",
+    )
+    parser.add_argument(
+        "--stage1-mlflow-cache-dir",
+        type=str,
+        default=None,
+        help="MLflow run name to load stage-1 model artifacts from and reuse as the parent run.",
     )
     parser.add_argument(
         "--switcharoo",
@@ -953,6 +960,128 @@ def compute_balanced_source_target_mmd(source_rna_embed, source_atac_embed, targ
     return float(mmd.compute())
 
 
+
+def resolve_run_id_from_name(client, run_name, experiment_name="multigate_mouse_brain_live_zeroshot"):
+    """
+    Look up the run ID for a given run name within the MultiGATE experiment.
+    Raises ValueError if no run or more than one run is found.
+    """
+    experiment = client.get_experiment_by_name(experiment_name)
+    if experiment is None:
+        raise ValueError(
+            "MLflow experiment '{}' not found. Ensure tracking URI is configured correctly.".format(
+                experiment_name
+            )
+        )
+
+    runs = client.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        filter_string="attributes.run_name = '{}'".format(run_name),
+    )
+    if len(runs) == 0:
+        raise ValueError(
+            "No run named '{}' found in experiment '{}'.".format(run_name, experiment_name)
+        )
+    if len(runs) > 1:
+        run_ids = [run.info.run_id for run in runs]
+        raise ValueError(
+            "Multiple runs named '{}' found in experiment '{}': {}.".format(
+                run_name, experiment_name, run_ids
+            )
+        )
+
+    run_id = runs[0].info.run_id
+    print("Resolved run name '{}' -> run ID: {}".format(run_name, run_id))
+    return run_id
+
+
+def load_run_params(client, run_id, run_name):
+    run = client.get_run(run_id)
+    params = run.data.params
+    print("\nRun params for '{}' (ID: {}):".format(run_name, run_id))
+    pprint(params)
+    return params
+
+
+def artifact_exists(client, run_id, artifact_path):
+    parent_dir = os.path.dirname(artifact_path)
+    try:
+        artifacts = client.list_artifacts(run_id, parent_dir)
+        return any(artifact.path == artifact_path for artifact in artifacts)
+    except Exception:
+        return False
+
+
+def download_model_artifact(client, run_id, artifact_name, dst_dir):
+    artifact_path = "models/{}".format(artifact_name)
+    if not artifact_exists(client, run_id, artifact_path):
+        raise FileNotFoundError(
+            "Artifact '{}' not found for run {}.".format(artifact_path, run_id)
+        )
+    print("  Downloading {} ...".format(artifact_path))
+    return client.download_artifacts(run_id, artifact_path, dst_dir)
+
+
+def hidden_dims_from_state_dict(state_dict, w_prefix):
+    keys = sorted(
+        [key for key in state_dict if key.startswith(w_prefix + ".")],
+        key=lambda key: int(key.split(".")[1]),
+    )
+    if not keys:
+        raise ValueError("No '{}' weights found in state dict.".format(w_prefix))
+
+    dims = [state_dict[keys[0]].shape[0]]
+    for key in keys:
+        dims.append(state_dict[key].shape[1])
+    return dims
+
+
+def build_stage1_trainer_from_state_dict(
+    state_dict,
+    spot_num,
+    n_epochs,
+    lr=0.0001,
+    gradient_clipping=5,
+    weight_decay=0.0001,
+    random_seed=2020,
+):
+    hidden_dims1 = hidden_dims_from_state_dict(state_dict, "W1")
+    hidden_dims2 = hidden_dims_from_state_dict(state_dict, "W2")
+    temp = float(state_dict.get("logit_scale", torch.tensor(1.0)).item())
+
+    if "vgp0" not in state_dict:
+        raise KeyError("Stage-1 state dict missing required key 'vgp0'.")
+
+    feat_num = hidden_dims1[0] + hidden_dims2[0]
+    vgp_len = int(state_dict["vgp0"].shape[0])
+    if vgp_len == feat_num:
+        vgp_anchor_mode = "feature"
+    else:
+        vgp_anchor_mode = "spot"
+        if vgp_len != int(spot_num):
+            raise ValueError(
+                "Spot-anchored checkpoint expects {} source cells, but current source has {}."
+                .format(vgp_len, spot_num)
+            )
+
+    trainer = MultiGATETrainer(
+        hidden_dims1=hidden_dims1,
+        hidden_dims2=hidden_dims2,
+        spot_num=int(spot_num),
+        temp=temp,
+        vgp_anchor_mode=vgp_anchor_mode,
+        n_epochs=max(1, int(n_epochs)),
+        lr=lr,
+        gradient_clipping=gradient_clipping,
+        nonlinear=True,
+        weight_decay=weight_decay,
+        verbose=False,
+        random_seed=random_seed,
+    )
+    trainer.mgate.load_state_dict(state_dict, strict=False)
+    trainer.mgate.eval()
+    return trainer, hidden_dims1, hidden_dims2, vgp_anchor_mode
+
 def run_stage2_distillation(
     source_trainer,
     target_rna,
@@ -972,7 +1101,7 @@ def run_stage2_distillation(
     vgp_anchor_mode=None,
 ):
     if stage2_epochs <= 0:
-        return None
+        return None, None
 
     emd = require_ot_backend()
 
@@ -1021,9 +1150,15 @@ def run_stage2_distillation(
     parent_run_name = None
     if parent_run is not None:
         parent_run_name = parent_run.data.tags.get("mlflow.runName")
-    stage2_run_name = "stage2_distillation" if not parent_run_name else "{}_stage2".format(parent_run_name)
+    stage2_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if parent_run_name:
+        stage2_run_name = "{}_stage2_{}".format(parent_run_name, stage2_timestamp)
+    else:
+        stage2_run_name = "stage2_distillation_{}".format(stage2_timestamp)
 
-    with mlflow.start_run(run_name=stage2_run_name, nested=True):
+    stage2_run_id = None
+    with mlflow.start_run(run_name=stage2_run_name, nested=True) as stage2_run:
+        stage2_run_id = stage2_run.info.run_id
         mlflow.set_tag("training_stage", "stage2_distillation")
         mlflow.set_tag("teacher_student_distillation", "true")
         mlflow.log_param("hidden_dims", json.dumps(source_trainer.mgate.hidden_dims1[1:])) # skip first dimension (input size)
@@ -1140,7 +1275,56 @@ def run_stage2_distillation(
         key_added="MultiGATE",
     )
 
-    return student_trainer
+    return student_trainer, stage2_run_id
+
+
+def log_stage2_artifacts_for_run(
+    stage2_run_id,
+    stage2_trainer,
+    source_rna,
+    source_atac,
+    target_rna,
+    target_atac,
+    target_graph_tf,
+    target_gp_tf,
+    target_x1,
+    target_x2,
+    log_mudata_umaps,
+):
+    if stage2_run_id is None:
+        raise ValueError("stage2_run_id is required to log stage-2 artifacts.")
+
+    with mlflow.start_run(run_id=stage2_run_id, nested=True):
+        # log stage-2 UMAP artifacts
+        log_stage_umap_artifacts(
+            source_rna=source_rna,
+            source_atac=source_atac,
+            target_rna=target_rna,
+            target_atac=target_atac,
+            stage_label="stage2",
+            log_mudata_umaps=log_mudata_umaps,
+        )
+
+        # log stage-2 model artifacts and attention matrix
+        stage2_target_embeddings = stage2_trainer.infer(
+            target_graph_tf,
+            target_graph_tf,
+            target_gp_tf,
+            target_x1,
+            target_x2,
+        )
+        target_peak_gene_attention = stage2_target_embeddings[4][0] # target_rna.uns['MultiGATE_gene_peak_attention'][0]
+        model_stage2 = stage2_trainer.mgate.state_dict()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "target_peak_gene_attention.npz")
+            sp.save_npz(local_path, target_peak_gene_attention)
+            mlflow.log_artifact(local_path, artifact_path="matrices")
+
+            local_path = os.path.join(tmpdir, "model_stage2.pth")
+            torch.save(model_stage2, local_path)
+            mlflow.log_artifact(local_path, artifact_path="models")
+
 
 
 def setup_mlflow():
@@ -1215,15 +1399,54 @@ def main():
         raise ValueError("--lambda-kd must be non-negative.")
     if args.scib_n_jobs <= 0:
         raise ValueError("--scib-n-jobs must be a positive integer.")
-    if args.stage1_dual_source_kd and args.spatial_graph_type == "tangram":
-        raise ValueError(
-            "--stage1-dual-source-kd with --spatial-graph-type tangram is not supported for source training. "
-            "Use spatial, knn, or identity."
-        )
 
     # Fail fast if scib-metrics backend is not available.
     require_scib_backend()
-    stage1_emd = require_ot_backend() if args.stage1_dual_source_kd else None
+
+    experiment_id = setup_mlflow()
+    eval_every = 1000 # set to -1 for very basic debugging only, since will skip the incorporation of MultiGATE embeddings into the anndatas
+    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    mlflow_client = MlflowClient()
+    use_stage1_cache = args.stage1_mlflow_cache_dir is not None
+    cached_stage1_run_name = args.stage1_mlflow_cache_dir
+    cached_stage1_run_id = None
+    cached_stage1_run_params = {}
+
+    effective_stage1_dual_source_kd = bool(args.stage1_dual_source_kd)
+    effective_stage1_student_graph_type = args.spatial_graph_type
+    effective_vgp_anchor_mode = args.vgp_anchor_mode
+
+    if use_stage1_cache:
+        cached_stage1_run_id = resolve_run_id_from_name(mlflow_client, cached_stage1_run_name)
+        cached_stage1_run_params = load_run_params(mlflow_client, cached_stage1_run_id, cached_stage1_run_name)
+
+        effective_stage1_dual_source_kd = (
+            str(cached_stage1_run_params.get("stage1_dual_source_kd", "False")).lower() == "true"
+        )
+        effective_stage1_student_graph_type = cached_stage1_run_params.get("stage1_student_graph", "identity")
+        if effective_stage1_student_graph_type in {"NA", "na", "None", "none", "", None}:
+            effective_stage1_student_graph_type = "identity"
+
+        cached_vgp_anchor_mode = cached_stage1_run_params.get("vgp_anchor_mode")
+        if cached_vgp_anchor_mode in {"spot", "feature"}:
+            effective_vgp_anchor_mode = cached_vgp_anchor_mode
+
+        print(
+            "[Stage1 Cache] run='{}' (id={}), dual_source_kd={}, student_graph={}, vgp_anchor_mode={}".format(
+                cached_stage1_run_name,
+                cached_stage1_run_id,
+                effective_stage1_dual_source_kd,
+                effective_stage1_student_graph_type,
+                effective_vgp_anchor_mode,
+            )
+        )
+
+    if effective_stage1_dual_source_kd and effective_stage1_student_graph_type == "tangram":
+        raise ValueError(
+            "Stage-1 dual-source KD with tangram student graph is not supported for source training. "
+            "Use spatial, knn, or identity."
+        )
 
     #%% load data
 
@@ -1287,23 +1510,14 @@ def main():
     source_rna = source_rna[:, source_rna.var["highly_variable"]].copy()
     source_atac = source_atac[:, source_atac.var["highly_variable"]].copy()
 
-    '''
-    gtf_path = os.path.join(os.getenv("DATAPATH"), "gene_annotations", "gencode.vM25.chr_patch_hapl_scaff.annotation.gtf.gz")
-    if not os.path.exists(gtf_path):
-        raise FileNotFoundError("GTF annotation file not found: {}".format(gtf_path))
-
-    MultiGATE.Cal_gene_peak_Net_new(source_rna, source_atac, 150000, file=gtf_path)
-    source_rna.uns["gene_peak_Net"] = source_atac.uns["gene_peak_Net"]
-    '''
-
     #%% target prep for live zero-shot eval
-
+    target_graph_type = args.spatial_graph_type
     target_rna, target_atac = prepare_target_for_spatial_graph_type(
         target_rna=target_rna,
         target_atac=target_atac,
         source_rna=source_rna,
         source_atac=source_atac,
-        spatial_graph_type=args.spatial_graph_type,
+        spatial_graph_type=target_graph_type,
         gtf_path=gtf_path,
     )
 
@@ -1370,7 +1584,7 @@ def main():
         hidden_dims2=[source_x2.shape[1]] + hidden_dims,
         spot_num=source_x1.shape[0],
         temp=1,
-        vgp_anchor_mode=args.vgp_anchor_mode,
+        vgp_anchor_mode=effective_vgp_anchor_mode,
         n_epochs=num_epochs,
         lr=0.0001,
         gradient_clipping=5,
@@ -1380,63 +1594,176 @@ def main():
         random_seed=2020,
     )
 
-    source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t = trainer._prepare_inputs(
-        source_graph_tf,
-        source_graph_tf,
-        source_gp_tf,
-        source_x1,
-        source_x2,
-    )
-
-    student_trainer = None
-    source_student_graph_tf = None
-    source_student_a_t = source_student_prune_t = source_student_gp_t = source_student_x1_t = source_student_x2_t = None
-
-    if args.stage1_dual_source_kd:
-
-        source_student_graph_tf = build_source_student_graph_tf(
-            source_rna=source_rna,
-            spatial_graph_type=args.spatial_graph_type,
-            #knn_neighbors=15,
-        )
-        student_trainer = MultiGATETrainer(
-            hidden_dims1=[source_x1.shape[1]] + hidden_dims,
-            hidden_dims2=[source_x2.shape[1]] + hidden_dims,
-            spot_num=source_x1.shape[0],
-            temp=1,
-            vgp_anchor_mode=args.vgp_anchor_mode,
-            n_epochs=num_epochs,
-            lr=0.0001,
-            gradient_clipping=5,
-            nonlinear=True,
-            weight_decay=0.0001,
-            verbose=False,
-            random_seed=2021,
-            config={"device": str(trainer.device)},
-        )
-        source_student_a_t, source_student_prune_t, source_student_gp_t, source_student_x1_t, source_student_x2_t = student_trainer._prepare_inputs(
-            source_student_graph_tf,
-            source_student_graph_tf,
+    source_a_t = source_prune_t = source_gp_t = source_x1_t = source_x2_t = None
+    if not use_stage1_cache:
+        source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t = trainer._prepare_inputs(
+            source_graph_tf,
+            source_graph_tf,
             source_gp_tf,
             source_x1,
             source_x2,
         )
 
-    stage1_primary_trainer = student_trainer if args.stage1_dual_source_kd else trainer
-    stage1_primary_source_graph_tf = source_student_graph_tf if args.stage1_dual_source_kd else source_graph_tf
-    stage1_primary_model_name = "student" if args.stage1_dual_source_kd else "teacher"
+    student_trainer = None
+    source_student_graph_tf = None
+    source_student_a_t = source_student_prune_t = source_student_gp_t = source_student_x1_t = source_student_x2_t = None
 
-    #%% MLflow setup
-    experiment_id = setup_mlflow()
-    eval_every = 1000 # set to -1 for very basic debugging only, since will skip the incorporation of MultiGATE embeddings into the anndatas
-    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if effective_stage1_dual_source_kd:
+
+        source_student_graph_tf = build_source_student_graph_tf(
+            source_rna=source_rna,
+            spatial_graph_type=effective_stage1_student_graph_type,
+        )
+
+        if not use_stage1_cache:
+            student_trainer = MultiGATETrainer(
+                hidden_dims1=[source_x1.shape[1]] + hidden_dims,
+                hidden_dims2=[source_x2.shape[1]] + hidden_dims,
+                spot_num=source_x1.shape[0],
+                temp=1,
+                vgp_anchor_mode=effective_vgp_anchor_mode,
+                n_epochs=num_epochs,
+                lr=0.0001,
+                gradient_clipping=5,
+                nonlinear=True,
+                weight_decay=0.0001,
+                verbose=False,
+                random_seed=2021,
+                config={"device": str(trainer.device)},
+            )
+            source_student_a_t, source_student_prune_t, source_student_gp_t, source_student_x1_t, source_student_x2_t = student_trainer._prepare_inputs(
+                source_student_graph_tf,
+                source_student_graph_tf,
+                source_gp_tf,
+                source_x1,
+                source_x2,
+            )
+
+    stage1_primary_source_graph_tf = source_student_graph_tf if effective_stage1_dual_source_kd else source_graph_tf
+
+    if use_stage1_cache:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_stage1_path = download_model_artifact(
+                mlflow_client,
+                cached_stage1_run_id,
+                "model_stage1.pth",
+                tmpdir,
+            )
+            stage1_state_dict = torch.load(local_stage1_path, map_location="cpu", weights_only=False)
+
+        stage1_primary_trainer, hidden_dims1_loaded, hidden_dims2_loaded, inferred_vgp_anchor_mode = build_stage1_trainer_from_state_dict(
+            stage1_state_dict,
+            spot_num=source_x1.shape[0],
+            n_epochs=num_epochs,
+            lr=0.0001,
+            gradient_clipping=5,
+            weight_decay=0.0001,
+            random_seed=2020,
+        )
+
+        if hidden_dims1_loaded[0] != source_x1.shape[1] or hidden_dims2_loaded[0] != source_x2.shape[1]:
+            raise ValueError(
+                "Feature dimension mismatch for cached stage-1 model: checkpoint expects "
+                "RNA {} / ATAC {}, current data is RNA {} / ATAC {}."
+                .format(hidden_dims1_loaded[0], hidden_dims2_loaded[0], source_x1.shape[1], source_x2.shape[1])
+            )
+
+        effective_vgp_anchor_mode = inferred_vgp_anchor_mode
+        stage1_primary_model_name = cached_stage1_run_params.get(
+            "stage1_primary_model",
+            "student" if effective_stage1_dual_source_kd else "teacher",
+        )
+        print(
+            "[Stage1 Cache] Loaded model_stage1.pth with hidden_dims1={}, hidden_dims2={}, vgp_anchor_mode={}".format(
+                hidden_dims1_loaded,
+                hidden_dims2_loaded,
+                inferred_vgp_anchor_mode,
+            )
+        )
+    else:
+        stage1_primary_trainer = student_trainer if effective_stage1_dual_source_kd else trainer
+        stage1_primary_model_name = "student" if effective_stage1_dual_source_kd else "teacher"
 
     print("Training epochs for stage 1:", num_epochs)
     print("Target paired cells after subsampling:", target_rna.n_obs)
-    if args.stage1_dual_source_kd:
+    if effective_stage1_dual_source_kd:
         print(
-            "[Stage1 Dual KD] Enabled: teacher graph=spatial, student graph={}".format(args.spatial_graph_type)
+            "[Stage1 Dual KD] Enabled: teacher graph=spatial, student graph={}".format(
+                effective_stage1_student_graph_type
+            )
         )
+
+    if use_stage1_cache:
+        print(
+            "[Stage1 Cache] Reusing parent run '{}' (ID: {}). Stage-1 training will be skipped.".format(
+                cached_stage1_run_name,
+                cached_stage1_run_id,
+            )
+        )
+        with mlflow.start_run(run_id=cached_stage1_run_id):
+            if args.stage2_epochs > 0:
+                print(
+                    "[Stage2 KD] Starting target distillation for {} epochs (lambda_kd={})".format(
+                        args.stage2_epochs,
+                        args.lambda_kd,
+                    )
+                )
+
+                stage1_primary_trainer.mgate.eval()
+                with torch.no_grad():
+                    source_embeddings = stage1_primary_trainer.infer(
+                        stage1_primary_source_graph_tf,
+                        stage1_primary_source_graph_tf,
+                        source_gp_tf,
+                        source_x1,
+                        source_x2,
+                    )
+
+                stage2_trainer, stage2_run_id = run_stage2_distillation(
+                    source_trainer=stage1_primary_trainer,
+                    target_rna=target_rna,
+                    target_atac=target_atac,
+                    target_graph_tf=target_graph_tf,
+                    target_gp_tf=target_gp_tf,
+                    target_x1=target_x1,
+                    target_x2=target_x2,
+                    source_graph_tf=stage1_primary_source_graph_tf,
+                    source_gp_tf=source_gp_tf,
+                    source_x1=source_x1,
+                    source_x2=source_x2,
+                    stage2_epochs=args.stage2_epochs,
+                    lambda_kd=args.lambda_kd,
+                    target_label_key=args.target_label_key,
+                    scib_n_jobs=args.scib_n_jobs,
+                    vgp_anchor_mode=effective_vgp_anchor_mode,
+                )
+                if stage2_trainer is None or stage2_run_id is None:
+                    raise RuntimeError("Stage-2 trainer/run-id was not returned despite stage2_epochs > 0.")
+
+                set_multigate_embeddings(
+                    source_rna,
+                    source_atac,
+                    source_embeddings[0],
+                    source_embeddings[1],
+                    key_added="MultiGATE",
+                )
+                log_stage2_artifacts_for_run(
+                    stage2_run_id=stage2_run_id,
+                    stage2_trainer=stage2_trainer,
+                    source_rna=source_rna,
+                    source_atac=source_atac,
+                    target_rna=target_rna,
+                    target_atac=target_atac,
+                    target_graph_tf=target_graph_tf,
+                    target_gp_tf=target_gp_tf,
+                    target_x1=target_x1,
+                    target_x2=target_x2,
+                    log_mudata_umaps=args.log_mudata_umaps,
+                )
+            else:
+                print("[Stage2 KD] Skipped because --stage2-epochs is 0.")
+
+        return
 
     with mlflow.start_run(run_name=run_name):
         mlflow.log_param("mlflow_experiment_id", experiment_id)
@@ -1457,15 +1784,16 @@ def main():
         mlflow.log_param("n_genes", int(source_rna.n_vars))
         mlflow.log_param("n_peaks", int(source_atac.n_vars))
         mlflow.log_param("graph_type", graph_type)
-        mlflow.log_param("stage1_dual_source_kd", bool(args.stage1_dual_source_kd))
+        mlflow.log_param("stage1_dual_source_kd", bool(effective_stage1_dual_source_kd))
         mlflow.log_param("stage1_primary_model", stage1_primary_model_name)
         mlflow.log_param("stage1_teacher_graph", "spatial")
-        mlflow.log_param("stage1_student_graph", args.spatial_graph_type if args.stage1_dual_source_kd else "NA")
-        mlflow.log_param("vgp_anchor_mode", args.vgp_anchor_mode)
+        mlflow.log_param("stage1_student_graph", effective_stage1_student_graph_type if effective_stage1_dual_source_kd else "NA")
+        mlflow.log_param("vgp_anchor_mode", effective_vgp_anchor_mode)
         source_scib_label_mode_logged = False
         target_scib_label_mode_logged = False
         source_scib_effective_label_key_logged = False
         target_scib_effective_label_key_logged = False
+        source_embeddings = None
 
         for epoch in tqdm(range(1, num_epochs + 1), desc="Stage 1 training", unit="epoch"):
 
@@ -1473,7 +1801,7 @@ def main():
             teacher_loss = trainer.run_epoch(epoch, source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t)
             mlflow.log_metric("source_train_loss", float(teacher_loss), step=epoch)
 
-            if args.stage1_dual_source_kd:
+            if effective_stage1_dual_source_kd:
 
                 trainer.mgate.eval()
                 student_trainer.mgate.train()
@@ -1498,18 +1826,6 @@ def main():
 
                 student_clip_rna, student_clip_atac = student_outputs[5], student_outputs[6]
                 teacher_clip_rna, teacher_clip_atac = teacher_outputs[5], teacher_outputs[6]
-                '''
-                student_logits = compute_clip_logits(
-                    student_clip_rna,
-                    student_clip_atac,
-                    student_trainer.mgate.logit_scale,
-                )
-                teacher_logits = compute_clip_logits(
-                    teacher_clip_rna,
-                    teacher_clip_atac,
-                    trainer.mgate.logit_scale,
-                )
-                '''
                 #stage1_kd_kl_loss = compute_kd_kl_loss(student_logits, teacher_logits)
                 stage1_distill_loss = F.mse_loss(student_clip_rna, teacher_clip_rna) + F.mse_loss(student_clip_atac, teacher_clip_atac)
 
@@ -1530,10 +1846,11 @@ def main():
                 del teacher_outputs, student_outputs
                 del teacher_clip_rna, teacher_clip_atac, student_clip_rna, student_clip_atac
                 del stage1_distill_loss
-
-            should_eval = \
-                ((epoch == 1) or (epoch % eval_every == 0) or (epoch == num_epochs)) and \
-                eval_every > 0
+                
+            should_eval = (
+                ((epoch == 1) or (epoch % eval_every == 0) or (epoch == num_epochs))
+                and eval_every > 0
+            )
 
             if not should_eval:
                 continue
@@ -1541,14 +1858,14 @@ def main():
             trainer_target = build_zero_shot_target_trainer(
                 stage1_primary_trainer,
                 target_rna.n_obs,
-                vgp_anchor_mode=args.vgp_anchor_mode,
+                vgp_anchor_mode=effective_vgp_anchor_mode,
             )
 
             stage1_primary_trainer.mgate.eval()
             trainer_target.mgate.eval()
             with torch.no_grad():
 
-                source_embeddings = stage1_primary_trainer.infer( # if args.stage1_dual_source_kd is True, source_embeddings is the stage 1 student source embeddings. Else, source_embeddings is the teacher source embeddings.
+                source_embeddings = stage1_primary_trainer.infer(
                     stage1_primary_source_graph_tf,
                     stage1_primary_source_graph_tf,
                     source_gp_tf,
@@ -1629,6 +1946,9 @@ def main():
                 )
                 mlflow.log_metric("stage1_source_target_balanced_mmd", mmd_value, step=epoch)
 
+        if source_embeddings is None:
+            raise RuntimeError("Stage-1 source embeddings were not computed before artifact logging.")
+
         # log stage-1 UMAP artifacts
         log_stage_umap_artifacts(
             source_rna=source_rna,
@@ -1639,8 +1959,8 @@ def main():
             log_mudata_umaps=args.log_mudata_umaps,
         )
 
-        if args.stage1_dual_source_kd:
-            
+        if effective_stage1_dual_source_kd:
+
             trainer.mgate.eval()
             teacher_source_embeddings = trainer.infer(
                 source_graph_tf,
@@ -1669,7 +1989,7 @@ def main():
         source_peak_gene_attention = source_embeddings[4][0] #peak_gene_attention = source_rna.uns['MultiGATE_gene_peak_attention'][0]
         model_stage1 = stage1_primary_trainer.mgate.state_dict()
         model_stage1_teacher = trainer.mgate.state_dict()
-        model_stage1_student = student_trainer.mgate.state_dict() if args.stage1_dual_source_kd else None
+        model_stage1_student = student_trainer.mgate.state_dict() if effective_stage1_dual_source_kd else None
 
         with tempfile.TemporaryDirectory() as tmpdir:
             local_path = os.path.join(tmpdir, "source_peak_gene_attention.npz")
@@ -1680,7 +2000,7 @@ def main():
             torch.save(model_stage1, local_path)
             mlflow.log_artifact(local_path, artifact_path="models")
 
-            if args.stage1_dual_source_kd:
+            if effective_stage1_dual_source_kd:
                 local_path = os.path.join(tmpdir, "model_stage1_teacher.pth")
                 torch.save(model_stage1_teacher, local_path)
                 mlflow.log_artifact(local_path, artifact_path="models")
@@ -1698,8 +2018,7 @@ def main():
                 )
             )
 
-            # run stage 2 distillation
-            stage2_trainer = run_stage2_distillation(
+            stage2_trainer, stage2_run_id = run_stage2_distillation(
                 source_trainer=stage1_primary_trainer,
                 target_rna=target_rna,
                 target_atac=target_atac,
@@ -1707,7 +2026,7 @@ def main():
                 target_gp_tf=target_gp_tf,
                 target_x1=target_x1,
                 target_x2=target_x2,
-                source_graph_tf=source_graph_tf,
+                source_graph_tf=stage1_primary_source_graph_tf,
                 source_gp_tf=source_gp_tf,
                 source_x1=source_x1,
                 source_x2=source_x2,
@@ -1715,46 +2034,31 @@ def main():
                 lambda_kd=args.lambda_kd,
                 target_label_key=args.target_label_key,
                 scib_n_jobs=args.scib_n_jobs,
-                vgp_anchor_mode=args.vgp_anchor_mode,
+                vgp_anchor_mode=effective_vgp_anchor_mode,
             )
-            if stage2_trainer is None:
-                raise RuntimeError("Stage-2 trainer was not returned despite stage2_epochs > 0.")
+            if stage2_trainer is None or stage2_run_id is None:
+                raise RuntimeError("Stage-2 trainer/run-id was not returned despite stage2_epochs > 0.")
+
             set_multigate_embeddings(
                 source_rna,
                 source_atac,
-                source_embeddings[0], # source embeddings are the stage 1 student source embeddings
+                source_embeddings[0],
                 source_embeddings[1],
                 key_added="MultiGATE",
             )
-            # log stage-2 UMAP artifacts
-            log_stage_umap_artifacts(
+            log_stage2_artifacts_for_run(
+                stage2_run_id=stage2_run_id,
+                stage2_trainer=stage2_trainer,
                 source_rna=source_rna,
                 source_atac=source_atac,
                 target_rna=target_rna,
                 target_atac=target_atac,
-                stage_label="stage2",
+                target_graph_tf=target_graph_tf,
+                target_gp_tf=target_gp_tf,
+                target_x1=target_x1,
+                target_x2=target_x2,
                 log_mudata_umaps=args.log_mudata_umaps,
             )
-
-            # log stage-2 model artifacts and attention matrix
-            stage2_target_embeddings = stage2_trainer.infer(
-                target_graph_tf,
-                target_graph_tf,
-                target_gp_tf,
-                target_x1,
-                target_x2,
-            )
-            target_peak_gene_attention = stage2_target_embeddings[4][0] # target_rna.uns['MultiGATE_gene_peak_attention'][0]
-            model_stage2 = stage2_trainer.mgate.state_dict()
-
-            with tempfile.TemporaryDirectory() as tmpdir:
-                local_path = os.path.join(tmpdir, "target_peak_gene_attention.npz")
-                sp.save_npz(local_path, target_peak_gene_attention)
-                mlflow.log_artifact(local_path, artifact_path="matrices")
-
-                local_path = os.path.join(tmpdir, "model_stage2.pth")
-                torch.save(model_stage2, local_path)
-                mlflow.log_artifact(local_path, artifact_path="models")
         else:
             print("[Stage2 KD] Skipped because --stage2-epochs is 0.")
 
