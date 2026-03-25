@@ -1208,7 +1208,7 @@ def run_stage2_distillation(
             loss_val = float(distill_loss.detach().cpu().item())
             pbar.set_postfix({"distill_loss": "{:.4f}".format(loss_val)})
 
-            if (epoch==1) or (epoch % 100 == 0) or (epoch == stage2_epochs):
+            if (epoch==1) or (epoch % 500 == 0) or (epoch == stage2_epochs):
 
                 student_trainer.mgate.eval()
                 with torch.no_grad():

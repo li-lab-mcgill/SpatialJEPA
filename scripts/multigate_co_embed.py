@@ -12,17 +12,25 @@ Given an MLflow run name produced by mouse_brain_spatial_rna_atac.py (e.g.
   6. Co-embeds source and target datasets into the shared latent space.
   7. Optionally saves the annotated AnnData objects as h5ad files.
 
-Model artifacts available under artifacts/models/ of a parent run:
-  model_stage1.pth          stage-1 primary  (= student if dual-KD, else teacher)
-  model_stage1_teacher.pth  stage-1 spatial source teacher    [dual-KD runs only]
-  model_stage1_student.pth  stage-1 non-spatial source student [dual-KD runs only]
-  model_stage2.pth          stage-2 target distilled student   [stage2_epochs > 0]
+Model artifacts available under artifacts/models/:
+  Parent run:
+    model_stage1.pth          stage-1 primary  (= student if dual-KD, else teacher)
+    model_stage1_teacher.pth  stage-1 spatial source teacher    [dual-KD runs only]
+    model_stage1_student.pth  stage-1 non-spatial source student [dual-KD runs only]
+    model_stage2.pth          legacy stage-2 target distilled student fallback
+  Stage-2 child run(s):
+    model_stage2.pth          stage-2 target distilled student
 
 Usage:
   python multigate_co_embed.py --run-name <mlflow-run-name> [options]
 
   # Co-embed using the default (stage1 primary for source, stage2 for target):
+  # Requires exactly one stage2 child run under --run-name, otherwise pass
+  # --stage2-run-name explicitly (or rely on legacy parent fallback when no child exists).
   python multigate_co_embed.py --run-name 20260314_095952 --save-h5ad
+
+  # Use a specific stage2 child run name when multiple stage2 children exist:
+  python multigate_co_embed.py --run-name 20260314_095952 --target-model stage2 --stage2-run-name 20260314_095952_stage2_20260323_184501
 
   # Use zero-shot target transfer instead of stage2:
   python multigate_co_embed.py --run-name 20260314_095952 --target-model zero_shot
@@ -160,8 +168,19 @@ def parse_args(notebook: bool = False):
         default="stage2",
         help=(
             "Which model to use for target inference. "
-            "'stage2' loads model_stage2.pth (requires stage2_epochs > 0). "
+            "'stage2' loads model_stage2.pth from a resolved stage2 child run "
+            "(or legacy parent fallback when no child run exists). "
             "'zero_shot' zero-shot transfers the chosen source model weights."
+        ),
+    )
+    p.add_argument(
+        "--stage2-run-name",
+        default=None,
+        help=(
+            "Optional stage2 child run name under --run-name parent. "
+            "Valid only with --target-model stage2. If omitted, exactly one stage2 "
+            "child run must exist; when zero child runs exist, falls back to "
+            "legacy parent model_stage2.pth."
         ),
     )
     p.add_argument(
@@ -268,6 +287,97 @@ def load_run_params(client, run_id, run_name):
     print("\nRun params for '{}' (ID: {}):".format(run_name, run_id))
     pprint(params)
     return params
+
+
+def _format_stage2_run_choices(run_infos):
+    if not run_infos:
+        return "None"
+    return ", ".join(
+        "{} ({})".format(info["run_name"], info["run_id"])
+        for info in run_infos
+    )
+
+
+def list_stage2_child_runs(client, experiment_id, parent_run_id):
+    """Return stage2 child runs sorted by most recent start time."""
+    child_runs = client.search_runs(
+        experiment_ids=[experiment_id],
+        filter_string="tags.mlflow.parentRunId = '{}'".format(parent_run_id),
+        order_by=["attributes.start_time DESC"],
+    )
+
+    child_infos = []
+    for run in child_runs:
+        run_name = run.data.tags.get("mlflow.runName") or run.info.run_id
+        child_infos.append(
+            {
+                "run_id": run.info.run_id,
+                "run_name": run_name,
+                "training_stage": run.data.tags.get("training_stage"),
+            }
+        )
+
+    stage2_tagged = [
+        info for info in child_infos
+        if info["training_stage"] == "stage2_distillation"
+    ]
+    if stage2_tagged:
+        return stage2_tagged
+    return child_infos
+
+
+def resolve_stage2_model_run(client, experiment_id, parent_run_id, stage2_run_name=None):
+    """
+    Resolve which run ID should provide model_stage2.pth.
+
+    Returns: (resolved_run_id, resolved_run_name, source_kind)
+      source_kind is one of {"child", "parent_legacy"}.
+    """
+    stage2_children = list_stage2_child_runs(client, experiment_id, parent_run_id)
+
+    if stage2_run_name is not None:
+        matches = [r for r in stage2_children if r["run_name"] == stage2_run_name]
+        if len(matches) == 0:
+            raise ValueError(
+                "No stage2 child run named '{}' found under parent run {}. "
+                "Available stage2 child runs: {}".format(
+                    stage2_run_name,
+                    parent_run_id,
+                    _format_stage2_run_choices(stage2_children),
+                )
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                "Multiple stage2 child runs named '{}' found under parent run {}: {}. "
+                "Use unique child run names.".format(
+                    stage2_run_name,
+                    parent_run_id,
+                    _format_stage2_run_choices(matches),
+                )
+            )
+        selected = matches[0]
+        return selected["run_id"], selected["run_name"], "child"
+
+    if len(stage2_children) == 1:
+        selected = stage2_children[0]
+        return selected["run_id"], selected["run_name"], "child"
+
+    if len(stage2_children) > 1:
+        raise ValueError(
+            "Found multiple stage2 child runs under parent run {}: {}. "
+            "Pass --stage2-run-name to select one.".format(
+                parent_run_id,
+                _format_stage2_run_choices(stage2_children),
+            )
+        )
+
+    if artifact_exists(client, parent_run_id, "models/model_stage2.pth"):
+        return parent_run_id, None, "parent_legacy"
+
+    raise ValueError(
+        "No stage2 child runs found under parent run {} and no legacy "
+        "parent artifact models/model_stage2.pth exists.".format(parent_run_id)
+    )
 
 
 def artifact_exists(client, run_id, artifact_path):
@@ -449,6 +559,9 @@ def main():
     NOTEBOOK = is_notebook()
     args = parse_args(notebook=NOTEBOOK)
     
+    if args.stage2_run_name is not None and args.target_model != "stage2":
+        raise ValueError("--stage2-run-name is only valid with --target-model stage2.")
+
     deterministic_seed = 0
     random.seed(deterministic_seed)
     np.random.seed(deterministic_seed)
@@ -475,6 +588,8 @@ def main():
     client = MlflowClient()
     run_id = resolve_run_id_from_name(client, args.run_name)
     run_params = load_run_params(client, run_id, args.run_name)
+    parent_run = client.get_run(run_id)
+    experiment_id = parent_run.info.experiment_id
 
     #%% Resolve graph type for the target (arg takes precedence over run param)
     spatial_graph_type = args.spatial_graph_type or run_params.get("stage1_student_graph", "identity")
@@ -485,7 +600,6 @@ def main():
     bp_width       = int(run_params.get("bp_width", 400))
     graph_type     = run_params.get("graph_type", "ATAC")
     dual_source_kd = run_params.get("stage1_dual_source_kd", "False").lower() == "true"
-    has_stage2     = int(run_params.get("stage2_epochs", 0)) > 0
     target_subsample_n = int(run_params.get("target_subsample_n", 5000))
     target_subsample_seed = int(run_params.get("target_subsample_seed", 0))
     if target_subsample_n <= 0:
@@ -499,13 +613,30 @@ def main():
                 args.source_model, run_params.get("stage1_dual_source_kd")
             )
         )
-    if args.target_model == "stage2" and not has_stage2:
-        raise ValueError(
-            "--target-model stage2 requires stage2_epochs > 0 in the training run, "
-            "but 'stage2_epochs={}'. Use --target-model zero_shot instead.".format(
-                run_params.get("stage2_epochs", 0)
-            )
+    resolved_stage2_run_id = None
+    resolved_stage2_run_name = None
+    resolved_stage2_source_kind = None
+    if args.target_model == "stage2":
+        resolved_stage2_run_id, resolved_stage2_run_name, resolved_stage2_source_kind = resolve_stage2_model_run(
+            client=client,
+            experiment_id=experiment_id,
+            parent_run_id=run_id,
+            stage2_run_name=args.stage2_run_name,
         )
+        if resolved_stage2_source_kind == "child":
+            print(
+                "Resolved stage2 model run: child '{}' (ID: {})".format(
+                    resolved_stage2_run_name,
+                    resolved_stage2_run_id,
+                )
+            )
+        else:
+            print(
+                "Resolved stage2 model run: parent '{}' (ID: {}) [legacy fallback]".format(
+                    args.run_name,
+                    run_id,
+                )
+            )
 
     # ── Output directory ────────────────────────────────────────────────────
     if args.output_dir is None:
@@ -611,9 +742,22 @@ def main():
         print("  Feature dimensions verified: {} genes, {} peaks".format(n_genes, n_peaks))
 
         if args.target_model == "stage2":
-            print("Target model (model_stage2.pth):")
+            if resolved_stage2_source_kind == "child":
+                print(
+                    "Target model (model_stage2.pth) from child run '{}' (ID: {}):".format(
+                        resolved_stage2_run_name,
+                        resolved_stage2_run_id,
+                    )
+                )
+            else:
+                print(
+                    "Target model (model_stage2.pth) from parent run '{}' (ID: {}) [legacy fallback]:".format(
+                        args.run_name,
+                        run_id,
+                    )
+                )
             target_mgate, _, _, _ = load_mgate(
-                client, run_id, "model_stage2.pth", device, tmpdir
+                client, resolved_stage2_run_id, "model_stage2.pth", device, tmpdir
             )
         else:
             # Zero-shot: built after download, outside the tmpdir block
