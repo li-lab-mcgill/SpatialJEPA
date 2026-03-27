@@ -118,6 +118,18 @@ def parse_args(notebook: bool = False):
         help="Scale factor for KD objectives (stage-1 dual-source KD and stage-2 target KD).",
     )
     parser.add_argument(
+        "--kd-mix-kl",
+        type=float,
+        default=0.1,
+        help="Weight on the KL distillation term in stage-2 loss: lambda_kd * (kd_mix_kl * KL + kd_mix_ot * OT-CLIP).",
+    )
+    parser.add_argument(
+        "--kd-mix-ot",
+        type=float,
+        default=0.9,
+        help="Weight on the OT-CLIP distillation term in stage-2 loss (see --kd-mix-kl).",
+    )
+    parser.add_argument(
         "--stage1-dual-source-kd",
         action="store_true",
         default=False,
@@ -1096,6 +1108,8 @@ def run_stage2_distillation(
     source_x2,
     stage2_epochs,
     lambda_kd,
+    kd_mix_kl,
+    kd_mix_ot,
     target_label_key,
     scib_n_jobs,
     vgp_anchor_mode=None,
@@ -1164,8 +1178,8 @@ def run_stage2_distillation(
         mlflow.log_param("hidden_dims", json.dumps(source_trainer.mgate.hidden_dims1[1:])) # skip first dimension (input size)
         mlflow.log_param("stage2_epochs", stage2_epochs)
         mlflow.log_param("lambda_kd", lambda_kd)
-        mlflow.log_param("kd_mix_kl", 0.1)
-        mlflow.log_param("kd_mix_ot", 0.9)
+        mlflow.log_param("kd_mix_kl", kd_mix_kl)
+        mlflow.log_param("kd_mix_ot", kd_mix_ot)
         mlflow.log_param("student_init", "random")
         teacher_init_mode = (
             "source_to_target_zero_shot_copy_vgp"
@@ -1195,7 +1209,7 @@ def run_stage2_distillation(
             kd_ot_loss = compute_ot_clip_loss(student_logits, teacher_logits, emd=emd)
             kd_kl_loss = compute_kd_kl_loss(student_logits, teacher_logits)
             kd_kl_loss = kd_kl_loss * 50 # TMP - bring KL loss to same scale as OT loss
-            distill_loss = lambda_kd * (0.1 * kd_kl_loss + 0.9 * kd_ot_loss)
+            distill_loss = lambda_kd * (kd_mix_kl * kd_kl_loss + kd_mix_ot * kd_ot_loss)
 
             distill_loss.backward()
             torch.nn.utils.clip_grad_norm_(student_trainer.mgate.parameters(), student_trainer.gradient_clipping)
@@ -1397,6 +1411,10 @@ def main():
         raise ValueError("--stage2-epochs must be a non-negative integer.")
     if args.lambda_kd < 0:
         raise ValueError("--lambda-kd must be non-negative.")
+    if args.kd_mix_kl < 0 or args.kd_mix_ot < 0:
+        raise ValueError("--kd-mix-kl and --kd-mix-ot must be non-negative.")
+    if args.kd_mix_kl + args.kd_mix_ot <= 0:
+        raise ValueError("--kd-mix-kl and --kd-mix-ot must sum to a positive value.")
     if args.scib_n_jobs <= 0:
         raise ValueError("--scib-n-jobs must be a positive integer.")
 
@@ -1703,9 +1721,11 @@ def main():
         with mlflow.start_run(run_id=cached_stage1_run_id):
             if args.stage2_epochs > 0:
                 print(
-                    "[Stage2 KD] Starting target distillation for {} epochs (lambda_kd={})".format(
+                    "[Stage2 KD] Starting target distillation for {} epochs (lambda_kd={}, kd_mix_kl={}, kd_mix_ot={})".format(
                         args.stage2_epochs,
                         args.lambda_kd,
+                        args.kd_mix_kl,
+                        args.kd_mix_ot,
                     )
                 )
 
@@ -1733,6 +1753,8 @@ def main():
                     source_x2=source_x2,
                     stage2_epochs=args.stage2_epochs,
                     lambda_kd=args.lambda_kd,
+                    kd_mix_kl=args.kd_mix_kl,
+                    kd_mix_ot=args.kd_mix_ot,
                     target_label_key=args.target_label_key,
                     scib_n_jobs=args.scib_n_jobs,
                     vgp_anchor_mode=effective_vgp_anchor_mode,
@@ -1771,6 +1793,8 @@ def main():
         mlflow.log_param("n_epochs", num_epochs)
         mlflow.log_param("stage2_epochs", args.stage2_epochs)
         mlflow.log_param("lambda_kd", args.lambda_kd)
+        mlflow.log_param("kd_mix_kl", args.kd_mix_kl)
+        mlflow.log_param("kd_mix_ot", args.kd_mix_ot)
         mlflow.log_param("bp_width", bp_width)
         mlflow.log_param("target_subsample_n", args.target_subsample_n)
         mlflow.log_param("target_subsample_seed", args.target_subsample_seed)
@@ -2012,9 +2036,11 @@ def main():
         #%% stage 2
         if args.stage2_epochs > 0:
             print(
-                "[Stage2 KD] Starting target distillation for {} epochs (lambda_kd={})".format(
+                "[Stage2 KD] Starting target distillation for {} epochs (lambda_kd={}, kd_mix_kl={}, kd_mix_ot={})".format(
                     args.stage2_epochs,
                     args.lambda_kd,
+                    args.kd_mix_kl,
+                    args.kd_mix_ot,
                 )
             )
 
@@ -2032,6 +2058,8 @@ def main():
                 source_x2=source_x2,
                 stage2_epochs=args.stage2_epochs,
                 lambda_kd=args.lambda_kd,
+                kd_mix_kl=args.kd_mix_kl,
+                kd_mix_ot=args.kd_mix_ot,
                 target_label_key=args.target_label_key,
                 scib_n_jobs=args.scib_n_jobs,
                 vgp_anchor_mode=effective_vgp_anchor_mode,
