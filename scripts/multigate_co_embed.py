@@ -713,6 +713,7 @@ def main():
         "stage1_student": "model_stage1_student.pth",
     }
     source_artifact_name = source_artifact_map[args.source_model]
+    #teacher_source_artifact_name = source_artifact_map["stage1_teacher"]
 
     print(
         "\nDownloading model artifacts for run '{}' (ID: {})...".format(
@@ -724,6 +725,10 @@ def main():
         print("Source model ({}) :".format(source_artifact_name))
         source_mgate, hidden_dims1, hidden_dims2, source_vgp_anchor_mode = load_mgate(
             client, run_id, source_artifact_name, device, tmpdir
+        )
+
+        teacher_source_mgate, _, _, _ = load_mgate(
+            client, run_id, source_artifact_map["stage1_teacher"], device, tmpdir
         )
 
         # Verify feature dimensions match after our feature-selection replication
@@ -856,12 +861,22 @@ def main():
         )
 
     #%% ── Inference, by dataset ────────────────────────────────────────────────────────────
+
+    ## (teacher) source inference
+    teacher_source_rna_emb, teacher_source_atac_emb = run_inference(
+        teacher_source_mgate, source_graph_tf, source_gp_tf, source_x1, source_x2, device
+    )
+    set_multigate_embeddings(source_rna, source_atac, teacher_source_rna_emb, teacher_source_atac_emb, key_added="MultiGATE_teacher")
+    print("  Teacher source embeddings: shape {}".format(teacher_source_rna_emb.shape))
+    
+    ## (student) source inference
     source_rna_emb, source_atac_emb = run_inference(
         source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
     print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
+    ## student target inference
     target_rna_emb, target_atac_emb = run_inference(
         target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
     )
@@ -869,9 +884,18 @@ def main():
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
     # Plot source/target concat UMAPs with the same helper as training script.
+    teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher")
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
-    
+
+    ## compute UMAPs
+    compute_concat_umap(
+        teacher_source_concat_adata,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
     compute_concat_umap(
         source_concat_adata,
         n_neighbors=10,
@@ -888,6 +912,13 @@ def main():
     )
     target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
 
+    # plot teacher source UMAPs
+    teacher_source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
+    fig, axs = plt.subplots(1, len(teacher_source_umap_colors), figsize=(18, 5))
+    for i, color in enumerate(teacher_source_umap_colors):
+        sc.pl.umap(teacher_source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+    plt.tight_layout(); plt.show()
+
     # plot source UMAPs
     source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
     fig, axs = plt.subplots(1, len(source_umap_colors), figsize=(18, 5))
@@ -901,6 +932,81 @@ def main():
     for i, color in enumerate(target_umap_colors):
         sc.pl.umap(target_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
     plt.tight_layout(); plt.show()
+
+    #%% source student & teacher analysis
+
+    corr_matrix = np.corrcoef(teacher_source_rna_emb, source_rna_emb, rowvar=False)
+    n_dims = source_rna_emb.shape[1]
+    #corr_matrix = corr_matrix[:n_dims, n_dims:]
+
+    plt.figure(figsize=(6, 6))
+    plt.matshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+    plt.colorbar()
+    plt.title('Correlation between teacher and student source embeddings')
+    plt.show()
+
+    # Compute per-dimension Pearson correlation between teacher and student source embeddings
+    pearson_corr = [
+        np.corrcoef(teacher_source_rna_emb[:, i], source_rna_emb[:, i])[0, 1]
+        for i in range(n_dims)
+    ]
+    pearson_corr = np.array(pearson_corr)
+    corr_sort = np.argsort(pearson_corr)  # lowest-to-highest correlation
+    corr_sorted = pearson_corr[corr_sort]
+    plt.figure(figsize=(8, 4))
+    plt.bar(range(n_dims), corr_sorted)
+    plt.title('Per-dimension Pearson correlation between teacher and student source embeddings')
+    plt.xticks(range(n_dims), corr_sort, rotation=45)
+    plt.ylabel('Pearson r')
+    plt.show()
+
+    ## remove top-k dimensions with largest spatial difference
+    top_k = 5
+    #keep_dims = np.arange(n_dims)[np.intersect1d(np.arange(n_dims), corr_sort[:-(top_k+1)])]
+    keep_dims = np.arange(n_dims)[np.intersect1d(np.arange(n_dims), corr_sort[top_k:])]
+
+    set_multigate_embeddings(source_rna, source_atac,
+        teacher_source_rna_emb[:, keep_dims],
+        teacher_source_atac_emb[:, keep_dims],
+        key_added="MultiGATE_teacher_trunc")
+    set_multigate_embeddings(source_rna, source_atac,
+        source_rna_emb[:, keep_dims],
+        source_atac_emb[:, keep_dims],
+        key_added="MultiGATE_trunc")
+    print("  Teacher source truncated embeddings: shape {}".format(teacher_source_rna_emb[:, keep_dims].shape))
+    print("  Student source truncated embeddings: shape {}".format(source_rna_emb[:, keep_dims].shape))
+
+    teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher_trunc")
+    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_trunc")
+    compute_concat_umap(
+        teacher_source_concat_adata,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    compute_concat_umap(
+        source_concat_adata,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+
+    # plot teacher source truncated UMAPs
+    teacher_source_trunc_umap_colors = ['modality', 'leiden', 'RNA_clusters']
+    fig, axs = plt.subplots(1, len(teacher_source_trunc_umap_colors), figsize=(18, 5))
+    for i, color in enumerate(teacher_source_trunc_umap_colors):
+        sc.pl.umap(teacher_source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+    plt.tight_layout(); plt.show()
+
+    # plot source truncated UMAPs
+    source_trunc_umap_colors = ['modality', 'leiden', 'RNA_clusters']
+    fig, axs = plt.subplots(1, len(source_trunc_umap_colors), figsize=(18, 5))
+    for i, color in enumerate(source_trunc_umap_colors):
+        sc.pl.umap(source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+    plt.tight_layout(); plt.show()
+
 
     #%% ── Inference, combined target embeddings ────────────────────────────────────────────────────────────
     source_rna_emb, source_atac_emb = run_inference(
