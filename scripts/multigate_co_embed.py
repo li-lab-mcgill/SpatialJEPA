@@ -326,14 +326,22 @@ def list_stage2_child_runs(client, experiment_id, parent_run_id):
     return child_infos
 
 
+STAGE2_MODEL_ARTIFACT = "models/model_stage2.pth"
+
+
 def resolve_stage2_model_run(client, experiment_id, parent_run_id, stage2_run_name=None):
     """
     Resolve which run ID should provide model_stage2.pth.
 
     Returns: (resolved_run_id, resolved_run_name, source_kind)
       source_kind is one of {"child", "parent_legacy"}.
+
+    If nested child runs exist but a child's checkpoint was never logged (crashed
+    job, older code path), the parent may still hold a legacy model_stage2.pth.
+    We only bind to a child run when that run actually lists the artifact.
     """
     stage2_children = list_stage2_child_runs(client, experiment_id, parent_run_id)
+    parent_has_legacy = artifact_exists(client, parent_run_id, STAGE2_MODEL_ARTIFACT)
 
     if stage2_run_name is not None:
         matches = [r for r in stage2_children if r["run_name"] == stage2_run_name]
@@ -356,11 +364,38 @@ def resolve_stage2_model_run(client, experiment_id, parent_run_id, stage2_run_na
                 )
             )
         selected = matches[0]
-        return selected["run_id"], selected["run_name"], "child"
+        if artifact_exists(client, selected["run_id"], STAGE2_MODEL_ARTIFACT):
+            return selected["run_id"], selected["run_name"], "child"
+        # Checkpoint may have been logged on the parent (legacy) even though the UI
+        # shows a nested stage-2 run row; nested runs do not always receive files.
+        if parent_has_legacy:
+            return parent_run_id, selected["run_name"], "parent_legacy"
+        raise FileNotFoundError(
+            "Stage-2 child run '{}' (ID: {}) has no artifact '{}', and parent run {} "
+            "has none either. Confirm the Run ID matches and that stage-2 logging finished.".format(
+                stage2_run_name,
+                selected["run_id"],
+                STAGE2_MODEL_ARTIFACT,
+                parent_run_id,
+            )
+        )
 
     if len(stage2_children) == 1:
         selected = stage2_children[0]
-        return selected["run_id"], selected["run_name"], "child"
+        if artifact_exists(client, selected["run_id"], STAGE2_MODEL_ARTIFACT):
+            return selected["run_id"], selected["run_name"], "child"
+        if parent_has_legacy:
+            return parent_run_id, None, "parent_legacy"
+        raise FileNotFoundError(
+            "Child run '{}' (ID: {}) exists under parent but has no '{}'; "
+            "parent {} also has no legacy checkpoint. "
+            "Re-run stage-2 or remove the empty nested run.".format(
+                selected["run_name"],
+                selected["run_id"],
+                STAGE2_MODEL_ARTIFACT,
+                parent_run_id,
+            )
+        )
 
     if len(stage2_children) > 1:
         raise ValueError(
@@ -371,12 +406,12 @@ def resolve_stage2_model_run(client, experiment_id, parent_run_id, stage2_run_na
             )
         )
 
-    if artifact_exists(client, parent_run_id, "models/model_stage2.pth"):
+    if parent_has_legacy:
         return parent_run_id, None, "parent_legacy"
 
     raise ValueError(
         "No stage2 child runs found under parent run {} and no legacy "
-        "parent artifact models/model_stage2.pth exists.".format(parent_run_id)
+        "parent artifact {} exists.".format(parent_run_id, STAGE2_MODEL_ARTIFACT)
     )
 
 
@@ -631,12 +666,23 @@ def main():
                 )
             )
         else:
-            print(
-                "Resolved stage2 model run: parent '{}' (ID: {}) [legacy fallback]".format(
-                    args.run_name,
-                    run_id,
+            if args.stage2_run_name and resolved_stage2_run_name:
+                print(
+                    "Resolved stage2 model run: parent '{}' (ID: {}) [legacy {}; "
+                    "not found on child '{}' — loading parent checkpoint]".format(
+                        args.run_name,
+                        run_id,
+                        STAGE2_MODEL_ARTIFACT,
+                        resolved_stage2_run_name,
+                    )
                 )
-            )
+            else:
+                print(
+                    "Resolved stage2 model run: parent '{}' (ID: {}) [legacy fallback]".format(
+                        args.run_name,
+                        run_id,
+                    )
+                )
 
     # ── Output directory ────────────────────────────────────────────────────
     if args.output_dir is None:
@@ -946,13 +992,43 @@ def main():
     plt.show()
 
     # Compute per-dimension Pearson correlation between teacher and student source embeddings
-    pearson_corr = [
-        np.corrcoef(teacher_source_rna_emb[:, i], source_rna_emb[:, i])[0, 1]
-        for i in range(n_dims)
-    ]
-    pearson_corr = np.array(pearson_corr)
-    corr_sort = np.argsort(pearson_corr)  # lowest-to-highest correlation
-    corr_sorted = pearson_corr[corr_sort]
+    C = teacher_source_rna_emb - source_rna_emb
+    mu = C.mean(axis=0)
+    sigma = C.std(axis=0)
+    C_std = (C - mu) / (sigma + 1e-6)
+
+    from sklearn.decomposition import PCA
+    pca = PCA(n_components=n_dims)
+    pca.fit(C_std)
+    plt.plot(np.cumsum(pca.explained_variance_ratio_))
+    # Plot barcharts of the first 5 principal component loadings using seaborn as different series
+    import seaborn as sns
+    import pandas as pd
+
+    n_pcs = 5
+    loadings_df = pd.DataFrame(
+        pca.components_[:n_pcs].T,
+        columns=[f'PC{i+1}' for i in range(n_pcs)]
+    )
+    loadings_df['Original Dimension'] = loadings_df.index
+
+    loadings_melted = loadings_df.melt(id_vars='Original Dimension', var_name='Principal Component', value_name='Loading')
+
+    plt.figure(figsize=(14, 8))
+    sns.barplot(
+        data=loadings_melted,
+        hue='Original Dimension',
+        x='Principal Component',
+        y='Loading',
+        alpha=0.7
+    )
+    plt.xlabel('Original Dimension')
+    plt.ylabel('Component Loading Value')
+    plt.title('Barcharts of PCA Component Loadings (First 5 PCs)')
+    plt.legend(title='Principal Component')
+    plt.tight_layout()
+    plt.show()
+
     plt.figure(figsize=(8, 4))
     plt.bar(range(n_dims), corr_sorted)
     plt.title('Per-dimension Pearson correlation between teacher and student source embeddings')
