@@ -979,6 +979,67 @@ def main():
         sc.pl.umap(target_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
     plt.tight_layout(); plt.show()
 
+    #%% AJIVE analysis
+    from mvlearn.decomposition import AJIVE
+    import seaborn as sns
+    import pandas as pd
+
+    ## spatial source inference
+    teacher_spatial_source_rna_emb, teacher_spatial_source_atac_emb = run_inference(
+        teacher_source_mgate, source_graph_tf, source_gp_tf, source_x1, source_x2, device
+    )    
+    ## non-spatial source inference
+    student_non_spatial_source_rna_emb, student_non_spatial_source_atac_emb = run_inference(
+        teacher_source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+    )
+
+    ## AJIVE analysis
+    X1 = teacher_spatial_source_rna_emb.copy()
+    X2 = student_non_spatial_source_rna_emb.copy()
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
+    U, S, V = np.linalg.svd(X1)
+    vars1 = S**2 / np.sum(S**2)
+    U, S, V = np.linalg.svd(X2)
+    vars2 = S**2 / np.sum(S**2)
+    n_plot_cps = X1.shape[1]
+    axes[0].plot(np.arange(n_plot_cps) + 1, vars1[:n_plot_cps], 'ro-', linewidth=2)
+    axes[1].plot(np.arange(n_plot_cps) + 1, vars2[:n_plot_cps], 'ro-', linewidth=2)
+    axes[0].set_title('Scree Plot View 1')
+    axes[1].set_title('Scree Plot View 2')
+    axes[0].set_xlabel('Number of top singular values')
+    axes[1].set_xlabel('Number of top singular values')
+    axes[0].set_ylabel('Percent variance explained')
+    plt.show()
+
+    ## fit AJIVE
+    source_rna_emb_list = [X1, X2]
+
+    ajive = AJIVE(
+        init_signal_ranks=[5, 5],
+        joint_rank=None,
+        n_jobs=1)
+
+    source_rna_joint = ajive.fit_transform(source_rna_emb_list)
+
+    def plot_blocks(blocks, names):
+        n_views = len(blocks[0])
+        n_blocks = len(blocks)
+        for i in range(n_views):
+            for j in range(n_blocks):
+                plt.subplot(n_blocks, n_views, j*n_views+i+1)
+                sns.heatmap(blocks[j][i], xticklabels=False, yticklabels=False,
+                            cmap="RdBu")
+                plt.title(f"View {i}: {names[j]}")
+
+    plt.figure(figsize=[15, 10])
+    plt.title('Different Views')
+    individual_mats = ajive.individual_mats_
+    Xs_inv = ajive.inverse_transform(source_rna_joint)
+    residuals = [v - X for v, X in zip(source_rna_emb_list, Xs_inv)]
+    plot_blocks([source_rna_emb_list, source_rna_joint, individual_mats, residuals],
+                ["Raw Data", "Joint", "Individual", "Noise"])
+
     #%% source student & teacher analysis
 
     corr_matrix = np.corrcoef(teacher_source_rna_emb, source_rna_emb, rowvar=False)
