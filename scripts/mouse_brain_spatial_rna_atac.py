@@ -1422,7 +1422,7 @@ def main():
     require_scib_backend()
 
     experiment_id = setup_mlflow()
-    eval_every = 1000 # set to -1 for very basic debugging only, since will skip the incorporation of MultiGATE embeddings into the anndatas
+    eval_every = 3000 # set to -1 for very basic debugging only, since will skip the incorporation of MultiGATE embeddings into the anndatas
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     mlflow_client = MlflowClient()
@@ -1610,6 +1610,7 @@ def main():
         weight_decay=0.0001,
         verbose=False,
         random_seed=2020,
+        skip_gp_attention=True,
     )
 
     source_a_t = source_prune_t = source_gp_t = source_x1_t = source_x2_t = None
@@ -1813,6 +1814,7 @@ def main():
         mlflow.log_param("stage1_teacher_graph", "spatial")
         mlflow.log_param("stage1_student_graph", effective_stage1_student_graph_type if effective_stage1_dual_source_kd else "NA")
         mlflow.log_param("vgp_anchor_mode", effective_vgp_anchor_mode)
+        mlflow.log_param("skip_gp_attention", trainer.mgate.skip_gp_attention)
         source_scib_label_mode_logged = False
         target_scib_label_mode_logged = False
         source_scib_effective_label_key_logged = False
@@ -1824,6 +1826,15 @@ def main():
             trainer.mgate.train()
             teacher_loss = trainer.run_epoch(epoch, source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t)
             mlflow.log_metric("source_train_loss", float(teacher_loss), step=epoch)
+
+            loss_atac = float(trainer.loss_list_atac[-1])
+            loss_rna = float(trainer.loss_list_rna[-1])
+            clip_loss = float(trainer.loss_list_clip[-1])
+            decorr_loss = float(trainer.loss_list_deco[-1])
+            mlflow.log_metric("source_train_loss_atac", loss_atac, step=epoch)
+            mlflow.log_metric("source_train_loss_rna", loss_rna, step=epoch)
+            mlflow.log_metric("source_train_loss_clip", clip_loss, step=epoch)
+            mlflow.log_metric("source_train_loss_decorr", decorr_loss, step=epoch)
 
             if effective_stage1_dual_source_kd:
 

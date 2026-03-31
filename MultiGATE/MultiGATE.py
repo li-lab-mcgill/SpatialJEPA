@@ -23,6 +23,7 @@ class MultiGATE(object):
         verbose=False,
         random_seed=2020,
         config=None,
+        skip_gp_attention=False,
     ):
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
@@ -33,7 +34,8 @@ class MultiGATE(object):
         self.loss_list_atac = []
         self.loss_list = []
         self.loss_list_clip = []
-
+        self.loss_list_deco = []
+        
         self.lr = lr
         self.n_epochs = n_epochs
         self.gradient_clipping = gradient_clipping
@@ -48,6 +50,7 @@ class MultiGATE(object):
             temp=temp,
             nonlinear=nonlinear,
             vgp_anchor_mode=vgp_anchor_mode,
+            skip_gp_attention=skip_gp_attention,
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.mgate.parameters(), lr=self.lr, weight_decay=weight_decay)
 
@@ -118,7 +121,7 @@ class MultiGATE(object):
         self.optimizer.zero_grad(set_to_none=True)
 
         outputs = self.mgate(A, prune_A, GP, X1, X2)
-        loss, loss_rna, loss_atac, _, clip_loss = outputs[:5]
+        loss, loss_rna, loss_atac, decorr_loss, clip_loss = outputs[:5]
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.mgate.parameters(), self.gradient_clipping)
@@ -129,7 +132,7 @@ class MultiGATE(object):
         self.loss_list_atac.append(float(loss_atac.detach().cpu().item()))
         self.loss_list_rna.append(float(loss_rna.detach().cpu().item()))
         self.loss_list_clip.append(float(clip_loss.detach().cpu().item()))
-
+        self.loss_list_deco.append(float(decorr_loss.detach().cpu().item()))
         return loss_scalar
 
     def infer(self, A, prune_A, GP, X1, X2):

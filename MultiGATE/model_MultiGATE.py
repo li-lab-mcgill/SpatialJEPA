@@ -7,6 +7,30 @@ def _load_legacy_tf_mgate():
 
     return legacy_cls
 
+def decorr_loss_correlation(
+    z: torch.Tensor,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """
+    Stable decorrelation loss using the off-diagonal of the correlation matrix.
+
+    Args:
+        z: Tensor of shape [batch, dim]
+        eps: Numerical stability term
+
+    Returns:
+        Scalar loss
+    """
+    z = z - z.mean(dim=0, keepdim=True)
+    z = z / (z.std(dim=0, unbiased=False, keepdim=True) + eps)
+
+    b = z.shape[0]
+    corr = (z.T @ z) / b
+
+    upper = torch.triu(corr, diagonal=1)
+    num_offdiag = corr.shape[0] * (corr.shape[0] - 1) // 2
+    loss = upper.pow(2).sum() / num_offdiag
+    return loss
 
 class LegacyTFMGATE(object):
     def __new__(cls, *args, **kwargs):
@@ -25,6 +49,7 @@ class MGATE(nn.Module):
         nonlinear=True,
         weight_decay=0.0001,
         vgp_anchor_mode="spot",
+        skip_gp_attention=True,
     ):
         super(MGATE, self).__init__()
         self.n_layers = len(hidden_dims1) - 1
@@ -39,6 +64,7 @@ class MGATE(nn.Module):
         self.temp = temp
         self.spot_num = int(spot_num)
         self.vgp_anchor_mode = vgp_anchor_mode
+        self.skip_gp_attention = skip_gp_attention
 
         self.W1 = nn.ParameterList([
             nn.Parameter(torch.empty(hidden_dims1[i], hidden_dims1[i + 1]))
@@ -116,23 +142,28 @@ class MGATE(nn.Module):
         self.Cgp = {}
 
         # Encoder
-        H = torch.cat([X1.transpose(0, 1), X2.transpose(0, 1)], dim=0)
-        if self.vgp_anchor_mode == "feature":
-            self.Cgp[0] = self._gp_attention_layer(GP, self.vgp0, self.vgp1)  # att_fg of Eq. (3), feature-anchored
-        else:
-            if X1.shape[0] != self.vgp0.shape[0]:
-                raise ValueError(
-                    "Spot-anchored vgp expects {} cells, but got {}. "
-                    "Instantiate MGATE with matching spot_num for this dataset."
-                    .format(self.vgp0.shape[0], X1.shape[0])
-                )
-            self.Cgp[0] = self.graph_attention_layer(GP, H, self.vgp0, self.vgp1)  # att_fg of Eq. (3), spot-anchored
-        H = torch.sparse.mm(self.Cgp[0], H)
-        H = F.relu(H) # after relu, H is output of Eq. (1) in the paper, i.e. ~X^T_(f)
+        if not self.skip_gp_attention:
+            H = torch.cat([X1.transpose(0, 1), X2.transpose(0, 1)], dim=0)
+            if self.vgp_anchor_mode == "feature":
+                self.Cgp[0] = self._gp_attention_layer(GP, self.vgp0, self.vgp1)  # att_fg of Eq. (3), feature-anchored
+            else:
+                if X1.shape[0] != self.vgp0.shape[0]:
+                    raise ValueError(
+                        "Spot-anchored vgp expects {} cells, but got {}. "
+                        "Instantiate MGATE with matching spot_num for this dataset."
+                        .format(self.vgp0.shape[0], X1.shape[0])
+                    )
+                self.Cgp[0] = self.graph_attention_layer(GP, H, self.vgp0, self.vgp1)  # att_fg of Eq. (3), spot-anchored
+            H = torch.sparse.mm(self.Cgp[0], H)
+            H = F.relu(H) # after relu, H is output of Eq. (1) in the paper, i.e. ~X^T_(f)
 
-        split_point = X1.shape[1]
-        H1 = H[:split_point, :].transpose(0, 1).contiguous()
-        H2 = H[split_point:, :].transpose(0, 1).contiguous()
+            split_point = X1.shape[1]
+            H1 = H[:split_point, :].transpose(0, 1).contiguous()
+            H2 = H[split_point:, :].transpose(0, 1).contiguous()
+
+        else:
+            H1 = X1
+            H2 = X2
 
         for layer in range(self.n_layers):
             H1 = self.__encoder(A, H1, self.W1, self.C1, self.v1_0, self.v1_1, layer) # output of Eq. (5) for first modality (RNA)
@@ -152,15 +183,19 @@ class MGATE(nn.Module):
                 H1 = F.elu(H1)
                 H2 = F.elu(H2)
 
-        H = torch.cat([H1.transpose(0, 1), H2.transpose(0, 1)], dim=0)
-        H = torch.sparse.mm(self.Cgp[0], H) # Eq. (11)
-        H = F.elu(H)
+        if not self.skip_gp_attention:
+            H = torch.cat([H1.transpose(0, 1), H2.transpose(0, 1)], dim=0)
+            H = torch.sparse.mm(self.Cgp[0], H) # Eq. (11)
+            H = F.elu(H)
 
-        H1_dec = H[:split_point, :].transpose(0, 1).contiguous()
-        H2_dec = H[split_point:, :].transpose(0, 1).contiguous()
+            H1_dec = H[:split_point, :].transpose(0, 1).contiguous()
+            H2_dec = H[split_point:, :].transpose(0, 1).contiguous()
 
-        X1_ = H1_dec
-        X2_ = H2_dec
+            X1_ = H1_dec
+            X2_ = H2_dec
+        else:
+            X1_ = H1
+            X2_ = H2
 
         # CLIP-style alignment loss
         rna_proj = self.bn_rna(torch.matmul(self.H1, self.W_i))
@@ -178,10 +213,16 @@ class MGATE(nn.Module):
         clip_loss = ((loss_rna + loss_atac) / 2.0).mean()
 
         # Reconstruction losses
-        features_loss1 = torch.sqrt(torch.sum(torch.pow(X1 - X1_, 2)))
-        features_loss2 = torch.sqrt(torch.sum(torch.pow(X2 - X2_, 2)))
+        features_loss1 = torch.sqrt(torch.sum(torch.pow(X1 - X1_, 2)))#.log()
+        features_loss2 = torch.sqrt(torch.sum(torch.pow(X2 - X2_, 2)))#.log()
 
-        self.loss = features_loss1 + features_loss2 + clip_loss
+        # decorrelation loss
+        rna_decorr_loss = decorr_loss_correlation(RNA_e)
+        atac_decorr_loss = decorr_loss_correlation(ATAC_e)
+        decorr_loss = (rna_decorr_loss + atac_decorr_loss) / 2.0 * 100.0 * 0.0
+
+        # total loss
+        self.loss = features_loss1 + features_loss2 + clip_loss + decorr_loss
         self.loss_rna = features_loss1
         self.loss_atac = features_loss2
         self.clip_loss = clip_loss
@@ -194,7 +235,7 @@ class MGATE(nn.Module):
             self.loss,
             self.loss_rna,
             self.loss_atac,
-            None,
+            decorr_loss,
             self.clip_loss,
             self.H1,
             self.H2,
