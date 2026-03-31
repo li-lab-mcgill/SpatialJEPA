@@ -773,9 +773,12 @@ def main():
             client, run_id, source_artifact_name, device, tmpdir
         )
 
-        teacher_source_mgate, _, _, _ = load_mgate(
-            client, run_id, source_artifact_map["stage1_teacher"], device, tmpdir
-        )
+        if dual_source_kd:
+            teacher_source_mgate, _, _, _ = load_mgate(
+                client, run_id, source_artifact_map["stage1_teacher"], device, tmpdir
+            )
+        else:
+            teacher_source_mgate = source_mgate
 
         # Verify feature dimensions match after our feature-selection replication
         expected_n_genes = hidden_dims1[0]
@@ -997,26 +1000,35 @@ def main():
     X1 = teacher_spatial_source_rna_emb.copy()
     X2 = student_non_spatial_source_rna_emb.copy()
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
     U, S, V = np.linalg.svd(X1)
     vars1 = S**2 / np.sum(S**2)
+    cumsum_vars1 = np.cumsum(vars1)
     U, S, V = np.linalg.svd(X2)
     vars2 = S**2 / np.sum(S**2)
+    cumsum_vars2 = np.cumsum(vars2)
     n_plot_cps = X1.shape[1]
-    axes[0].plot(np.arange(n_plot_cps) + 1, vars1[:n_plot_cps], 'ro-', linewidth=2)
-    axes[1].plot(np.arange(n_plot_cps) + 1, vars2[:n_plot_cps], 'ro-', linewidth=2)
-    axes[0].set_title('Scree Plot View 1')
-    axes[1].set_title('Scree Plot View 2')
+    
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
+    axes[0].plot(np.arange(n_plot_cps) + 1, cumsum_vars1[:n_plot_cps], 'ro-', linewidth=2)
+    axes[1].plot(np.arange(n_plot_cps) + 1, cumsum_vars2[:n_plot_cps], 'ro-', linewidth=2)
+    axes[0].set_title('Cumulative Variance View 1')
+    axes[1].set_title('Cumulative Variance View 2')
     axes[0].set_xlabel('Number of top singular values')
     axes[1].set_xlabel('Number of top singular values')
-    axes[0].set_ylabel('Percent variance explained')
+    axes[0].set_ylabel('Cumulative percent variance explained')
+    # Add grid to both plots
+    axes[0].grid(True, color='#dddddd', linewidth=0.5)
+    axes[1].grid(True, color='#dddddd', linewidth=0.5)
+    # Add horizontal line at cumsum_vars==0.9
+    axes[0].axhline(y=0.9, color='gray', linestyle='--', linewidth=1)
+    axes[1].axhline(y=0.9, color='gray', linestyle='--', linewidth=1)
     plt.show()
 
     ## fit AJIVE
     source_rna_emb_list = [X1, X2]
 
     ajive = AJIVE(
-        init_signal_ranks=[5, 5],
+        init_signal_ranks=[7, 10],
         joint_rank=None,
         n_jobs=1)
 
@@ -1039,6 +1051,78 @@ def main():
     residuals = [v - X for v, X in zip(source_rna_emb_list, Xs_inv)]
     plot_blocks([source_rna_emb_list, source_rna_joint, individual_mats, residuals],
                 ["Raw Data", "Joint", "Individual", "Noise"])
+
+    ## UMAP of AJIVE projection embeddings
+    import anndata as ad
+    obs_index = np.concatenate([source_rna.obs_names, source_rna.obs_names])
+    obs_df = pd.DataFrame(
+        {"teacher_or_student": (["teacher"] * source_rna.n_obs + ["student"] * source_rna.n_obs)},
+        index=obs_index
+    )
+    concat_ajive_joint = ad.AnnData(
+        X=np.concatenate([source_rna_joint[0], source_rna_joint[1]], axis=0),
+        obs=obs_df,
+    )
+    concat_individual_mats = ad.AnnData(
+        X=np.concatenate([individual_mats[0], individual_mats[1]], axis=0),
+        obs=obs_df,
+    )
+    concat_residuals = ad.AnnData(
+        X=np.concatenate([residuals[0], residuals[1]], axis=0),
+        obs=obs_df,
+    )
+    compute_concat_umap(
+        concat_ajive_joint,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    compute_concat_umap(
+        concat_individual_mats,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    compute_concat_umap(
+        concat_residuals,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+
+    sc.pl.umap(concat_ajive_joint, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+
+    sc.pl.umap(concat_individual_mats, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+
+    sc.pl.umap(concat_residuals, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+
+    teacher_individual_mat = concat_individual_mats[concat_individual_mats.obs["teacher_or_student"].eq("teacher")]
+    student_individual_mat = concat_individual_mats[concat_individual_mats.obs["teacher_or_student"].eq("student")]
+
+    compute_concat_umap(
+        teacher_individual_mat,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    compute_concat_umap(
+        student_individual_mat,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    sc.pl.umap(teacher_individual_mat, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+    sc.pl.umap(student_individual_mat, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
 
     #%% source student & teacher analysis
 
