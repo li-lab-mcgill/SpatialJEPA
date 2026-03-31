@@ -925,19 +925,96 @@ def main():
     set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
     print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
-    ## student target inference
+    # Plot source/target concat UMAPs with the same helper as training script.
+    teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher")
+    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
+
+    ## compute UMAPs
+    compute_concat_umap(
+        teacher_source_concat_adata,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    compute_concat_umap(
+        source_concat_adata,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+
+    # plot teacher source UMAPs
+    teacher_source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
+    fig, axs = plt.subplots(1, len(teacher_source_umap_colors), figsize=(18, 5))
+    for i, color in enumerate(teacher_source_umap_colors):
+        sc.pl.umap(teacher_source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+    plt.tight_layout(); plt.show()
+
+    # plot source UMAPs
+    source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
+    fig, axs = plt.subplots(1, len(source_umap_colors), figsize=(18, 5))
+    for i, color in enumerate(source_umap_colors):
+        sc.pl.umap(source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+    plt.tight_layout(); plt.show()
+
+    if args.target_model:
+
+        ## student target inference
+        target_rna_emb, target_atac_emb = run_inference(
+            target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
+        )
+        set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
+        print("  Target embeddings: shape {}".format(target_rna_emb.shape))
+
+        target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
+
+        compute_concat_umap(
+            target_concat_adata,
+            n_neighbors=10,
+            resolution=0.5,
+            deterministic=True,
+            random_state=deterministic_seed,
+        )
+        target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
+
+        # plot target UMAPs
+        target_umap_colors = ['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster']
+        fig, axs = plt.subplots(1, len(target_umap_colors), figsize=(18, 5))
+        for i, color in enumerate(target_umap_colors):
+            sc.pl.umap(target_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+        plt.tight_layout(); plt.show()
+
+    #%% Inference, all same model
+
+    model = teacher_source_mgate
+
+    ## (teacher) source inference
+    teacher_source_rna_emb, teacher_source_atac_emb = run_inference(
+        model, source_graph_tf, source_gp_tf, source_x1, source_x2, device
+    )
+    set_multigate_embeddings(source_rna, source_atac, teacher_source_rna_emb, teacher_source_atac_emb, key_added="MultiGATE_teacher")
+    print("  Teacher source embeddings: shape {}".format(teacher_source_rna_emb.shape))
+    
+    ## (student) source inference
+    source_rna_emb, source_atac_emb = run_inference(
+        model, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+    )
+    set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
+    print("  Source embeddings: shape {}".format(source_rna_emb.shape))
+
+    ## (target) inference
     target_rna_emb, target_atac_emb = run_inference(
-        target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
+        model, target_graph_tf, target_gp_tf, target_x1, target_x2, device
     )
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
-    # Plot source/target concat UMAPs with the same helper as training script.
     teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher")
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
 
-    ## compute UMAPs
     compute_concat_umap(
         teacher_source_concat_adata,
         n_neighbors=10,
@@ -955,32 +1032,19 @@ def main():
     compute_concat_umap(
         target_concat_adata,
         n_neighbors=10,
-        resolution=0.5,
+        resolution=1.5,
         deterministic=True,
         random_state=deterministic_seed,
     )
     target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
 
-    # plot teacher source UMAPs
-    teacher_source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
-    fig, axs = plt.subplots(1, len(teacher_source_umap_colors), figsize=(18, 5))
-    for i, color in enumerate(teacher_source_umap_colors):
-        sc.pl.umap(teacher_source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+    sc.pl.umap(teacher_source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+    sc.pl.umap(source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+    sc.pl.umap(target_concat_adata, color=['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
     plt.tight_layout(); plt.show()
 
-    # plot source UMAPs
-    source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
-    fig, axs = plt.subplots(1, len(source_umap_colors), figsize=(18, 5))
-    for i, color in enumerate(source_umap_colors):
-        sc.pl.umap(source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
-    plt.tight_layout(); plt.show()
-
-    # plot target UMAPs
-    target_umap_colors = ['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster']
-    fig, axs = plt.subplots(1, len(target_umap_colors), figsize=(18, 5))
-    for i, color in enumerate(target_umap_colors):
-        sc.pl.umap(target_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
-    plt.tight_layout(); plt.show()
 
     #%% AJIVE analysis
     from mvlearn.decomposition import AJIVE
@@ -1028,7 +1092,7 @@ def main():
     source_rna_emb_list = [X1, X2]
 
     ajive = AJIVE(
-        init_signal_ranks=[7, 10],
+        #init_signal_ranks=[7, 10],
         joint_rank=None,
         n_jobs=1)
 
@@ -1044,6 +1108,7 @@ def main():
                             cmap="RdBu")
                 plt.title(f"View {i}: {names[j]}")
 
+    ## plot AJIVE blocks
     plt.figure(figsize=[15, 10])
     plt.title('Different Views')
     individual_mats = ajive.individual_mats_
@@ -1056,7 +1121,10 @@ def main():
     import anndata as ad
     obs_index = np.concatenate([source_rna.obs_names, source_rna.obs_names])
     obs_df = pd.DataFrame(
-        {"teacher_or_student": (["teacher"] * source_rna.n_obs + ["student"] * source_rna.n_obs)},
+        {
+            "teacher_or_student": (["teacher"] * source_rna.n_obs + ["student"] * source_rna.n_obs),
+            "RNA_clusters": source_rna.obs["RNA_clusters"].tolist() + source_rna.obs["RNA_clusters"].tolist(),
+        },
         index=obs_index
     )
     concat_ajive_joint = ad.AnnData(
@@ -1093,13 +1161,13 @@ def main():
         random_state=deterministic_seed,
     )
 
-    sc.pl.umap(concat_ajive_joint, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
+    sc.pl.umap(concat_ajive_joint, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
     plt.tight_layout(); plt.show()
 
-    sc.pl.umap(concat_individual_mats, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
+    sc.pl.umap(concat_individual_mats, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
     plt.tight_layout(); plt.show()
 
-    sc.pl.umap(concat_residuals, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
+    sc.pl.umap(concat_residuals, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
     plt.tight_layout(); plt.show()
 
     teacher_individual_mat = concat_individual_mats[concat_individual_mats.obs["teacher_or_student"].eq("teacher")]

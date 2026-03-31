@@ -1327,13 +1327,15 @@ def log_stage2_artifacts_for_run(
             target_x1,
             target_x2,
         )
-        target_peak_gene_attention = stage2_target_embeddings[4][0] # target_rna.uns['MultiGATE_gene_peak_attention'][0]
         model_stage2 = stage2_trainer.mgate.state_dict()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            local_path = os.path.join(tmpdir, "target_peak_gene_attention.npz")
-            sp.save_npz(local_path, target_peak_gene_attention)
-            mlflow.log_artifact(local_path, artifact_path="matrices")
+
+            if not stage2_trainer.mgate.skip_gp_attention:
+                target_peak_gene_attention = stage2_target_embeddings[4][0] # target_rna.uns['MultiGATE_gene_peak_attention'][0]
+                local_path = os.path.join(tmpdir, "target_peak_gene_attention.npz")
+                sp.save_npz(local_path, target_peak_gene_attention)
+                mlflow.log_artifact(local_path, artifact_path="matrices")
 
             local_path = os.path.join(tmpdir, "model_stage2.pth")
             torch.save(model_stage2, local_path)
@@ -1610,7 +1612,6 @@ def main():
         weight_decay=0.0001,
         verbose=False,
         random_seed=2020,
-        skip_gp_attention=True,
     )
 
     source_a_t = source_prune_t = source_gp_t = source_x1_t = source_x2_t = None
@@ -2021,19 +2022,21 @@ def main():
             )
 
         # log stage-1 model artifacts and attention matrix
-        source_peak_gene_attention = source_embeddings[4][0] #peak_gene_attention = source_rna.uns['MultiGATE_gene_peak_attention'][0]
         model_stage1 = stage1_primary_trainer.mgate.state_dict()
         model_stage1_teacher = trainer.mgate.state_dict()
         model_stage1_student = student_trainer.mgate.state_dict() if effective_stage1_dual_source_kd else None
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            local_path = os.path.join(tmpdir, "source_peak_gene_attention.npz")
-            sp.save_npz(local_path, source_peak_gene_attention)
-            mlflow.log_artifact(local_path, artifact_path="matrices")
 
             local_path = os.path.join(tmpdir, "model_stage1.pth")
             torch.save(model_stage1, local_path)
             mlflow.log_artifact(local_path, artifact_path="models")
+
+            if not stage1_primary_trainer.mgate.skip_gp_attention:
+                source_peak_gene_attention = source_embeddings[4][0] #peak_gene_attention = source_rna.uns['MultiGATE_gene_peak_attention'][0]
+                local_path = os.path.join(tmpdir, "source_peak_gene_attention.npz")
+                sp.save_npz(local_path, source_peak_gene_attention)
+                mlflow.log_artifact(local_path, artifact_path="matrices")
 
             if effective_stage1_dual_source_kd:
                 local_path = os.path.join(tmpdir, "model_stage1_teacher.pth")
