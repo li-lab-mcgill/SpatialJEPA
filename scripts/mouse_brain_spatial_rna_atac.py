@@ -384,6 +384,7 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_anchor_m
         verbose=False,
         random_seed=0,
         config={"device": str(source_trainer.device)},
+        skip_gp_attention=source_trainer.mgate.skip_gp_attention,
     )
 
     if vgp_anchor_mode == "feature":
@@ -402,6 +403,44 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_anchor_m
             target_trainer.mgate.vgp1.zero_()
 
     return target_trainer
+
+
+def infer_source_and_zero_shot_target_embeddings(
+    source_trainer,
+    source_graph_tf,
+    source_gp_tf,
+    source_x1,
+    source_x2,
+    target_graph_tf,
+    target_gp_tf,
+    target_x1,
+    target_x2,
+    target_spot_num,
+    vgp_anchor_mode=None,
+):
+    target_trainer = build_zero_shot_target_trainer(
+        source_trainer,
+        target_spot_num,
+        vgp_anchor_mode=vgp_anchor_mode,
+    )
+    source_trainer.mgate.eval()
+    target_trainer.mgate.eval()
+    with torch.no_grad():
+        source_embeddings = source_trainer.infer(
+            source_graph_tf,
+            source_graph_tf,
+            source_gp_tf,
+            source_x1,
+            source_x2,
+        )
+        target_embeddings = target_trainer.infer(
+            target_graph_tf,
+            target_graph_tf,
+            target_gp_tf,
+            target_x1,
+            target_x2,
+        )
+    return source_embeddings, target_embeddings, target_trainer
 
 
 def pair_and_subsample_target(target_rna, target_atac, subsample_n, seed):
@@ -611,13 +650,14 @@ def compute_scib_metrics_for_domain(
     domain_name,
     label_key=None,
     scib_n_jobs=1,
+    embedding_key="MultiGATE",
 ):
     scib_backend = require_scib_backend()
     Benchmarker = scib_backend["Benchmarker"]
     BioConservation = scib_backend["BioConservation"]
     BatchCorrection = scib_backend["BatchCorrection"]
 
-    concat_adata = build_concat_adata_for_umap(rna_adata, atac_adata, embedding_key="MultiGATE")
+    concat_adata = build_concat_adata_for_umap(rna_adata, atac_adata, embedding_key=embedding_key)
     effective_label_key, label_mode = resolve_scib_labels(
         rna_adata=rna_adata,
         atac_adata=atac_adata,
@@ -821,9 +861,10 @@ def log_stage_umap_artifacts(
     target_atac,
     stage_label,
     log_mudata_umaps=False,
+    embedding_key="MultiGATE",
 ):
-    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
-    target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
+    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key=embedding_key)
+    target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key=embedding_key)
 
     compute_concat_umap(source_concat_adata, n_neighbors=10, resolution=1.5)
     compute_concat_umap(target_concat_adata, n_neighbors=10, resolution=1.5)
@@ -874,14 +915,14 @@ def log_stage_umap_artifacts(
         source_mdata = build_mudata_with_umap(
             source_rna,
             source_atac,
-            embedding_key="MultiGATE",
+            embedding_key=embedding_key,
             n_neighbors=10,
             resolution=1.5,
         )
         target_mdata = build_mudata_with_umap(
             target_rna,
             target_atac,
-            embedding_key="MultiGATE",
+            embedding_key=embedding_key,
             n_neighbors=10,
             resolution=1.5,
         )
@@ -1612,6 +1653,7 @@ def main():
         weight_decay=0.0001,
         verbose=False,
         random_seed=2020,
+        skip_gp_attention=True,
     )
 
     source_a_t = source_prune_t = source_gp_t = source_x1_t = source_x2_t = None
@@ -1625,6 +1667,7 @@ def main():
         )
 
     student_trainer = None
+    nonspatial_trainer = None
     source_student_graph_tf = None
     source_student_a_t = source_student_prune_t = source_student_gp_t = source_student_x1_t = source_student_x2_t = None
 
@@ -1658,6 +1701,21 @@ def main():
                 source_x1,
                 source_x2,
             )
+            nonspatial_trainer = MultiGATETrainer(
+                hidden_dims1=[source_x1.shape[1]] + hidden_dims,
+                hidden_dims2=[source_x2.shape[1]] + hidden_dims,
+                spot_num=source_x1.shape[0],
+                temp=1,
+                vgp_anchor_mode=effective_vgp_anchor_mode,
+                n_epochs=num_epochs,
+                lr=0.0001,
+                gradient_clipping=5,
+                nonlinear=True,
+                weight_decay=0.0001,
+                verbose=False,
+                random_seed=2022,
+                config={"device": str(trainer.device)},
+            )
 
     stage1_primary_source_graph_tf = source_student_graph_tf if effective_stage1_dual_source_kd else source_graph_tf
 
@@ -1689,6 +1747,10 @@ def main():
             )
 
         effective_vgp_anchor_mode = inferred_vgp_anchor_mode
+        if "skip_gp_attention" in cached_stage1_run_params:
+            stage1_primary_trainer.mgate.skip_gp_attention = (
+                str(cached_stage1_run_params["skip_gp_attention"]).lower() == "true"
+            )
         stage1_primary_model_name = cached_stage1_run_params.get(
             "stage1_primary_model",
             "student" if effective_stage1_dual_source_kd else "teacher",
@@ -1712,6 +1774,11 @@ def main():
                 effective_stage1_student_graph_type
             )
         )
+        if nonspatial_trainer is not None:
+            print(
+                "[Stage1 Non-Spatial] Enabled: auxiliary non-spatial model trains on the student graph "
+                "with teacher-style losses."
+            )
 
     if use_stage1_cache:
         print(
@@ -1814,6 +1881,8 @@ def main():
         mlflow.log_param("stage1_primary_model", stage1_primary_model_name)
         mlflow.log_param("stage1_teacher_graph", "spatial")
         mlflow.log_param("stage1_student_graph", effective_stage1_student_graph_type if effective_stage1_dual_source_kd else "NA")
+        mlflow.log_param("stage1_nonspatial_enabled", bool(nonspatial_trainer is not None))
+        mlflow.log_param("stage1_nonspatial_graph",effective_stage1_student_graph_type if nonspatial_trainer is not None else "NA",)
         mlflow.log_param("vgp_anchor_mode", effective_vgp_anchor_mode)
         mlflow.log_param("skip_gp_attention", trainer.mgate.skip_gp_attention)
         source_scib_label_mode_logged = False
@@ -1882,7 +1951,39 @@ def main():
                 del teacher_outputs, student_outputs
                 del teacher_clip_rna, teacher_clip_atac, student_clip_rna, student_clip_atac
                 del stage1_distill_loss
-                
+
+            if nonspatial_trainer is not None:
+                nonspatial_trainer.mgate.train()
+                nonspatial_loss = nonspatial_trainer.run_epoch(
+                    epoch,
+                    source_student_a_t,
+                    source_student_prune_t,
+                    source_student_gp_t,
+                    source_student_x1_t,
+                    source_student_x2_t,
+                )
+                mlflow.log_metric("stage1_nonspatial_train_loss", float(nonspatial_loss), step=epoch)
+                mlflow.log_metric(
+                    "stage1_nonspatial_train_loss_atac",
+                    float(nonspatial_trainer.loss_list_atac[-1]),
+                    step=epoch,
+                )
+                mlflow.log_metric(
+                    "stage1_nonspatial_train_loss_rna",
+                    float(nonspatial_trainer.loss_list_rna[-1]),
+                    step=epoch,
+                )
+                mlflow.log_metric(
+                    "stage1_nonspatial_train_loss_clip",
+                    float(nonspatial_trainer.loss_list_clip[-1]),
+                    step=epoch,
+                )
+                mlflow.log_metric(
+                    "stage1_nonspatial_train_loss_decorr",
+                    float(nonspatial_trainer.loss_list_deco[-1]),
+                    step=epoch,
+                )
+
             should_eval = (
                 ((epoch == 1) or (epoch % eval_every == 0) or (epoch == num_epochs))
                 and eval_every > 0
@@ -1891,96 +1992,132 @@ def main():
             if not should_eval:
                 continue
 
-            trainer_target = build_zero_shot_target_trainer(
-                stage1_primary_trainer,
-                target_rna.n_obs,
+            trainer_target = None
+            source_embeddings, target_embeddings, trainer_target = infer_source_and_zero_shot_target_embeddings(
+                source_trainer=stage1_primary_trainer,
+                source_graph_tf=stage1_primary_source_graph_tf,
+                source_gp_tf=source_gp_tf,
+                source_x1=source_x1,
+                source_x2=source_x2,
+                target_graph_tf=target_graph_tf,
+                target_gp_tf=target_gp_tf,
+                target_x1=target_x1,
+                target_x2=target_x2,
+                target_spot_num=target_rna.n_obs,
                 vgp_anchor_mode=effective_vgp_anchor_mode,
             )
+            set_multigate_embeddings(
+                source_rna,
+                source_atac,
+                source_embeddings[0],
+                source_embeddings[1],
+                key_added="MultiGATE",
+            )
+            set_multigate_embeddings(
+                target_rna,
+                target_atac,
+                target_embeddings[0],
+                target_embeddings[1],
+                key_added="MultiGATE",
+            )
 
-            stage1_primary_trainer.mgate.eval()
-            trainer_target.mgate.eval()
-            with torch.no_grad():
-
-                source_embeddings = stage1_primary_trainer.infer(
-                    stage1_primary_source_graph_tf,
-                    stage1_primary_source_graph_tf,
-                    source_gp_tf,
-                    source_x1,
-                    source_x2,
+            # compute and log scib metrics for source data
+            source_scib_metrics = compute_scib_metrics_for_domain(
+                rna_adata=source_rna,
+                atac_adata=source_atac,
+                domain_name="source",
+                label_key=args.source_label_key,
+                scib_n_jobs=args.scib_n_jobs,
+            )
+            log_scib_metrics(prefix="source", metrics=source_scib_metrics, step=epoch)
+            if not source_scib_label_mode_logged:
+                mlflow.log_param("source_scib_label_mode", source_scib_metrics["label_mode"])
+                source_scib_label_mode_logged = True
+            if not source_scib_effective_label_key_logged:
+                mlflow.log_param(
+                    "source_scib_effective_label_key",
+                    source_scib_metrics["effective_label_key"],
                 )
-                target_embeddings = trainer_target.infer(
-                    target_graph_tf,
-                    target_graph_tf,
-                    target_gp_tf,
-                    target_x1,
-                    target_x2,
+                source_scib_effective_label_key_logged = True
+
+            # compute and log scib metrics for target data
+            target_scib_metrics = compute_scib_metrics_for_domain(
+                rna_adata=target_rna,
+                atac_adata=target_atac,
+                domain_name="target",
+                label_key=args.target_label_key,
+                scib_n_jobs=args.scib_n_jobs,
+            )
+            log_scib_metrics(prefix="target", metrics=target_scib_metrics, step=epoch)
+
+            if not target_scib_label_mode_logged:
+                mlflow.log_param("target_scib_label_mode", target_scib_metrics["label_mode"])
+                target_scib_label_mode_logged = True
+            if not target_scib_effective_label_key_logged:
+                mlflow.log_param(
+                    "target_scib_effective_label_key",
+                    target_scib_metrics["effective_label_key"],
+                )
+                target_scib_effective_label_key_logged = True
+
+            # compute alignment metrics between source and target
+            mmd_value = compute_balanced_source_target_mmd(
+                source_rna.obsm["MultiGATE"],
+                source_atac.obsm["MultiGATE"],
+                target_rna.obsm["MultiGATE"],
+                target_atac.obsm["MultiGATE"],
+            )
+            mlflow.log_metric("stage1_source_target_balanced_mmd", mmd_value, step=epoch)
+
+            if nonspatial_trainer is not None:
+                nonspatial_target_trainer = None
+                nonspatial_source_embeddings, nonspatial_target_embeddings, nonspatial_target_trainer = (
+                    infer_source_and_zero_shot_target_embeddings(
+                        source_trainer=nonspatial_trainer,
+                        source_graph_tf=source_student_graph_tf,
+                        source_gp_tf=source_gp_tf,
+                        source_x1=source_x1,
+                        source_x2=source_x2,
+                        target_graph_tf=target_graph_tf,
+                        target_gp_tf=target_gp_tf,
+                        target_x1=target_x1,
+                        target_x2=target_x2,
+                        target_spot_num=target_rna.n_obs,
+                        vgp_anchor_mode=effective_vgp_anchor_mode,
+                    )
                 )
                 set_multigate_embeddings(
                     source_rna,
                     source_atac,
-                    source_embeddings[0],
-                    source_embeddings[1],
-                    key_added="MultiGATE",
+                    nonspatial_source_embeddings[0],
+                    nonspatial_source_embeddings[1],
+                    key_added="MultiGATE_nonspatial",
                 )
                 set_multigate_embeddings(
                     target_rna,
                     target_atac,
-                    target_embeddings[0],
-                    target_embeddings[1],
-                    key_added="MultiGATE",
+                    nonspatial_target_embeddings[0],
+                    nonspatial_target_embeddings[1],
+                    key_added="MultiGATE_nonspatial",
+                )
+                nonspatial_mmd_value = compute_balanced_source_target_mmd(
+                    source_rna.obsm["MultiGATE_nonspatial"],
+                    source_atac.obsm["MultiGATE_nonspatial"],
+                    target_rna.obsm["MultiGATE_nonspatial"],
+                    target_atac.obsm["MultiGATE_nonspatial"],
+                )
+                mlflow.log_metric(
+                    "stage1_nonspatial_source_target_balanced_mmd",
+                    nonspatial_mmd_value,
+                    step=epoch,
                 )
                 if epoch != num_epochs:
-                    del trainer_target, target_embeddings, source_embeddings
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    del nonspatial_target_trainer, nonspatial_target_embeddings, nonspatial_source_embeddings
 
-                # compute and log scib metrics for source data
-                source_scib_metrics = compute_scib_metrics_for_domain(
-                    rna_adata=source_rna,
-                    atac_adata=source_atac,
-                    domain_name="source",
-                    label_key=args.source_label_key,
-                    scib_n_jobs=args.scib_n_jobs,
-                )
-                log_scib_metrics(prefix="source", metrics=source_scib_metrics, step=epoch)
-                if not source_scib_label_mode_logged:
-                    mlflow.log_param("source_scib_label_mode", source_scib_metrics["label_mode"])
-                    source_scib_label_mode_logged = True
-                if not source_scib_effective_label_key_logged:
-                    mlflow.log_param(
-                        "source_scib_effective_label_key",
-                        source_scib_metrics["effective_label_key"],
-                    )
-                    source_scib_effective_label_key_logged = True
-
-                # compute and log scib metrics for target data
-                target_scib_metrics = compute_scib_metrics_for_domain(
-                    rna_adata=target_rna,
-                    atac_adata=target_atac,
-                    domain_name="target",
-                    label_key=args.target_label_key,
-                    scib_n_jobs=args.scib_n_jobs,
-                )
-                log_scib_metrics(prefix="target", metrics=target_scib_metrics, step=epoch)
-
-                if not target_scib_label_mode_logged:
-                    mlflow.log_param("target_scib_label_mode", target_scib_metrics["label_mode"])
-                    target_scib_label_mode_logged = True
-                if not target_scib_effective_label_key_logged:
-                    mlflow.log_param(
-                        "target_scib_effective_label_key",
-                        target_scib_metrics["effective_label_key"],
-                    )
-                    target_scib_effective_label_key_logged = True
-
-                # compute alignment metrics between source and target
-                mmd_value = compute_balanced_source_target_mmd(
-                    source_rna.obsm["MultiGATE"],
-                    source_atac.obsm["MultiGATE"],
-                    target_rna.obsm["MultiGATE"],
-                    target_atac.obsm["MultiGATE"],
-                )
-                mlflow.log_metric("stage1_source_target_balanced_mmd", mmd_value, step=epoch)
+            if epoch != num_epochs:
+                del trainer_target, target_embeddings, source_embeddings
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         if source_embeddings is None:
             raise RuntimeError("Stage-1 source embeddings were not computed before artifact logging.")
@@ -1996,21 +2133,34 @@ def main():
         )
 
         if effective_stage1_dual_source_kd:
-
-            trainer.mgate.eval()
-            teacher_source_embeddings = trainer.infer(
-                source_graph_tf,
-                source_graph_tf,
-                source_gp_tf,
-                source_x1,
-                source_x2,
+            teacher_source_embeddings, teacher_target_embeddings, teacher_target_trainer = (
+                infer_source_and_zero_shot_target_embeddings(
+                    source_trainer=trainer,
+                    source_graph_tf=source_graph_tf,
+                    source_gp_tf=source_gp_tf,
+                    source_x1=source_x1,
+                    source_x2=source_x2,
+                    target_graph_tf=target_graph_tf,
+                    target_gp_tf=target_gp_tf,
+                    target_x1=target_x1,
+                    target_x2=target_x2,
+                    target_spot_num=target_rna.n_obs,
+                    vgp_anchor_mode=effective_vgp_anchor_mode,
+                )
             )
             set_multigate_embeddings(
                 source_rna,
                 source_atac,
                 teacher_source_embeddings[0],
                 teacher_source_embeddings[1],
-                key_added="MultiGATE",
+                key_added="MultiGATE_teacher",
+            )
+            set_multigate_embeddings(
+                target_rna,
+                target_atac,
+                teacher_target_embeddings[0],
+                teacher_target_embeddings[1],
+                key_added="MultiGATE_teacher",
             )
             log_stage_umap_artifacts(
                 source_rna=source_rna,
@@ -2019,12 +2169,56 @@ def main():
                 target_atac=target_atac,
                 stage_label="stage1_teacher",
                 log_mudata_umaps=args.log_mudata_umaps,
+                embedding_key="MultiGATE_teacher",
             )
+            del teacher_target_trainer
+
+        if nonspatial_trainer is not None:
+            nonspatial_source_embeddings_final, nonspatial_target_embeddings_final, nonspatial_target_trainer_final = (
+                infer_source_and_zero_shot_target_embeddings(
+                    source_trainer=nonspatial_trainer,
+                    source_graph_tf=source_student_graph_tf,
+                    source_gp_tf=source_gp_tf,
+                    source_x1=source_x1,
+                    source_x2=source_x2,
+                    target_graph_tf=target_graph_tf,
+                    target_gp_tf=target_gp_tf,
+                    target_x1=target_x1,
+                    target_x2=target_x2,
+                    target_spot_num=target_rna.n_obs,
+                    vgp_anchor_mode=effective_vgp_anchor_mode,
+                )
+            )
+            set_multigate_embeddings(
+                source_rna,
+                source_atac,
+                nonspatial_source_embeddings_final[0],
+                nonspatial_source_embeddings_final[1],
+                key_added="MultiGATE_nonspatial",
+            )
+            set_multigate_embeddings(
+                target_rna,
+                target_atac,
+                nonspatial_target_embeddings_final[0],
+                nonspatial_target_embeddings_final[1],
+                key_added="MultiGATE_nonspatial",
+            )
+            log_stage_umap_artifacts(
+                source_rna=source_rna,
+                source_atac=source_atac,
+                target_rna=target_rna,
+                target_atac=target_atac,
+                stage_label="stage1_nonspatial",
+                log_mudata_umaps=args.log_mudata_umaps,
+                embedding_key="MultiGATE_nonspatial",
+            )
+            del nonspatial_target_trainer_final
 
         # log stage-1 model artifacts and attention matrix
         model_stage1 = stage1_primary_trainer.mgate.state_dict()
         model_stage1_teacher = trainer.mgate.state_dict()
         model_stage1_student = student_trainer.mgate.state_dict() if effective_stage1_dual_source_kd else None
+        model_stage1_nonspatial = nonspatial_trainer.mgate.state_dict() if nonspatial_trainer is not None else None
 
         with tempfile.TemporaryDirectory() as tmpdir:
 
@@ -2046,6 +2240,17 @@ def main():
                 local_path = os.path.join(tmpdir, "model_stage1_student.pth")
                 torch.save(model_stage1_student, local_path)
                 mlflow.log_artifact(local_path, artifact_path="models")
+
+            if model_stage1_nonspatial is not None:
+                local_path = os.path.join(tmpdir, "model_stage1_nonspatial.pth")
+                torch.save(model_stage1_nonspatial, local_path)
+                mlflow.log_artifact(local_path, artifact_path="models")
+
+                if not nonspatial_trainer.mgate.skip_gp_attention:
+                    source_peak_gene_attention_nonspatial = nonspatial_source_embeddings_final[4][0]
+                    local_path = os.path.join(tmpdir, "source_peak_gene_attention_nonspatial.npz")
+                    sp.save_npz(local_path, source_peak_gene_attention_nonspatial)
+                    mlflow.log_artifact(local_path, artifact_path="matrices")
 
         #%% stage 2
         if args.stage2_epochs > 0:

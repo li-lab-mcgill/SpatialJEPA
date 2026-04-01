@@ -619,6 +619,9 @@ def main():
     print("Device:", device, "(deterministic mode)")
 
     #%% ── MLflow setup ────────────────────────────────────────────────────────
+    #args.run_name = '20260331_105802'
+    #args.stage2_run_name = '20260331_105802_stage2_20260331_122453'
+
     setup_mlflow_tracking()
     client = MlflowClient()
     run_id = resolve_run_id_from_name(client, args.run_name)
@@ -988,7 +991,7 @@ def main():
 
     #%% Inference, all same model
 
-    model = teacher_source_mgate
+    model = target_mgate
 
     ## (teacher) source inference
     teacher_source_rna_emb, teacher_source_atac_emb = run_inference(
@@ -1057,7 +1060,7 @@ def main():
     )    
     ## non-spatial source inference
     student_non_spatial_source_rna_emb, student_non_spatial_source_atac_emb = run_inference(
-        teacher_source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+        source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
 
     ## AJIVE analysis
