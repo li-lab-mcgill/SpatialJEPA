@@ -120,6 +120,23 @@ class GraphInputBundle:
     x1: pd.DataFrame
     x2: pd.DataFrame
 
+    def __repr__(self) -> str:
+        def _sparse_tf_summary(tf: Tuple[Any, Any, Any]) -> str:
+            if tf is None or len(tf) < 3:
+                return "invalid"
+            shape = tf[2]
+            n_edges = int(getattr(tf[0], "shape", [0])[0]) if tf[0] is not None else 0
+            return "edges={}, shape={}".format(n_edges, shape)
+
+        return (
+            "GraphInputBundle(graph_tf=({}), gp_tf=({}), x1.shape={}, x2.shape={})".format(
+                _sparse_tf_summary(self.graph_tf),
+                _sparse_tf_summary(self.gp_tf),
+                tuple(self.x1.shape),
+                tuple(self.x2.shape),
+            )
+        )
+
 
 @dataclass
 class GraphBundle:
@@ -128,6 +145,17 @@ class GraphBundle:
     bp_width: int = 400
     graph_type: str = "ATAC"
     protein_value: float = 0.001
+
+    def __repr__(self) -> str:
+        return (
+            "GraphBundle(bp_width={}, graph_type={}, protein_value={}, source={}, target={})".format(
+                self.bp_width,
+                self.graph_type,
+                self.protein_value,
+                self.source,
+                self.target,
+            )
+        )
 
 
 @dataclass
@@ -1768,7 +1796,7 @@ def build_graph_bundle(data_bundle, bp_width=400, graph_type="ATAC", protein_val
     )
 
 
-def create_multigate_trainer(graph_inputs, hidden_dims, n_epochs, vgp_anchor_mode, random_seed, skip_gp_attention=False, device=None):
+def create_multigate_trainer(graph_inputs, hidden_dims, n_epochs, vgp_anchor_mode, random_seed, skip_gp_attention=True, device=None):
     trainer_kwargs = {
         "hidden_dims1": [graph_inputs.x1.shape[1]] + hidden_dims,
         "hidden_dims2": [graph_inputs.x2.shape[1]] + hidden_dims,
