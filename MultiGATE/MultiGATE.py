@@ -1,125 +1,164 @@
-import tensorflow.compat.v1 as tf
-tf.disable_v2_behavior()
-import scipy.sparse as sp
 import numpy as np
-from .model_MultiGATE import MGATE
+import scipy.sparse as sp
+import torch
 from tqdm import tqdm
 
-class MultiGATE():
+from .model_MultiGATE import MGATE
 
-    def __init__(self, hidden_dims1, hidden_dims2, spot_num, temp, n_epochs=500, lr=0.0001,
-                 gradient_clipping=5, nonlinear=True, weight_decay=0.0001,
-                 verbose=False, random_seed=2020, config=None):
+
+class MultiGATE(object):
+
+    def __init__(
+        self,
+        hidden_dims1,
+        hidden_dims2,
+        spot_num,
+        temp,
+        vgp_anchor_mode="spot",
+        n_epochs=500,
+        lr=0.0001,
+        gradient_clipping=5,
+        nonlinear=True,
+        weight_decay=0.0001,
+        verbose=False,
+        random_seed=2020,
+        config=None,
+        skip_gp_attention=True,
+    ):
         np.random.seed(random_seed)
-        tf.set_random_seed(random_seed)
+        torch.manual_seed(random_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(random_seed)
+
         self.loss_list_rna = []
         self.loss_list_atac = []
         self.loss_list = []
         self.loss_list_clip = []
-        self.weight_decay_loss_list = []
+        self.loss_list_deco = []
+        
         self.lr = lr
         self.n_epochs = n_epochs
         self.gradient_clipping = gradient_clipping
-        self.build_placeholders()
         self.verbose = verbose
         self.config = config
-        
-        self.temp = temp
-        self.mgate = MGATE(hidden_dims1, hidden_dims2, spot_num, temp, nonlinear, weight_decay)
-        self.loss, self.loss_rna, self.loss_atac, self.weight_decay_loss, self.clip_loss, self.H1, self.H2, self.C1, \
-        self.C2, self.Cgp, self.ReX1, self.ReX2 = self.mgate(self.A, self.prune_A, self.GP, self.X1, self.X2)
-        self.optimize(self.loss)
-        self.build_session()
-        # self.hidden_dims = hidden_dims
 
-    def build_placeholders(self):
-        self.A = tf.sparse_placeholder(dtype=tf.float32)
-        self.prune_A = tf.sparse_placeholder(dtype=tf.float32)
-        self.GP = tf.sparse_placeholder(dtype=tf.float32)
-        self.X1 = tf.placeholder(dtype=tf.float32)
-        self.X2 = tf.placeholder(dtype=tf.float32)
+        self.device = self._resolve_device(config)
+        self.mgate = MGATE(
+            hidden_dims1=hidden_dims1,
+            hidden_dims2=hidden_dims2,
+            spot_num=spot_num,
+            temp=temp,
+            nonlinear=nonlinear,
+            vgp_anchor_mode=vgp_anchor_mode,
+            skip_gp_attention=skip_gp_attention,
+        ).to(self.device)
+        self.optimizer = torch.optim.Adam(self.mgate.parameters(), lr=self.lr, weight_decay=weight_decay)
 
-    def build_session(self, gpu=True):
-        if self.config is not None:
-            # Use the provided configuration
-            config = self.config
+    def _resolve_device(self, config):
+        if isinstance(config, dict) and config.get("device") is not None:
+            return torch.device(config["device"])
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _as_dense_tensor(self, x):
+        values = x.values if hasattr(x, "values") else np.asarray(x)
+        return torch.as_tensor(values, dtype=torch.float32, device=self.device)
+
+    def _as_sparse_tensor(self, graph):
+        if isinstance(graph, torch.Tensor):
+            if not graph.is_sparse:
+                raise TypeError("Expected sparse tensor for graph input")
+            return graph.coalesce().to(self.device)
+
+        if sp.isspmatrix(graph):
+            graph = graph.tocoo()
+            indices = np.vstack((graph.row, graph.col))
+            values = graph.data
+            shape = graph.shape
+        elif isinstance(graph, tuple) and len(graph) == 3:
+            indices, values, shape = graph
+            indices = np.asarray(indices)
+            if indices.ndim != 2:
+                raise ValueError("Graph indices must be 2D")
+            if indices.shape[0] == 2:
+                pass
+            elif indices.shape[1] == 2:
+                indices = indices.T
+            else:
+                raise ValueError("Graph indices should have shape (2, E) or (E, 2)")
         else:
-            # Use default configuration
-            config = tf.ConfigProto()
-            config.gpu_options.allow_growth = True
-            # Add A100 compatibility options
-            config.gpu_options.per_process_gpu_memory_fraction = 0.7
-            config.graph_options.rewrite_options.memory_optimization = True
-            config.graph_options.rewrite_options.arithmetic_optimization = True
-            
-        if gpu == False:
-            config.intra_op_parallelism_threads = 0
-            config.inter_op_parallelism_threads = 0
-        self.session = tf.Session(config=config)
-        self.session.run([tf.global_variables_initializer(), tf.local_variables_initializer()])
+            raise TypeError("Unsupported graph format: {}".format(type(graph)))
 
-    def optimize(self, loss):
-        optimizer = tf.train.AdamOptimizer(learning_rate=self.lr)
-        gradients, variables = zip(*optimizer.compute_gradients(loss))
-        gradients, _ = tf.clip_by_global_norm(gradients, self.gradient_clipping)
-        self.train_op = optimizer.apply_gradients(zip(gradients, variables))
+        indices_t = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        values_t = torch.as_tensor(values, dtype=torch.float32, device=self.device)
+        sparse_t = torch.sparse_coo_tensor(indices_t, values_t, torch.Size(shape), device=self.device)
+        return sparse_t.coalesce()
+
+    def _prepare_inputs(self, A, prune_A, GP, X1, X2):
+        return (
+            self._as_sparse_tensor(A),
+            self._as_sparse_tensor(prune_A),
+            self._as_sparse_tensor(GP),
+            self._as_dense_tensor(X1),
+            self._as_dense_tensor(X2),
+        )
 
     def __call__(self, A, prune_A, GP, X1, X2):
-        # for epoch in tqdm(range(self.n_epochs)):
-        #     self.run_epoch(epoch, A, prune_A, GP, X1, X2)
-        
+        A_t, prune_A_t, GP_t, X1_t, X2_t = self._prepare_inputs(A, prune_A, GP, X1, X2)
+
         with tqdm(total=self.n_epochs, desc="Epoch Progress", unit="epoch") as pbar:
             for epoch in range(self.n_epochs):
-                loss = self.run_epoch(epoch, A, prune_A, GP, X1, X2)
+                loss = self.run_epoch(epoch, A_t, prune_A_t, GP_t, X1_t, X2_t)
                 pbar.update(1)
                 if self.verbose:
-                    tqdm.write(f"Epoch: {epoch}, Loss: {loss:.4f}")
-                    
+                    tqdm.write("Epoch: {}, Loss: {:.4f}".format(epoch, loss))
+
     def run_epoch(self, epoch, A, prune_A, GP, X1, X2):
-        try:
-            loss, loss_rna, loss_atac, weight_decay_loss, clip_loss, _ = self.session.run([self.loss, self.loss_rna, self.loss_atac, self.weight_decay_loss, self.clip_loss, self.train_op],
-                                             feed_dict={self.A: A,
-                                                        self.prune_A: prune_A,
-                                                        self.GP: GP,
-                                                        self.X1: X1,
-                                                        self.X2: X2})
-            self.loss_list.append(loss)
-            self.loss_list_atac.append(loss_atac)
-            self.loss_list_rna.append(loss_rna)
-            self.loss_list_clip.append(clip_loss)
-            self.weight_decay_loss_list.append(weight_decay_loss)
-            return loss
-        except tf.errors.InternalError as e:
-            if "Blas GEMM launch failed" in str(e):
-                print("BLAS GEMM operation failed. Attempting with smaller batch or reduced precision...")
-                # Try to continue with a gentler operation approach
-                with tf.device('/cpu:0'):  # Fall back to CPU if GEMM fails on GPU
-                    loss, loss_rna, loss_atac, weight_decay_loss, clip_loss, _ = self.session.run([self.loss, self.loss_rna, self.loss_atac, self.weight_decay_loss, self.clip_loss, self.train_op],
-                                                 feed_dict={self.A: A,
-                                                            self.prune_A: prune_A,
-                                                            self.GP: GP,
-                                                            self.X1: X1,
-                                                            self.X2: X2})
-                    self.loss_list.append(loss)
-                    self.loss_list_atac.append(loss_atac)
-                    self.loss_list_rna.append(loss_rna)
-                    self.loss_list_clip.append(clip_loss)
-                    self.weight_decay_loss_list.append(weight_decay_loss)
-                    return loss
-            else:
-                # If it's not a BLAS error, re-raise
-                raise
+        del epoch
+        if not (isinstance(A, torch.Tensor) and isinstance(X1, torch.Tensor)):
+            A, prune_A, GP, X1, X2 = self._prepare_inputs(A, prune_A, GP, X1, X2)
+
+        self.mgate.train()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        outputs = self.mgate(A, prune_A, GP, X1, X2)
+        loss, loss_rna, loss_atac, decorr_loss, clip_loss = outputs[:5]
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.mgate.parameters(), self.gradient_clipping)
+        self.optimizer.step()
+
+        loss_scalar = float(loss.detach().cpu().item())
+        self.loss_list.append(loss_scalar)
+        self.loss_list_atac.append(float(loss_atac.detach().cpu().item()))
+        self.loss_list_rna.append(float(loss_rna.detach().cpu().item()))
+        self.loss_list_clip.append(float(clip_loss.detach().cpu().item()))
+        self.loss_list_deco.append(float(decorr_loss.detach().cpu().item()))
+        return loss_scalar
 
     def infer(self, A, prune_A, GP, X1, X2):
-        H1, H2, C1, C2, Cgp, ReX1, ReX2 = self.session.run([self.H1, self.H2, self.C1, self.C2, self.Cgp, self.ReX1, self.ReX2],
-                           feed_dict={self.A: A,
-                                      self.prune_A: prune_A,
-                                      self.GP: GP,
-                                      self.X1: X1,
-                                      self.X2: X2})
+        A_t, prune_A_t, GP_t, X1_t, X2_t = self._prepare_inputs(A, prune_A, GP, X1, X2)
 
-        return H1, H2, self.Conbine_Atten_l(C1), self.Conbine_Atten_l(C2), self.Conbine_Atten_l(Cgp), self.loss_list, ReX1, ReX2
+        self.mgate.eval()
+        with torch.no_grad():
+            H1, H2, C1, C2, Cgp, ReX1, ReX2 = self.mgate(A_t, prune_A_t, GP_t, X1_t, X2_t)[5:]
 
-    def Conbine_Atten_l(self, input):
-        return [sp.coo_matrix((input[layer][1], (input[layer][0][:, 0], input[layer][0][:, 1])), shape=(input[layer][2][0], input[layer][2][1])) for layer in input]
-   
+        return (
+            H1.detach().cpu().numpy(),
+            H2.detach().cpu().numpy(),
+            self.Conbine_Atten_l(C1),
+            self.Conbine_Atten_l(C2),
+            self.Conbine_Atten_l(Cgp),
+            self.loss_list,
+            ReX1.detach().cpu().numpy(),
+            ReX2.detach().cpu().numpy(),
+        )
+
+    def Conbine_Atten_l(self, input_att):
+        attentions = []
+        for layer in sorted(input_att):
+            tensor = input_att[layer].coalesce()
+            idx = tensor.indices().detach().cpu().numpy()
+            values = tensor.values().detach().cpu().numpy()
+            shape = tuple(tensor.shape)
+            attentions.append(sp.coo_matrix((values, (idx[0], idx[1])), shape=shape))
+        return attentions
