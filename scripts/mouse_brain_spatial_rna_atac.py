@@ -5,8 +5,10 @@ import json
 import os
 import shutil
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime
 from pprint import pprint
+from typing import Any, Dict, Optional, Tuple
 
 # Python 3.7 compatibility for muon/mudata (they use typing.Literal in newer versions)
 if sys.version_info < (3, 8):
@@ -15,39 +17,68 @@ if sys.version_info < (3, 8):
 
     typing.Literal = Literal
 
-#%% load env variables from .env file
 from dotenv import dotenv_values, load_dotenv
-load_dotenv(dotenv_path="/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env")
-print("Loaded environment variables from .env or env:", end="\n\n")
-pprint(dotenv_values("/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env"))
+ENV_FILE_PATH = "/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env"
+DEFAULT_SOURCE_LABEL_KEY = "RNA_clusters"
+DEFAULT_TARGET_LABEL_KEY = "arc_gex_kmeans_5_clusters_Cluster"
 
-if os.getenv("DATAPATH") is None:
-    raise EnvironmentError(
-        "DATAPATH is not set. Export DATAPATH to the base data directory, e.g. "
-        "'/home/mcb/users/dmannk/BAKLAVA_base/data'."
-    )
+BASE_PATH = None
+REPO_ROOT = None
+MultiGATE = None
+MultiGATETrainer = None
 
-if shutil.which("bedtools") is None:
-    raise EnvironmentError(
-        "bedtools is required for Cal_gene_peak_Net_new. Install bedtools and ensure sortBed is available on PATH."
-    )
 
-base_path = os.path.join(os.getenv("DATAPATH"), "aligned_data")
+def bootstrap_runtime():
+    global BASE_PATH, REPO_ROOT, MultiGATE, MultiGATETrainer
 
-# Ensure this script imports the local repo package, not site-packages.
-BAKLAVA_BASE_DIR = os.getenv("BAKLAVA_BASE_DIR")
-REPO_ROOT = os.path.join(BAKLAVA_BASE_DIR, "MultiGATE")
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+    load_dotenv(dotenv_path=ENV_FILE_PATH)
+    print("Loaded environment variables from .env or env:", end="\n\n")
+    pprint(dotenv_values(ENV_FILE_PATH))
 
-# Make sure env-local binaries (e.g., bedtools) are discoverable when running
-# with an explicit python path instead of an activated conda shell.
-env_bin = os.path.dirname(sys.executable)
-current_path_entries = os.environ.get("PATH", "").split(os.pathsep)
-if env_bin and env_bin not in current_path_entries:
-    os.environ["PATH"] = env_bin + os.pathsep + os.environ.get("PATH", "")
+    datapath = os.getenv("DATAPATH")
+    if datapath is None:
+        raise EnvironmentError(
+            "DATAPATH is not set. Export DATAPATH to the base data directory, e.g. "
+            "'/home/mcb/users/dmannk/BAKLAVA_base/data'."
+        )
 
-#os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    if shutil.which("bedtools") is None:
+        raise EnvironmentError(
+            "bedtools is required for Cal_gene_peak_Net_new. Install bedtools and ensure sortBed is available on PATH."
+        )
+
+    baklava_base_dir = os.getenv("BAKLAVA_BASE_DIR")
+    if baklava_base_dir is None:
+        raise EnvironmentError(
+            "BAKLAVA_BASE_DIR is not set. Export BAKLAVA_BASE_DIR to the base repo directory, e.g. "
+            "'/home/mcb/users/dmannk/BAKLAVA_base'."
+        )
+
+    REPO_ROOT = os.path.join(baklava_base_dir, "MultiGATE")
+    if REPO_ROOT not in sys.path:
+        sys.path.insert(0, REPO_ROOT)
+
+    # Make sure env-local binaries (e.g., bedtools) are discoverable when running
+    # with an explicit python path instead of an activated conda shell.
+    env_bin = os.path.dirname(sys.executable)
+    current_path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    if env_bin and env_bin not in current_path_entries:
+        os.environ["PATH"] = env_bin + os.pathsep + os.environ.get("PATH", "")
+
+    if MultiGATE is None or MultiGATETrainer is None:
+        import MultiGATE as multigate_module
+        from MultiGATE.MultiGATE import MultiGATE as multigate_trainer_cls
+
+        MultiGATE = multigate_module
+        MultiGATETrainer = multigate_trainer_cls
+        print("Using MultiGATE module:", MultiGATE.__file__)
+
+    BASE_PATH = os.path.join(datapath, "aligned_data")
+
+
+def require_runtime_bootstrap():
+    if BASE_PATH is None or REPO_ROOT is None or MultiGATE is None or MultiGATETrainer is None:
+        raise RuntimeError("bootstrap_runtime() must be called before training or data preparation.")
 
 import matplotlib.pyplot as plt
 import mlflow
@@ -65,12 +96,62 @@ from ignite.metrics import MaximumMeanDiscrepancy as MMD
 from tqdm import tqdm
 import tempfile
 
-import MultiGATE
-from MultiGATE.MultiGATE import MultiGATE as MultiGATETrainer
-print("Using MultiGATE module:", MultiGATE.__file__)
-
 import warnings
 warnings.filterwarnings("ignore")
+
+
+@dataclass
+class DomainData:
+    rna: AnnData
+    atac: AnnData
+    label_key: Optional[str] = None
+
+
+@dataclass
+class DataBundle:
+    source: DomainData
+    target: DomainData
+
+
+@dataclass
+class GraphInputBundle:
+    graph_tf: Tuple[Any, Any, Any]
+    gp_tf: Tuple[Any, Any, Any]
+    x1: pd.DataFrame
+    x2: pd.DataFrame
+
+
+@dataclass
+class GraphBundle:
+    source: GraphInputBundle
+    target: GraphInputBundle
+    bp_width: int = 400
+    graph_type: str = "ATAC"
+    protein_value: float = 0.001
+
+
+@dataclass
+class Stage1CacheConfig:
+    use_cache: bool
+    run_name: Optional[str] = None
+    run_id: Optional[str] = None
+    run_params: Dict[str, Any] = field(default_factory=dict)
+    dual_source_kd: bool = False
+    student_graph_type: str = "identity"
+    vgp_anchor_mode: str = "feature"
+
+
+@dataclass
+class Stage1TrainerBundle:
+    teacher: Any
+    student: Optional[Any]
+    nonspatial: Optional[Any]
+    source_inputs_tensors: Optional[Tuple[Any, Any, Any, Any, Any]]
+    source_student_inputs_tensors: Optional[Tuple[Any, Any, Any, Any, Any]]
+    source_student_graph_tf: Optional[Tuple[Any, Any, Any]]
+    primary: Any
+    primary_model_name: str
+    primary_source_graph_tf: Tuple[Any, Any, Any]
 
 
 def parse_args(notebook: bool = False):
@@ -181,10 +262,15 @@ def parse_args(notebook: bool = False):
         help="Type of graph to use for MultiGATE.",
     )
     parser.add_argument(
+        "--stage1-mlflow-cache-run-name",
         "--stage1-mlflow-cache-dir",
+        dest="stage1_mlflow_cache_run_name",
         type=str,
         default=None,
-        help="MLflow run name to load stage-1 model artifacts from and reuse as the parent run.",
+        help=(
+            "MLflow run name to load stage-1 model artifacts from and reuse as the parent run. "
+            "--stage1-mlflow-cache-dir is kept as a backward-compatible alias."
+        ),
     )
     parser.add_argument(
         "--switcharoo",
@@ -1333,6 +1419,24 @@ def run_stage2_distillation(
     return student_trainer, stage2_run_id
 
 
+def log_torch_state_dict_artifacts(tmpdir, state_dicts):
+    for artifact_name, state_dict in state_dicts.items():
+        if state_dict is None:
+            continue
+        local_path = os.path.join(tmpdir, artifact_name)
+        torch.save(state_dict, local_path)
+        mlflow.log_artifact(local_path, artifact_path="models")
+
+
+def log_sparse_matrix_artifacts(tmpdir, matrices):
+    for artifact_name, matrix in matrices.items():
+        if matrix is None:
+            continue
+        local_path = os.path.join(tmpdir, artifact_name)
+        sp.save_npz(local_path, matrix)
+        mlflow.log_artifact(local_path, artifact_path="matrices")
+
+
 def log_stage2_artifacts_for_run(
     stage2_run_id,
     stage2_trainer,
@@ -1350,7 +1454,6 @@ def log_stage2_artifacts_for_run(
         raise ValueError("stage2_run_id is required to log stage-2 artifacts.")
 
     with mlflow.start_run(run_id=stage2_run_id, nested=True):
-        # log stage-2 UMAP artifacts
         log_stage_umap_artifacts(
             source_rna=source_rna,
             source_atac=source_atac,
@@ -1360,7 +1463,6 @@ def log_stage2_artifacts_for_run(
             log_mudata_umaps=log_mudata_umaps,
         )
 
-        # log stage-2 model artifacts and attention matrix
         stage2_target_embeddings = stage2_trainer.infer(
             target_graph_tf,
             target_graph_tf,
@@ -1368,23 +1470,25 @@ def log_stage2_artifacts_for_run(
             target_x1,
             target_x2,
         )
-        model_stage2 = stage2_trainer.mgate.state_dict()
-
         with tempfile.TemporaryDirectory() as tmpdir:
-
+            log_torch_state_dict_artifacts(
+                tmpdir,
+                {
+                    "model_stage2.pth": stage2_trainer.mgate.state_dict(),
+                },
+            )
             if not stage2_trainer.mgate.skip_gp_attention:
-                target_peak_gene_attention = stage2_target_embeddings[4][0] # target_rna.uns['MultiGATE_gene_peak_attention'][0]
-                local_path = os.path.join(tmpdir, "target_peak_gene_attention.npz")
-                sp.save_npz(local_path, target_peak_gene_attention)
-                mlflow.log_artifact(local_path, artifact_path="matrices")
-
-            local_path = os.path.join(tmpdir, "model_stage2.pth")
-            torch.save(model_stage2, local_path)
-            mlflow.log_artifact(local_path, artifact_path="models")
-
+                log_sparse_matrix_artifacts(
+                    tmpdir,
+                    {
+                        "target_peak_gene_attention.npz": stage2_target_embeddings[4][0],
+                    },
+                )
 
 
 def setup_mlflow():
+    require_runtime_bootstrap()
+
     # Default to a clean tracking location under BAKLAVA_base so we don't
     # accidentally write into other repos' local `mlruns/` directories.
     baklava_base_dir = os.path.dirname(REPO_ROOT)
@@ -1427,29 +1531,26 @@ def setup_mlflow():
     mlflow.set_experiment(experiment_name=experiment_name)
     return experiment_id
 
+
 def is_notebook():
     try:
         from IPython import get_ipython
+
         shell = get_ipython().__class__.__name__
         if shell == "ZMQInteractiveShell":
-            # Jupyter notebook or qtconsole
             return True
-        elif shell == "TerminalInteractiveShell":
-            # Terminal running IPython
+        if shell == "TerminalInteractiveShell":
             return False
-        else:
-            # Other types
-            return False
+        return False
     except Exception:
         return False
 
-#%%
-def main():
-#%%
-    NOTEBOOK = is_notebook()
-    args = parse_args(notebook=NOTEBOOK)
+
+def validate_args(args):
     if args.target_subsample_n <= 0:
         raise ValueError("--target-subsample-n must be a positive integer.")
+    if args.stage1_epochs <= 0:
+        raise ValueError("--stage1-epochs must be a positive integer.")
     if args.stage2_epochs < 0:
         raise ValueError("--stage2-epochs must be a non-negative integer.")
     if args.lambda_kd < 0:
@@ -1461,81 +1562,109 @@ def main():
     if args.scib_n_jobs <= 0:
         raise ValueError("--scib-n-jobs must be a positive integer.")
 
-    # Fail fast if scib-metrics backend is not available.
-    require_scib_backend()
 
-    experiment_id = setup_mlflow()
-    eval_every = 3000 # set to -1 for very basic debugging only, since will skip the incorporation of MultiGATE embeddings into the anndatas
-    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+def resolve_stage1_cache_config(args, mlflow_client):
+    cache_config = Stage1CacheConfig(
+        use_cache=args.stage1_mlflow_cache_run_name is not None,
+        run_name=args.stage1_mlflow_cache_run_name,
+        dual_source_kd=bool(args.stage1_dual_source_kd),
+        student_graph_type=args.spatial_graph_type,
+        vgp_anchor_mode=args.vgp_anchor_mode,
+    )
 
-    mlflow_client = MlflowClient()
-    use_stage1_cache = args.stage1_mlflow_cache_dir is not None
-    cached_stage1_run_name = args.stage1_mlflow_cache_dir
-    cached_stage1_run_id = None
-    cached_stage1_run_params = {}
+    if cache_config.use_cache:
+        cache_config.run_id = resolve_run_id_from_name(mlflow_client, cache_config.run_name)
+        cache_config.run_params = load_run_params(mlflow_client, cache_config.run_id, cache_config.run_name)
 
-    effective_stage1_dual_source_kd = bool(args.stage1_dual_source_kd)
-    effective_stage1_student_graph_type = args.spatial_graph_type
-    effective_vgp_anchor_mode = args.vgp_anchor_mode
-
-    if use_stage1_cache:
-        cached_stage1_run_id = resolve_run_id_from_name(mlflow_client, cached_stage1_run_name)
-        cached_stage1_run_params = load_run_params(mlflow_client, cached_stage1_run_id, cached_stage1_run_name)
-
-        effective_stage1_dual_source_kd = (
-            str(cached_stage1_run_params.get("stage1_dual_source_kd", "False")).lower() == "true"
+        cache_config.dual_source_kd = (
+            str(cache_config.run_params.get("stage1_dual_source_kd", "False")).lower() == "true"
         )
-        effective_stage1_student_graph_type = cached_stage1_run_params.get("stage1_student_graph", "identity")
-        if effective_stage1_student_graph_type in {"NA", "na", "None", "none", "", None}:
-            effective_stage1_student_graph_type = "identity"
+        cache_config.student_graph_type = cache_config.run_params.get("stage1_student_graph", "identity")
+        if cache_config.student_graph_type in {"NA", "na", "None", "none", "", None}:
+            cache_config.student_graph_type = "identity"
 
-        cached_vgp_anchor_mode = cached_stage1_run_params.get("vgp_anchor_mode")
+        cached_vgp_anchor_mode = cache_config.run_params.get("vgp_anchor_mode")
         if cached_vgp_anchor_mode in {"spot", "feature"}:
-            effective_vgp_anchor_mode = cached_vgp_anchor_mode
+            cache_config.vgp_anchor_mode = cached_vgp_anchor_mode
 
         print(
             "[Stage1 Cache] run='{}' (id={}), dual_source_kd={}, student_graph={}, vgp_anchor_mode={}".format(
-                cached_stage1_run_name,
-                cached_stage1_run_id,
-                effective_stage1_dual_source_kd,
-                effective_stage1_student_graph_type,
-                effective_vgp_anchor_mode,
+                cache_config.run_name,
+                cache_config.run_id,
+                cache_config.dual_source_kd,
+                cache_config.student_graph_type,
+                cache_config.vgp_anchor_mode,
             )
         )
 
-    if effective_stage1_dual_source_kd and effective_stage1_student_graph_type == "tangram":
+    if cache_config.dual_source_kd and cache_config.student_graph_type == "tangram":
         raise ValueError(
             "Stage-1 dual-source KD with tangram student graph is not supported for source training. "
             "Use spatial, knn, or identity."
         )
 
-    #%% load data
+    return cache_config
 
-    # SOURCE
-    source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned.h5ad"))
-    source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned.h5ad"))
 
+def resolve_domain_label_key(adata, requested_key, default_key, domain_name):
+    if requested_key is not None:
+        if requested_key in adata.obs.columns:
+            adata.obs[requested_key] = adata.obs[requested_key].astype("category")
+            return requested_key
+        warnings.warn(
+            "Requested {} label key '{}' not found. Falling back to default key '{}' if available.".format(
+                domain_name,
+                requested_key,
+                default_key,
+            )
+        )
+
+    if default_key in adata.obs.columns:
+        adata.obs[default_key] = adata.obs[default_key].astype("category")
+        return default_key
+
+    warnings.warn(
+        "No usable {} label key found (requested='{}', default='{}'). scIB will fall back to pseudo labels.".format(
+            domain_name,
+            requested_key,
+            default_key,
+        )
+    )
+    return None
+
+
+def load_and_prepare_data_bundle(args):
+    require_runtime_bootstrap()
+
+    source_rna = sc.read_h5ad(os.path.join(BASE_PATH, "source_rna_aligned.h5ad"))
+    source_atac = sc.read_h5ad(os.path.join(BASE_PATH, "source_atac_aligned.h5ad"))
     source_rna.obsm["spatial"] = source_rna.obsm["spatial"] * -1
     source_atac.obsm["spatial"] = source_atac.obsm["spatial"] * -1
 
-    # TARGET
-    target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
-    target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
+    target_rna = sc.read_h5ad(os.path.join(BASE_PATH, "target_rna_aligned.h5ad"))
+    target_atac = sc.read_h5ad(os.path.join(BASE_PATH, "target_atac_aligned.h5ad"))
     assert target_rna.obs_names.equals(target_atac.obs_names), "Target RNA and ATAC must have matching obs_names"
 
-    n_genes = len(target_rna.var_names)
-    n_peaks = len(target_atac.var_names)
+    source_label_key = resolve_domain_label_key(
+        source_rna,
+        requested_key=args.source_label_key,
+        default_key=DEFAULT_SOURCE_LABEL_KEY,
+        domain_name="source",
+    )
+    target_label_key = resolve_domain_label_key(
+        target_rna,
+        requested_key=args.target_label_key,
+        default_key=DEFAULT_TARGET_LABEL_KEY,
+        domain_name="target",
+    )
+    source_rna.uns["label_key"] = source_label_key
+    target_rna.uns["label_key"] = target_label_key
 
-    # Set celltype keys
-    source_rna.uns['label_key'] = 'RNA_clusters'
-    target_rna.uns['label_key'] = 'arc_gex_kmeans_5_clusters_Cluster'
-
-    # Ensure that label_key is categorical
-    source_rna.obs[source_rna.uns['label_key']] = source_rna.obs[source_rna.uns['label_key']].astype('category')
-    target_rna.obs[target_rna.uns['label_key']] = target_rna.obs[target_rna.uns['label_key']].astype('category')
-
-    #%% compute gene-peak net
-    gtf_path = os.path.join(os.getenv("DATAPATH"), "gene_annotations", "gencode.vM25.chr_patch_hapl_scaff.annotation.gtf.gz")
+    gtf_path = os.path.join(
+        os.getenv("DATAPATH"),
+        "gene_annotations",
+        "gencode.vM25.chr_patch_hapl_scaff.annotation.gtf.gz",
+    )
     if not os.path.exists(gtf_path):
         raise FileNotFoundError("GTF annotation file not found: {}".format(gtf_path))
 
@@ -1543,7 +1672,6 @@ def main():
     gp_net = source_atac.uns["gene_peak_Net"].copy()
     del source_atac.uns["gene_peak_Net"]
 
-    rank_type = "fused"
     source_rna, source_atac, target_rna, target_atac, gp_net = apply_hvg_and_gp_filtering(
         source_rna=source_rna,
         source_atac=source_atac,
@@ -1552,36 +1680,26 @@ def main():
         gp_net=gp_net,
         top_n_genes=args.top_n_genes,
         top_n_peaks=args.top_n_peaks,
-        rank_type=rank_type,
+        rank_type="fused",
     )
-
-    n_genes = len(target_rna.var_names)
-    n_peaks = len(target_atac.var_names)
-    print(f"Filtered {n_genes} genes and {n_peaks} peaks from gene-peak net")
-
+    print("Filtered {} genes and {} peaks from gene-peak net".format(len(target_rna.var_names), len(target_atac.var_names)))
     del gp_net
 
-    #%% source spatial graph
     MultiGATE.Cal_Spatial_Net(source_rna, rad_cutoff=40)
     MultiGATE.Stats_Spatial_Net(source_rna)
-
     MultiGATE.Cal_Spatial_Net(source_atac, rad_cutoff=40)
     MultiGATE.Stats_Spatial_Net(source_atac)
-
     source_rna = source_rna[:, source_rna.var["highly_variable"]].copy()
     source_atac = source_atac[:, source_atac.var["highly_variable"]].copy()
 
-    #%% target prep for live zero-shot eval
-    target_graph_type = args.spatial_graph_type
     target_rna, target_atac = prepare_target_for_spatial_graph_type(
         target_rna=target_rna,
         target_atac=target_atac,
         source_rna=source_rna,
         source_atac=source_atac,
-        spatial_graph_type=target_graph_type,
+        spatial_graph_type=args.spatial_graph_type,
         gtf_path=gtf_path,
     )
-
     print("[INFO] Pairing and subsampling target data...")
     target_rna, target_atac = pair_and_subsample_target(
         target_rna,
@@ -1590,34 +1708,41 @@ def main():
         seed=args.target_subsample_seed,
     )
 
-    #%% swap source and target
+    data_bundle = DataBundle(
+        source=DomainData(rna=source_rna, atac=source_atac, label_key=source_label_key),
+        target=DomainData(rna=target_rna, atac=target_atac, label_key=target_label_key),
+    )
 
     if args.switcharoo:
+        data_bundle = DataBundle(
+            source=DomainData(
+                rna=data_bundle.target.rna.copy(),
+                atac=data_bundle.target.atac.copy(),
+                label_key=data_bundle.target.label_key,
+            ),
+            target=DomainData(
+                rna=data_bundle.source.rna.copy(),
+                atac=data_bundle.source.atac.copy(),
+                label_key=data_bundle.source.label_key,
+            ),
+        )
 
-        source_rna_tmp = source_rna.copy()
-        source_atac_tmp = source_atac.copy()
+    data_bundle.source.rna.uns["label_key"] = data_bundle.source.label_key
+    data_bundle.target.rna.uns["label_key"] = data_bundle.target.label_key
+    return data_bundle
 
-        source_rna = target_rna.copy()
-        source_atac = target_atac.copy()
 
-        target_rna = source_rna_tmp.copy()
-        target_atac = source_atac_tmp.copy()
-
-    #%% Build reusable graph/data inputs
-    bp_width = 400
-    graph_type = "ATAC"
-    protein_value = 0.001
-
+def build_graph_bundle(data_bundle, bp_width=400, graph_type="ATAC", protein_value=0.001):
     source_graph_tf, source_gp_tf, source_x1, source_x2 = build_graph_inputs(
-        source_rna,
-        source_atac,
+        data_bundle.source.rna,
+        data_bundle.source.atac,
         bp_width=bp_width,
         graph_type=graph_type,
         protein_value=protein_value,
     )
     target_graph_tf, target_gp_tf, target_x1, target_x2 = build_graph_inputs(
-        target_rna,
-        target_atac,
+        data_bundle.target.rna,
+        data_bundle.target.atac,
         bp_width=bp_width,
         graph_type=graph_type,
         protein_value=protein_value,
@@ -1634,257 +1759,294 @@ def main():
             )
         )
 
-    #%% Build source trainer
-    num_epochs = args.stage1_epochs
-    if num_epochs <= 0:
-        raise ValueError("--stage1-epochs must be a positive integer.")
+    return GraphBundle(
+        source=GraphInputBundle(graph_tf=source_graph_tf, gp_tf=source_gp_tf, x1=source_x1, x2=source_x2),
+        target=GraphInputBundle(graph_tf=target_graph_tf, gp_tf=target_gp_tf, x1=target_x1, x2=target_x2),
+        bp_width=bp_width,
+        graph_type=graph_type,
+        protein_value=protein_value,
+    )
 
+
+def create_multigate_trainer(graph_inputs, hidden_dims, n_epochs, vgp_anchor_mode, random_seed, skip_gp_attention=False, device=None):
+    trainer_kwargs = {
+        "hidden_dims1": [graph_inputs.x1.shape[1]] + hidden_dims,
+        "hidden_dims2": [graph_inputs.x2.shape[1]] + hidden_dims,
+        "spot_num": graph_inputs.x1.shape[0],
+        "temp": 1,
+        "vgp_anchor_mode": vgp_anchor_mode,
+        "n_epochs": n_epochs,
+        "lr": 0.0001,
+        "gradient_clipping": 5,
+        "nonlinear": True,
+        "weight_decay": 0.0001,
+        "verbose": False,
+        "random_seed": random_seed,
+        "skip_gp_attention": skip_gp_attention,
+    }
+    if device is not None:
+        trainer_kwargs["config"] = {"device": str(device)}
+    return MultiGATETrainer(**trainer_kwargs)
+
+
+def initialize_stage1_trainers_for_training(data_bundle, graph_bundle, cache_config, num_epochs):
     hidden_dims = [512, 30]
-    trainer = MultiGATETrainer(
-        hidden_dims1=[source_x1.shape[1]] + hidden_dims,
-        hidden_dims2=[source_x2.shape[1]] + hidden_dims,
-        spot_num=source_x1.shape[0],
-        temp=1,
-        vgp_anchor_mode=effective_vgp_anchor_mode,
+    teacher_trainer = create_multigate_trainer(
+        graph_bundle.source,
+        hidden_dims=hidden_dims,
         n_epochs=num_epochs,
-        lr=0.0001,
-        gradient_clipping=5,
-        nonlinear=True,
-        weight_decay=0.0001,
-        verbose=False,
+        vgp_anchor_mode=cache_config.vgp_anchor_mode,
         random_seed=2020,
         skip_gp_attention=True,
     )
-
-    source_a_t = source_prune_t = source_gp_t = source_x1_t = source_x2_t = None
-    if not use_stage1_cache:
-        source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t = trainer._prepare_inputs(
-            source_graph_tf,
-            source_graph_tf,
-            source_gp_tf,
-            source_x1,
-            source_x2,
-        )
+    source_inputs_tensors = teacher_trainer._prepare_inputs(
+        graph_bundle.source.graph_tf,
+        graph_bundle.source.graph_tf,
+        graph_bundle.source.gp_tf,
+        graph_bundle.source.x1,
+        graph_bundle.source.x2,
+    )
 
     student_trainer = None
     nonspatial_trainer = None
     source_student_graph_tf = None
-    source_student_a_t = source_student_prune_t = source_student_gp_t = source_student_x1_t = source_student_x2_t = None
+    source_student_inputs_tensors = None
 
-    if effective_stage1_dual_source_kd:
-
+    if cache_config.dual_source_kd:
         source_student_graph_tf = build_source_student_graph_tf(
-            source_rna=source_rna,
-            spatial_graph_type=effective_stage1_student_graph_type,
+            source_rna=data_bundle.source.rna,
+            spatial_graph_type=cache_config.student_graph_type,
         )
-
-        if not use_stage1_cache:
-            student_trainer = MultiGATETrainer(
-                hidden_dims1=[source_x1.shape[1]] + hidden_dims,
-                hidden_dims2=[source_x2.shape[1]] + hidden_dims,
-                spot_num=source_x1.shape[0],
-                temp=1,
-                vgp_anchor_mode=effective_vgp_anchor_mode,
-                n_epochs=num_epochs,
-                lr=0.0001,
-                gradient_clipping=5,
-                nonlinear=True,
-                weight_decay=0.0001,
-                verbose=False,
-                random_seed=2021,
-                config={"device": str(trainer.device)},
-            )
-            source_student_a_t, source_student_prune_t, source_student_gp_t, source_student_x1_t, source_student_x2_t = student_trainer._prepare_inputs(
-                source_student_graph_tf,
-                source_student_graph_tf,
-                source_gp_tf,
-                source_x1,
-                source_x2,
-            )
-            nonspatial_trainer = MultiGATETrainer(
-                hidden_dims1=[source_x1.shape[1]] + hidden_dims,
-                hidden_dims2=[source_x2.shape[1]] + hidden_dims,
-                spot_num=source_x1.shape[0],
-                temp=1,
-                vgp_anchor_mode=effective_vgp_anchor_mode,
-                n_epochs=num_epochs,
-                lr=0.0001,
-                gradient_clipping=5,
-                nonlinear=True,
-                weight_decay=0.0001,
-                verbose=False,
-                random_seed=2022,
-                config={"device": str(trainer.device)},
-            )
-
-    stage1_primary_source_graph_tf = source_student_graph_tf if effective_stage1_dual_source_kd else source_graph_tf
-
-    if use_stage1_cache:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            local_stage1_path = download_model_artifact(
-                mlflow_client,
-                cached_stage1_run_id,
-                "model_stage1.pth",
-                tmpdir,
-            )
-            stage1_state_dict = torch.load(local_stage1_path, map_location="cpu", weights_only=False)
-
-        stage1_primary_trainer, hidden_dims1_loaded, hidden_dims2_loaded, inferred_vgp_anchor_mode = build_stage1_trainer_from_state_dict(
-            stage1_state_dict,
-            spot_num=source_x1.shape[0],
+        student_trainer = create_multigate_trainer(
+            graph_bundle.source,
+            hidden_dims=hidden_dims,
             n_epochs=num_epochs,
-            lr=0.0001,
-            gradient_clipping=5,
-            weight_decay=0.0001,
-            random_seed=2020,
+            vgp_anchor_mode=cache_config.vgp_anchor_mode,
+            random_seed=2021,
+            device=teacher_trainer.device,
+        )
+        source_student_inputs_tensors = student_trainer._prepare_inputs(
+            source_student_graph_tf,
+            source_student_graph_tf,
+            graph_bundle.source.gp_tf,
+            graph_bundle.source.x1,
+            graph_bundle.source.x2,
+        )
+        nonspatial_trainer = create_multigate_trainer(
+            graph_bundle.source,
+            hidden_dims=hidden_dims,
+            n_epochs=num_epochs,
+            vgp_anchor_mode=cache_config.vgp_anchor_mode,
+            random_seed=2022,
+            device=teacher_trainer.device,
         )
 
-        if hidden_dims1_loaded[0] != source_x1.shape[1] or hidden_dims2_loaded[0] != source_x2.shape[1]:
-            raise ValueError(
-                "Feature dimension mismatch for cached stage-1 model: checkpoint expects "
-                "RNA {} / ATAC {}, current data is RNA {} / ATAC {}."
-                .format(hidden_dims1_loaded[0], hidden_dims2_loaded[0], source_x1.shape[1], source_x2.shape[1])
-            )
+    primary_trainer = student_trainer if cache_config.dual_source_kd else teacher_trainer
+    primary_source_graph_tf = source_student_graph_tf if cache_config.dual_source_kd else graph_bundle.source.graph_tf
+    primary_model_name = "student" if cache_config.dual_source_kd else "teacher"
 
-        effective_vgp_anchor_mode = inferred_vgp_anchor_mode
-        if "skip_gp_attention" in cached_stage1_run_params:
-            stage1_primary_trainer.mgate.skip_gp_attention = (
-                str(cached_stage1_run_params["skip_gp_attention"]).lower() == "true"
-            )
-        stage1_primary_model_name = cached_stage1_run_params.get(
-            "stage1_primary_model",
-            "student" if effective_stage1_dual_source_kd else "teacher",
+    return Stage1TrainerBundle(
+        teacher=teacher_trainer,
+        student=student_trainer,
+        nonspatial=nonspatial_trainer,
+        source_inputs_tensors=source_inputs_tensors,
+        source_student_inputs_tensors=source_student_inputs_tensors,
+        source_student_graph_tf=source_student_graph_tf,
+        primary=primary_trainer,
+        primary_model_name=primary_model_name,
+        primary_source_graph_tf=primary_source_graph_tf,
+    )
+
+
+def load_cached_stage1_primary_trainer(data_bundle, graph_bundle, cache_config, mlflow_client, num_epochs):
+    source_student_graph_tf = None
+    if cache_config.dual_source_kd:
+        source_student_graph_tf = build_source_student_graph_tf(
+            source_rna=data_bundle.source.rna,
+            spatial_graph_type=cache_config.student_graph_type,
         )
-        print(
-            "[Stage1 Cache] Loaded model_stage1.pth with hidden_dims1={}, hidden_dims2={}, vgp_anchor_mode={}".format(
-                hidden_dims1_loaded,
-                hidden_dims2_loaded,
-                inferred_vgp_anchor_mode,
+    primary_source_graph_tf = source_student_graph_tf if cache_config.dual_source_kd else graph_bundle.source.graph_tf
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_stage1_path = download_model_artifact(
+            mlflow_client,
+            cache_config.run_id,
+            "model_stage1.pth",
+            tmpdir,
+        )
+        stage1_state_dict = torch.load(local_stage1_path, map_location="cpu", weights_only=False)
+
+    stage1_primary_trainer, hidden_dims1_loaded, hidden_dims2_loaded, inferred_vgp_anchor_mode = build_stage1_trainer_from_state_dict(
+        stage1_state_dict,
+        spot_num=graph_bundle.source.x1.shape[0],
+        n_epochs=num_epochs,
+        lr=0.0001,
+        gradient_clipping=5,
+        weight_decay=0.0001,
+        random_seed=2020,
+    )
+
+    if hidden_dims1_loaded[0] != graph_bundle.source.x1.shape[1] or hidden_dims2_loaded[0] != graph_bundle.source.x2.shape[1]:
+        raise ValueError(
+            "Feature dimension mismatch for cached stage-1 model: checkpoint expects "
+            "RNA {} / ATAC {}, current data is RNA {} / ATAC {}."
+            .format(
+                hidden_dims1_loaded[0],
+                hidden_dims2_loaded[0],
+                graph_bundle.source.x1.shape[1],
+                graph_bundle.source.x2.shape[1],
             )
         )
-    else:
-        stage1_primary_trainer = student_trainer if effective_stage1_dual_source_kd else trainer
-        stage1_primary_model_name = "student" if effective_stage1_dual_source_kd else "teacher"
 
-    print("Training epochs for stage 1:", num_epochs)
-    print("Target paired cells after subsampling:", target_rna.n_obs)
-    if effective_stage1_dual_source_kd:
-        print(
-            "[Stage1 Dual KD] Enabled: teacher graph=spatial, student graph={}".format(
-                effective_stage1_student_graph_type
-            )
+    cache_config.vgp_anchor_mode = inferred_vgp_anchor_mode
+    if "skip_gp_attention" in cache_config.run_params:
+        stage1_primary_trainer.mgate.skip_gp_attention = (
+            str(cache_config.run_params["skip_gp_attention"]).lower() == "true"
         )
-        if nonspatial_trainer is not None:
-            print(
-                "[Stage1 Non-Spatial] Enabled: auxiliary non-spatial model trains on the student graph "
-                "with teacher-style losses."
-            )
-
-    if use_stage1_cache:
-        print(
-            "[Stage1 Cache] Reusing parent run '{}' (ID: {}). Stage-1 training will be skipped.".format(
-                cached_stage1_run_name,
-                cached_stage1_run_id,
-            )
+    primary_model_name = cache_config.run_params.get(
+        "stage1_primary_model",
+        "student" if cache_config.dual_source_kd else "teacher",
+    )
+    print(
+        "[Stage1 Cache] Loaded model_stage1.pth with hidden_dims1={}, hidden_dims2={}, vgp_anchor_mode={}".format(
+            hidden_dims1_loaded,
+            hidden_dims2_loaded,
+            inferred_vgp_anchor_mode,
         )
-        with mlflow.start_run(run_id=cached_stage1_run_id):
-            if args.stage2_epochs > 0:
-                print(
-                    "[Stage2 KD] Starting target distillation for {} epochs (lambda_kd={}, kd_mix_kl={}, kd_mix_ot={})".format(
-                        args.stage2_epochs,
-                        args.lambda_kd,
-                        args.kd_mix_kl,
-                        args.kd_mix_ot,
-                    )
-                )
+    )
 
-                stage1_primary_trainer.mgate.eval()
-                with torch.no_grad():
-                    source_embeddings = stage1_primary_trainer.infer(
-                        stage1_primary_source_graph_tf,
-                        stage1_primary_source_graph_tf,
-                        source_gp_tf,
-                        source_x1,
-                        source_x2,
-                    )
+    return Stage1TrainerBundle(
+        teacher=None,
+        student=None,
+        nonspatial=None,
+        source_inputs_tensors=None,
+        source_student_inputs_tensors=None,
+        source_student_graph_tf=source_student_graph_tf,
+        primary=stage1_primary_trainer,
+        primary_model_name=primary_model_name,
+        primary_source_graph_tf=primary_source_graph_tf,
+    )
 
-                stage2_trainer, stage2_run_id = run_stage2_distillation(
-                    source_trainer=stage1_primary_trainer,
-                    target_rna=target_rna,
-                    target_atac=target_atac,
-                    target_graph_tf=target_graph_tf,
-                    target_gp_tf=target_gp_tf,
-                    target_x1=target_x1,
-                    target_x2=target_x2,
-                    source_graph_tf=stage1_primary_source_graph_tf,
-                    source_gp_tf=source_gp_tf,
-                    source_x1=source_x1,
-                    source_x2=source_x2,
-                    stage2_epochs=args.stage2_epochs,
-                    lambda_kd=args.lambda_kd,
-                    kd_mix_kl=args.kd_mix_kl,
-                    kd_mix_ot=args.kd_mix_ot,
-                    target_label_key=args.target_label_key,
-                    scib_n_jobs=args.scib_n_jobs,
-                    vgp_anchor_mode=effective_vgp_anchor_mode,
-                )
-                if stage2_trainer is None or stage2_run_id is None:
-                    raise RuntimeError("Stage-2 trainer/run-id was not returned despite stage2_epochs > 0.")
 
-                set_multigate_embeddings(
-                    source_rna,
-                    source_atac,
-                    source_embeddings[0],
-                    source_embeddings[1],
-                    key_added="MultiGATE",
-                )
-                log_stage2_artifacts_for_run(
-                    stage2_run_id=stage2_run_id,
-                    stage2_trainer=stage2_trainer,
-                    source_rna=source_rna,
-                    source_atac=source_atac,
-                    target_rna=target_rna,
-                    target_atac=target_atac,
-                    target_graph_tf=target_graph_tf,
-                    target_gp_tf=target_gp_tf,
-                    target_x1=target_x1,
-                    target_x2=target_x2,
-                    log_mudata_umaps=args.log_mudata_umaps,
-                )
-            else:
-                print("[Stage2 KD] Skipped because --stage2-epochs is 0.")
+def maybe_run_stage2_and_log(args, data_bundle, graph_bundle, trainer_bundle, source_embeddings, vgp_anchor_mode):
+    if args.stage2_epochs <= 0:
+        print("[Stage2 KD] Skipped because --stage2-epochs is 0.")
+        return None, None
 
-        return
+    print(
+        "[Stage2 KD] Starting target distillation for {} epochs (lambda_kd={}, kd_mix_kl={}, kd_mix_ot={})".format(
+            args.stage2_epochs,
+            args.lambda_kd,
+            args.kd_mix_kl,
+            args.kd_mix_ot,
+        )
+    )
+
+    stage2_trainer, stage2_run_id = run_stage2_distillation(
+        source_trainer=trainer_bundle.primary,
+        target_rna=data_bundle.target.rna,
+        target_atac=data_bundle.target.atac,
+        target_graph_tf=graph_bundle.target.graph_tf,
+        target_gp_tf=graph_bundle.target.gp_tf,
+        target_x1=graph_bundle.target.x1,
+        target_x2=graph_bundle.target.x2,
+        source_graph_tf=trainer_bundle.primary_source_graph_tf,
+        source_gp_tf=graph_bundle.source.gp_tf,
+        source_x1=graph_bundle.source.x1,
+        source_x2=graph_bundle.source.x2,
+        stage2_epochs=args.stage2_epochs,
+        lambda_kd=args.lambda_kd,
+        kd_mix_kl=args.kd_mix_kl,
+        kd_mix_ot=args.kd_mix_ot,
+        target_label_key=data_bundle.target.label_key,
+        scib_n_jobs=args.scib_n_jobs,
+        vgp_anchor_mode=vgp_anchor_mode,
+    )
+    if stage2_trainer is None or stage2_run_id is None:
+        raise RuntimeError("Stage-2 trainer/run-id was not returned despite stage2_epochs > 0.")
+
+    set_multigate_embeddings(
+        data_bundle.source.rna,
+        data_bundle.source.atac,
+        source_embeddings[0],
+        source_embeddings[1],
+        key_added="MultiGATE",
+    )
+    log_stage2_artifacts_for_run(
+        stage2_run_id=stage2_run_id,
+        stage2_trainer=stage2_trainer,
+        source_rna=data_bundle.source.rna,
+        source_atac=data_bundle.source.atac,
+        target_rna=data_bundle.target.rna,
+        target_atac=data_bundle.target.atac,
+        target_graph_tf=graph_bundle.target.graph_tf,
+        target_gp_tf=graph_bundle.target.gp_tf,
+        target_x1=graph_bundle.target.x1,
+        target_x2=graph_bundle.target.x2,
+        log_mudata_umaps=args.log_mudata_umaps,
+    )
+    return stage2_trainer, stage2_run_id
+
+
+def run_stage1_training_and_log(args, experiment_id, run_name, eval_every, num_epochs, data_bundle, graph_bundle, trainer_bundle, cache_config):
+    source_rna = data_bundle.source.rna
+    source_atac = data_bundle.source.atac
+    target_rna = data_bundle.target.rna
+    target_atac = data_bundle.target.atac
+
+    trainer = trainer_bundle.teacher
+    student_trainer = trainer_bundle.student
+    nonspatial_trainer = trainer_bundle.nonspatial
+
+    if trainer is None:
+        raise RuntimeError("Stage-1 teacher trainer is required for non-cached training.")
+    if trainer_bundle.source_inputs_tensors is None:
+        raise RuntimeError("source_inputs_tensors is required for non-cached stage-1 training.")
+    if cache_config.dual_source_kd and trainer_bundle.source_student_inputs_tensors is None:
+        raise RuntimeError("source_student_inputs_tensors is required for dual-source stage-1 training.")
+
+    source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t = trainer_bundle.source_inputs_tensors
+    source_student_a_t = source_student_prune_t = source_student_gp_t = source_student_x1_t = source_student_x2_t = None
+    if trainer_bundle.source_student_inputs_tensors is not None:
+        source_student_a_t, source_student_prune_t, source_student_gp_t, source_student_x1_t, source_student_x2_t = (
+            trainer_bundle.source_student_inputs_tensors
+        )
 
     with mlflow.start_run(run_name=run_name):
         mlflow.log_param("mlflow_experiment_id", experiment_id)
-        mlflow.log_param("hidden_dims", json.dumps(hidden_dims))
+        mlflow.log_param("hidden_dims", json.dumps([512, 30]))
         mlflow.log_param("n_epochs", num_epochs)
         mlflow.log_param("stage2_epochs", args.stage2_epochs)
         mlflow.log_param("lambda_kd", args.lambda_kd)
         mlflow.log_param("kd_mix_kl", args.kd_mix_kl)
         mlflow.log_param("kd_mix_ot", args.kd_mix_ot)
-        mlflow.log_param("bp_width", bp_width)
+        mlflow.log_param("bp_width", graph_bundle.bp_width)
         mlflow.log_param("target_subsample_n", args.target_subsample_n)
         mlflow.log_param("target_subsample_seed", args.target_subsample_seed)
         mlflow.log_param("log_mudata_umaps", args.log_mudata_umaps)
-        mlflow.log_param("source_label_key", args.source_label_key if args.source_label_key is not None else "None")
-        mlflow.log_param("target_label_key", args.target_label_key if args.target_label_key is not None else "None")
+        mlflow.log_param("source_label_key_requested", args.source_label_key if args.source_label_key is not None else "None")
+        mlflow.log_param("target_label_key_requested", args.target_label_key if args.target_label_key is not None else "None")
+        mlflow.log_param("source_label_key", data_bundle.source.label_key if data_bundle.source.label_key is not None else "None")
+        mlflow.log_param("target_label_key", data_bundle.target.label_key if data_bundle.target.label_key is not None else "None")
         mlflow.log_param("target_effective_n", int(target_rna.n_obs))
         mlflow.log_param("eval_every", eval_every)
         mlflow.log_param("source_cells", int(source_rna.n_obs))
         mlflow.log_param("target_cells", int(target_rna.n_obs))
         mlflow.log_param("n_genes", int(source_rna.n_vars))
         mlflow.log_param("n_peaks", int(source_atac.n_vars))
-        mlflow.log_param("graph_type", graph_type)
-        mlflow.log_param("stage1_dual_source_kd", bool(effective_stage1_dual_source_kd))
-        mlflow.log_param("stage1_primary_model", stage1_primary_model_name)
+        mlflow.log_param("graph_type", graph_bundle.graph_type)
+        mlflow.log_param("stage1_dual_source_kd", bool(cache_config.dual_source_kd))
+        mlflow.log_param("stage1_primary_model", trainer_bundle.primary_model_name)
         mlflow.log_param("stage1_teacher_graph", "spatial")
-        mlflow.log_param("stage1_student_graph", effective_stage1_student_graph_type if effective_stage1_dual_source_kd else "NA")
+        mlflow.log_param("stage1_student_graph", cache_config.student_graph_type if cache_config.dual_source_kd else "NA")
         mlflow.log_param("stage1_nonspatial_enabled", bool(nonspatial_trainer is not None))
-        mlflow.log_param("stage1_nonspatial_graph",effective_stage1_student_graph_type if nonspatial_trainer is not None else "NA",)
-        mlflow.log_param("vgp_anchor_mode", effective_vgp_anchor_mode)
+        mlflow.log_param(
+            "stage1_nonspatial_graph",
+            cache_config.student_graph_type if nonspatial_trainer is not None else "NA",
+        )
+        mlflow.log_param("vgp_anchor_mode", cache_config.vgp_anchor_mode)
         mlflow.log_param("skip_gp_attention", trainer.mgate.skip_gp_attention)
+
         source_scib_label_mode_logged = False
         target_scib_label_mode_logged = False
         source_scib_effective_label_key_logged = False
@@ -1892,22 +2054,16 @@ def main():
         source_embeddings = None
 
         for epoch in tqdm(range(1, num_epochs + 1), desc="Stage 1 training", unit="epoch"):
-
             trainer.mgate.train()
             teacher_loss = trainer.run_epoch(epoch, source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t)
             mlflow.log_metric("source_train_loss", float(teacher_loss), step=epoch)
 
-            loss_atac = float(trainer.loss_list_atac[-1])
-            loss_rna = float(trainer.loss_list_rna[-1])
-            clip_loss = float(trainer.loss_list_clip[-1])
-            decorr_loss = float(trainer.loss_list_deco[-1])
-            mlflow.log_metric("source_train_loss_atac", loss_atac, step=epoch)
-            mlflow.log_metric("source_train_loss_rna", loss_rna, step=epoch)
-            mlflow.log_metric("source_train_loss_clip", clip_loss, step=epoch)
-            mlflow.log_metric("source_train_loss_decorr", decorr_loss, step=epoch)
+            mlflow.log_metric("source_train_loss_atac", float(trainer.loss_list_atac[-1]), step=epoch)
+            mlflow.log_metric("source_train_loss_rna", float(trainer.loss_list_rna[-1]), step=epoch)
+            mlflow.log_metric("source_train_loss_clip", float(trainer.loss_list_clip[-1]), step=epoch)
+            mlflow.log_metric("source_train_loss_decorr", float(trainer.loss_list_deco[-1]), step=epoch)
 
-            if effective_stage1_dual_source_kd:
-
+            if cache_config.dual_source_kd:
                 trainer.mgate.eval()
                 student_trainer.mgate.train()
                 student_trainer.optimizer.zero_grad(set_to_none=True)
@@ -1920,7 +2076,6 @@ def main():
                         source_x1_t,
                         source_x2_t,
                     )
-
                 student_outputs = student_trainer.mgate(
                     source_student_a_t,
                     source_student_prune_t,
@@ -1931,18 +2086,12 @@ def main():
 
                 student_clip_rna, student_clip_atac = student_outputs[5], student_outputs[6]
                 teacher_clip_rna, teacher_clip_atac = teacher_outputs[5], teacher_outputs[6]
-                #stage1_kd_kl_loss = compute_kd_kl_loss(student_logits, teacher_logits)
                 stage1_distill_loss = F.mse_loss(student_clip_rna, teacher_clip_rna) + F.mse_loss(student_clip_atac, teacher_clip_atac)
 
                 stage1_distill_loss.backward()
                 torch.nn.utils.clip_grad_norm_(student_trainer.mgate.parameters(), student_trainer.gradient_clipping)
                 student_trainer.optimizer.step()
 
-                mlflow.log_metric(
-                    "stage1_student_distill_loss",
-                    float(stage1_distill_loss.detach().cpu().item()),
-                    step=epoch,
-                )
                 mlflow.log_metric(
                     "stage1_student_distill_loss",
                     float(stage1_distill_loss.detach().cpu().item()),
@@ -1963,70 +2112,36 @@ def main():
                     source_student_x2_t,
                 )
                 mlflow.log_metric("stage1_nonspatial_train_loss", float(nonspatial_loss), step=epoch)
-                mlflow.log_metric(
-                    "stage1_nonspatial_train_loss_atac",
-                    float(nonspatial_trainer.loss_list_atac[-1]),
-                    step=epoch,
-                )
-                mlflow.log_metric(
-                    "stage1_nonspatial_train_loss_rna",
-                    float(nonspatial_trainer.loss_list_rna[-1]),
-                    step=epoch,
-                )
-                mlflow.log_metric(
-                    "stage1_nonspatial_train_loss_clip",
-                    float(nonspatial_trainer.loss_list_clip[-1]),
-                    step=epoch,
-                )
-                mlflow.log_metric(
-                    "stage1_nonspatial_train_loss_decorr",
-                    float(nonspatial_trainer.loss_list_deco[-1]),
-                    step=epoch,
-                )
+                mlflow.log_metric("stage1_nonspatial_train_loss_atac", float(nonspatial_trainer.loss_list_atac[-1]), step=epoch)
+                mlflow.log_metric("stage1_nonspatial_train_loss_rna", float(nonspatial_trainer.loss_list_rna[-1]), step=epoch)
+                mlflow.log_metric("stage1_nonspatial_train_loss_clip", float(nonspatial_trainer.loss_list_clip[-1]), step=epoch)
+                mlflow.log_metric("stage1_nonspatial_train_loss_decorr", float(nonspatial_trainer.loss_list_deco[-1]), step=epoch)
 
-            should_eval = (
-                ((epoch == 1) or (epoch % eval_every == 0) or (epoch == num_epochs))
-                and eval_every > 0
-            )
-
+            should_eval = ((epoch == 1) or (epoch % eval_every == 0) or (epoch == num_epochs)) and eval_every > 0
             if not should_eval:
                 continue
 
-            trainer_target = None
             source_embeddings, target_embeddings, trainer_target = infer_source_and_zero_shot_target_embeddings(
-                source_trainer=stage1_primary_trainer,
-                source_graph_tf=stage1_primary_source_graph_tf,
-                source_gp_tf=source_gp_tf,
-                source_x1=source_x1,
-                source_x2=source_x2,
-                target_graph_tf=target_graph_tf,
-                target_gp_tf=target_gp_tf,
-                target_x1=target_x1,
-                target_x2=target_x2,
+                source_trainer=trainer_bundle.primary,
+                source_graph_tf=trainer_bundle.primary_source_graph_tf,
+                source_gp_tf=graph_bundle.source.gp_tf,
+                source_x1=graph_bundle.source.x1,
+                source_x2=graph_bundle.source.x2,
+                target_graph_tf=graph_bundle.target.graph_tf,
+                target_gp_tf=graph_bundle.target.gp_tf,
+                target_x1=graph_bundle.target.x1,
+                target_x2=graph_bundle.target.x2,
                 target_spot_num=target_rna.n_obs,
-                vgp_anchor_mode=effective_vgp_anchor_mode,
+                vgp_anchor_mode=cache_config.vgp_anchor_mode,
             )
-            set_multigate_embeddings(
-                source_rna,
-                source_atac,
-                source_embeddings[0],
-                source_embeddings[1],
-                key_added="MultiGATE",
-            )
-            set_multigate_embeddings(
-                target_rna,
-                target_atac,
-                target_embeddings[0],
-                target_embeddings[1],
-                key_added="MultiGATE",
-            )
+            set_multigate_embeddings(source_rna, source_atac, source_embeddings[0], source_embeddings[1], key_added="MultiGATE")
+            set_multigate_embeddings(target_rna, target_atac, target_embeddings[0], target_embeddings[1], key_added="MultiGATE")
 
-            # compute and log scib metrics for source data
             source_scib_metrics = compute_scib_metrics_for_domain(
                 rna_adata=source_rna,
                 atac_adata=source_atac,
                 domain_name="source",
-                label_key=args.source_label_key,
+                label_key=data_bundle.source.label_key,
                 scib_n_jobs=args.scib_n_jobs,
             )
             log_scib_metrics(prefix="source", metrics=source_scib_metrics, step=epoch)
@@ -2034,33 +2149,24 @@ def main():
                 mlflow.log_param("source_scib_label_mode", source_scib_metrics["label_mode"])
                 source_scib_label_mode_logged = True
             if not source_scib_effective_label_key_logged:
-                mlflow.log_param(
-                    "source_scib_effective_label_key",
-                    source_scib_metrics["effective_label_key"],
-                )
+                mlflow.log_param("source_scib_effective_label_key", source_scib_metrics["effective_label_key"])
                 source_scib_effective_label_key_logged = True
 
-            # compute and log scib metrics for target data
             target_scib_metrics = compute_scib_metrics_for_domain(
                 rna_adata=target_rna,
                 atac_adata=target_atac,
                 domain_name="target",
-                label_key=args.target_label_key,
+                label_key=data_bundle.target.label_key,
                 scib_n_jobs=args.scib_n_jobs,
             )
             log_scib_metrics(prefix="target", metrics=target_scib_metrics, step=epoch)
-
             if not target_scib_label_mode_logged:
                 mlflow.log_param("target_scib_label_mode", target_scib_metrics["label_mode"])
                 target_scib_label_mode_logged = True
             if not target_scib_effective_label_key_logged:
-                mlflow.log_param(
-                    "target_scib_effective_label_key",
-                    target_scib_metrics["effective_label_key"],
-                )
+                mlflow.log_param("target_scib_effective_label_key", target_scib_metrics["effective_label_key"])
                 target_scib_effective_label_key_logged = True
 
-            # compute alignment metrics between source and target
             mmd_value = compute_balanced_source_target_mmd(
                 source_rna.obsm["MultiGATE"],
                 source_atac.obsm["MultiGATE"],
@@ -2070,20 +2176,19 @@ def main():
             mlflow.log_metric("stage1_source_target_balanced_mmd", mmd_value, step=epoch)
 
             if nonspatial_trainer is not None:
-                nonspatial_target_trainer = None
                 nonspatial_source_embeddings, nonspatial_target_embeddings, nonspatial_target_trainer = (
                     infer_source_and_zero_shot_target_embeddings(
                         source_trainer=nonspatial_trainer,
-                        source_graph_tf=source_student_graph_tf,
-                        source_gp_tf=source_gp_tf,
-                        source_x1=source_x1,
-                        source_x2=source_x2,
-                        target_graph_tf=target_graph_tf,
-                        target_gp_tf=target_gp_tf,
-                        target_x1=target_x1,
-                        target_x2=target_x2,
+                        source_graph_tf=trainer_bundle.source_student_graph_tf,
+                        source_gp_tf=graph_bundle.source.gp_tf,
+                        source_x1=graph_bundle.source.x1,
+                        source_x2=graph_bundle.source.x2,
+                        target_graph_tf=graph_bundle.target.graph_tf,
+                        target_gp_tf=graph_bundle.target.gp_tf,
+                        target_x1=graph_bundle.target.x1,
+                        target_x2=graph_bundle.target.x2,
                         target_spot_num=target_rna.n_obs,
-                        vgp_anchor_mode=effective_vgp_anchor_mode,
+                        vgp_anchor_mode=cache_config.vgp_anchor_mode,
                     )
                 )
                 set_multigate_embeddings(
@@ -2106,11 +2211,7 @@ def main():
                     target_rna.obsm["MultiGATE_nonspatial"],
                     target_atac.obsm["MultiGATE_nonspatial"],
                 )
-                mlflow.log_metric(
-                    "stage1_nonspatial_source_target_balanced_mmd",
-                    nonspatial_mmd_value,
-                    step=epoch,
-                )
+                mlflow.log_metric("stage1_nonspatial_source_target_balanced_mmd", nonspatial_mmd_value, step=epoch)
                 if epoch != num_epochs:
                     del nonspatial_target_trainer, nonspatial_target_embeddings, nonspatial_source_embeddings
 
@@ -2122,7 +2223,6 @@ def main():
         if source_embeddings is None:
             raise RuntimeError("Stage-1 source embeddings were not computed before artifact logging.")
 
-        # log stage-1 UMAP artifacts
         log_stage_umap_artifacts(
             source_rna=source_rna,
             source_atac=source_atac,
@@ -2132,20 +2232,20 @@ def main():
             log_mudata_umaps=args.log_mudata_umaps,
         )
 
-        if effective_stage1_dual_source_kd:
+        if cache_config.dual_source_kd:
             teacher_source_embeddings, teacher_target_embeddings, teacher_target_trainer = (
                 infer_source_and_zero_shot_target_embeddings(
                     source_trainer=trainer,
-                    source_graph_tf=source_graph_tf,
-                    source_gp_tf=source_gp_tf,
-                    source_x1=source_x1,
-                    source_x2=source_x2,
-                    target_graph_tf=target_graph_tf,
-                    target_gp_tf=target_gp_tf,
-                    target_x1=target_x1,
-                    target_x2=target_x2,
+                    source_graph_tf=graph_bundle.source.graph_tf,
+                    source_gp_tf=graph_bundle.source.gp_tf,
+                    source_x1=graph_bundle.source.x1,
+                    source_x2=graph_bundle.source.x2,
+                    target_graph_tf=graph_bundle.target.graph_tf,
+                    target_gp_tf=graph_bundle.target.gp_tf,
+                    target_x1=graph_bundle.target.x1,
+                    target_x2=graph_bundle.target.x2,
                     target_spot_num=target_rna.n_obs,
-                    vgp_anchor_mode=effective_vgp_anchor_mode,
+                    vgp_anchor_mode=cache_config.vgp_anchor_mode,
                 )
             )
             set_multigate_embeddings(
@@ -2173,20 +2273,21 @@ def main():
             )
             del teacher_target_trainer
 
+        nonspatial_source_embeddings_final = None
         if nonspatial_trainer is not None:
             nonspatial_source_embeddings_final, nonspatial_target_embeddings_final, nonspatial_target_trainer_final = (
                 infer_source_and_zero_shot_target_embeddings(
                     source_trainer=nonspatial_trainer,
-                    source_graph_tf=source_student_graph_tf,
-                    source_gp_tf=source_gp_tf,
-                    source_x1=source_x1,
-                    source_x2=source_x2,
-                    target_graph_tf=target_graph_tf,
-                    target_gp_tf=target_gp_tf,
-                    target_x1=target_x1,
-                    target_x2=target_x2,
+                    source_graph_tf=trainer_bundle.source_student_graph_tf,
+                    source_gp_tf=graph_bundle.source.gp_tf,
+                    source_x1=graph_bundle.source.x1,
+                    source_x2=graph_bundle.source.x2,
+                    target_graph_tf=graph_bundle.target.graph_tf,
+                    target_gp_tf=graph_bundle.target.gp_tf,
+                    target_x1=graph_bundle.target.x1,
+                    target_x2=graph_bundle.target.x2,
                     target_spot_num=target_rna.n_obs,
-                    vgp_anchor_mode=effective_vgp_anchor_mode,
+                    vgp_anchor_mode=cache_config.vgp_anchor_mode,
                 )
             )
             set_multigate_embeddings(
@@ -2214,118 +2315,128 @@ def main():
             )
             del nonspatial_target_trainer_final
 
-        # log stage-1 model artifacts and attention matrix
-        model_stage1 = stage1_primary_trainer.mgate.state_dict()
-        model_stage1_teacher = trainer.mgate.state_dict()
-        model_stage1_student = student_trainer.mgate.state_dict() if effective_stage1_dual_source_kd else None
-        model_stage1_nonspatial = nonspatial_trainer.mgate.state_dict() if nonspatial_trainer is not None else None
-
         with tempfile.TemporaryDirectory() as tmpdir:
+            log_torch_state_dict_artifacts(
+                tmpdir,
+                {
+                    "model_stage1.pth": trainer_bundle.primary.mgate.state_dict(),
+                    "model_stage1_teacher.pth": trainer.mgate.state_dict() if cache_config.dual_source_kd else None,
+                    "model_stage1_student.pth": student_trainer.mgate.state_dict() if cache_config.dual_source_kd else None,
+                    "model_stage1_nonspatial.pth": nonspatial_trainer.mgate.state_dict() if nonspatial_trainer is not None else None,
+                },
+            )
 
-            local_path = os.path.join(tmpdir, "model_stage1.pth")
-            torch.save(model_stage1, local_path)
-            mlflow.log_artifact(local_path, artifact_path="models")
+            sparse_matrices = {}
+            if not trainer_bundle.primary.mgate.skip_gp_attention:
+                sparse_matrices["source_peak_gene_attention.npz"] = source_embeddings[4][0]
+            if (
+                nonspatial_trainer is not None
+                and not nonspatial_trainer.mgate.skip_gp_attention
+                and nonspatial_source_embeddings_final is not None
+            ):
+                sparse_matrices["source_peak_gene_attention_nonspatial.npz"] = nonspatial_source_embeddings_final[4][0]
+            log_sparse_matrix_artifacts(tmpdir, sparse_matrices)
 
-            if not stage1_primary_trainer.mgate.skip_gp_attention:
-                source_peak_gene_attention = source_embeddings[4][0] #peak_gene_attention = source_rna.uns['MultiGATE_gene_peak_attention'][0]
-                local_path = os.path.join(tmpdir, "source_peak_gene_attention.npz")
-                sp.save_npz(local_path, source_peak_gene_attention)
-                mlflow.log_artifact(local_path, artifact_path="matrices")
+        maybe_run_stage2_and_log(
+            args=args,
+            data_bundle=data_bundle,
+            graph_bundle=graph_bundle,
+            trainer_bundle=trainer_bundle,
+            source_embeddings=source_embeddings,
+            vgp_anchor_mode=cache_config.vgp_anchor_mode,
+        )
 
-            if effective_stage1_dual_source_kd:
-                local_path = os.path.join(tmpdir, "model_stage1_teacher.pth")
-                torch.save(model_stage1_teacher, local_path)
-                mlflow.log_artifact(local_path, artifact_path="models")
 
-                local_path = os.path.join(tmpdir, "model_stage1_student.pth")
-                torch.save(model_stage1_student, local_path)
-                mlflow.log_artifact(local_path, artifact_path="models")
-
-            if model_stage1_nonspatial is not None:
-                local_path = os.path.join(tmpdir, "model_stage1_nonspatial.pth")
-                torch.save(model_stage1_nonspatial, local_path)
-                mlflow.log_artifact(local_path, artifact_path="models")
-
-                if not nonspatial_trainer.mgate.skip_gp_attention:
-                    source_peak_gene_attention_nonspatial = nonspatial_source_embeddings_final[4][0]
-                    local_path = os.path.join(tmpdir, "source_peak_gene_attention_nonspatial.npz")
-                    sp.save_npz(local_path, source_peak_gene_attention_nonspatial)
-                    mlflow.log_artifact(local_path, artifact_path="matrices")
-
-        #%% stage 2
-        if args.stage2_epochs > 0:
+def summarize_stage1_setup(num_epochs, data_bundle, cache_config, trainer_bundle):
+    print("Training epochs for stage 1:", num_epochs)
+    print("Target paired cells after subsampling:", data_bundle.target.rna.n_obs)
+    if cache_config.dual_source_kd:
+        print(
+            "[Stage1 Dual KD] Enabled: teacher graph=spatial, student graph={}".format(
+                cache_config.student_graph_type
+            )
+        )
+        if trainer_bundle.nonspatial is not None:
             print(
-                "[Stage2 KD] Starting target distillation for {} epochs (lambda_kd={}, kd_mix_kl={}, kd_mix_ot={})".format(
-                    args.stage2_epochs,
-                    args.lambda_kd,
-                    args.kd_mix_kl,
-                    args.kd_mix_ot,
+                "[Stage1 Non-Spatial] Enabled: auxiliary non-spatial model trains on the student graph "
+                "with teacher-style losses."
+            )
+
+
+def main():
+    bootstrap_runtime()
+
+    notebook_mode = is_notebook()
+    args = parse_args(notebook=notebook_mode)
+    validate_args(args)
+
+    # Fail fast if scib-metrics backend is not available.
+    require_scib_backend()
+
+    experiment_id = setup_mlflow()
+    eval_every = 3000  # set to -1 for very basic debugging only.
+    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    num_epochs = args.stage1_epochs
+
+    mlflow_client = MlflowClient()
+    cache_config = resolve_stage1_cache_config(args, mlflow_client)
+    data_bundle = load_and_prepare_data_bundle(args)
+    graph_bundle = build_graph_bundle(data_bundle)
+
+    if cache_config.use_cache:
+        trainer_bundle = load_cached_stage1_primary_trainer(
+            data_bundle=data_bundle,
+            graph_bundle=graph_bundle,
+            cache_config=cache_config,
+            mlflow_client=mlflow_client,
+            num_epochs=num_epochs,
+        )
+        summarize_stage1_setup(num_epochs, data_bundle, cache_config, trainer_bundle)
+        print(
+            "[Stage1 Cache] Reusing parent run '{}' (ID: {}). Stage-1 training will be skipped.".format(
+                cache_config.run_name,
+                cache_config.run_id,
+            )
+        )
+        with mlflow.start_run(run_id=cache_config.run_id):
+            trainer_bundle.primary.mgate.eval()
+            with torch.no_grad():
+                source_embeddings = trainer_bundle.primary.infer(
+                    trainer_bundle.primary_source_graph_tf,
+                    trainer_bundle.primary_source_graph_tf,
+                    graph_bundle.source.gp_tf,
+                    graph_bundle.source.x1,
+                    graph_bundle.source.x2,
                 )
+            maybe_run_stage2_and_log(
+                args=args,
+                data_bundle=data_bundle,
+                graph_bundle=graph_bundle,
+                trainer_bundle=trainer_bundle,
+                source_embeddings=source_embeddings,
+                vgp_anchor_mode=cache_config.vgp_anchor_mode,
             )
+        return
 
-            stage2_trainer, stage2_run_id = run_stage2_distillation(
-                source_trainer=stage1_primary_trainer,
-                target_rna=target_rna,
-                target_atac=target_atac,
-                target_graph_tf=target_graph_tf,
-                target_gp_tf=target_gp_tf,
-                target_x1=target_x1,
-                target_x2=target_x2,
-                source_graph_tf=stage1_primary_source_graph_tf,
-                source_gp_tf=source_gp_tf,
-                source_x1=source_x1,
-                source_x2=source_x2,
-                stage2_epochs=args.stage2_epochs,
-                lambda_kd=args.lambda_kd,
-                kd_mix_kl=args.kd_mix_kl,
-                kd_mix_ot=args.kd_mix_ot,
-                target_label_key=args.target_label_key,
-                scib_n_jobs=args.scib_n_jobs,
-                vgp_anchor_mode=effective_vgp_anchor_mode,
-            )
-            if stage2_trainer is None or stage2_run_id is None:
-                raise RuntimeError("Stage-2 trainer/run-id was not returned despite stage2_epochs > 0.")
+    trainer_bundle = initialize_stage1_trainers_for_training(
+        data_bundle=data_bundle,
+        graph_bundle=graph_bundle,
+        cache_config=cache_config,
+        num_epochs=num_epochs,
+    )
+    summarize_stage1_setup(num_epochs, data_bundle, cache_config, trainer_bundle)
+    run_stage1_training_and_log(
+        args=args,
+        experiment_id=experiment_id,
+        run_name=run_name,
+        eval_every=eval_every,
+        num_epochs=num_epochs,
+        data_bundle=data_bundle,
+        graph_bundle=graph_bundle,
+        trainer_bundle=trainer_bundle,
+        cache_config=cache_config,
+    )
 
-            set_multigate_embeddings(
-                source_rna,
-                source_atac,
-                source_embeddings[0],
-                source_embeddings[1],
-                key_added="MultiGATE",
-            )
-            log_stage2_artifacts_for_run(
-                stage2_run_id=stage2_run_id,
-                stage2_trainer=stage2_trainer,
-                source_rna=source_rna,
-                source_atac=source_atac,
-                target_rna=target_rna,
-                target_atac=target_atac,
-                target_graph_tf=target_graph_tf,
-                target_gp_tf=target_gp_tf,
-                target_x1=target_x1,
-                target_x2=target_x2,
-                log_mudata_umaps=args.log_mudata_umaps,
-            )
-        else:
-            print("[Stage2 KD] Skipped because --stage2-epochs is 0.")
 
-#%%
 if __name__ == "__main__":
     main()
-else:
-
-    _auto_ready = all(
-        name in globals()
-        for name in ("source_peak_gene_attention", "source_rna", "source_atac")
-    )
-    if _auto_ready:
-        attention_analysis_summary = run_gene_peak_attention_tutorial(
-            peak_gene_attention=source_peak_gene_attention,
-            adata_rna=source_rna,
-            adata_atac=source_atac,
-        )
-    else:
-        print(
-            "Imported gene_peak_attention_utils. "
-            "Run run_gene_peak_attention_tutorial(...) after training objects are available."
-        )
