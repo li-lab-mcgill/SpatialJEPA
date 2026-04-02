@@ -82,6 +82,7 @@ def require_runtime_bootstrap():
 
 import matplotlib.pyplot as plt
 import mlflow
+from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 import muon as mu
 import numpy as np
@@ -1514,49 +1515,83 @@ def log_stage2_artifacts_for_run(
                 )
 
 
+def _mlflow_namespace_dir():
+    """MultiGATE artifact / local-DB root under MLFLOW_BASE_DIR."""
+    env_mlflow_base_dir = os.environ.get("MLFLOW_BASE_DIR", os.path.expanduser("~/services/mlflow/artifacts"))
+    mlflow_base_dir = os.path.abspath(env_mlflow_base_dir)
+    if os.path.basename(mlflow_base_dir.rstrip(os.sep)) != "MultiGATE":
+        mlflow_base_dir = os.path.join(mlflow_base_dir, "MultiGATE")
+    return mlflow_base_dir
+
+
+def _mlflow_tracking_connection_failed(exc):
+    msg = str(exc).lower()
+    return any(
+        fragment in msg
+        for fragment in (
+            "connection refused",
+            "failed to establish",
+            "connection error",
+            "max retries exceeded",
+            "newconnectionerror",
+        )
+    )
+
+
 def setup_mlflow():
     require_runtime_bootstrap()
 
-    # Default to a clean tracking location under BAKLAVA_base so we don't
-    # accidentally write into other repos' local `mlruns/` directories.
-    baklava_base_dir = os.path.dirname(REPO_ROOT)
-    default_mlflow_base_dir = os.path.join(baklava_base_dir, "mlflow_tracking", "MultiGATE")
-
-    # If a global MLFLOW_BASE_DIR is set (e.g. by BAKLAVA's `.env`), namespace
-    # MultiGATE runs under a dedicated subdirectory to avoid schema/version
-    # conflicts with other MLflow usage.
-    env_mlflow_base_dir = os.environ.get("MLFLOW_BASE_DIR")
-    if env_mlflow_base_dir:
-        mlflow_base_dir = os.path.abspath(env_mlflow_base_dir)
-        if os.path.basename(mlflow_base_dir.rstrip(os.sep)) != "MultiGATE":
-            mlflow_base_dir = os.path.join(mlflow_base_dir, "MultiGATE")
-    else:
-        mlflow_base_dir = os.path.abspath(default_mlflow_base_dir)
+    mlflow_base_dir = _mlflow_namespace_dir()
     os.makedirs(mlflow_base_dir, exist_ok=True)
+    print("MLflow artifact dir:", mlflow_base_dir)
 
-    mlflow_db_path = os.path.join(mlflow_base_dir, "mlflow.db")
-    tracking_uri = "sqlite:///{}".format(mlflow_db_path)
-    os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
+    # Optional: log to a local SQLite file instead of the HTTP tracking server (no postgres/mlflow
+    # process needed).  export MLFLOW_OFFLINE_SQLITE=1
+    offline = os.environ.get("MLFLOW_OFFLINE_SQLITE", "").lower() in ("1", "true", "yes")
+    if offline:
+        mlflow_db_path = os.path.join(mlflow_base_dir, "mlflow.db")
+        tracking_uri = "sqlite:///{}".format(mlflow_db_path)
+        print("MLFLOW_OFFLINE_SQLITE: using local backend", tracking_uri)
+    else:
+        # Point to the MLflow tracking server (PostgreSQL-backed).
+        tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
+
     mlflow.set_tracking_uri(tracking_uri)
-    print("MLflow backend-store-uri:", tracking_uri)
-    print("MLflow base dir:", mlflow_base_dir)
+    print("MLflow tracking URI:", tracking_uri)
 
     experiment_name = "multigate_mouse_brain_live_zeroshot"
-    artifact_dir = os.path.join(mlflow_base_dir, "mlflow_artifacts", experiment_name)
+    artifact_dir = os.path.join(mlflow_base_dir, experiment_name)
     os.makedirs(artifact_dir, exist_ok=True)
 
-    experiment = mlflow.get_experiment_by_name(experiment_name)
-    if experiment is None:
-        experiment_id = mlflow.create_experiment(
-            experiment_name,
-            artifact_location=os.path.abspath(artifact_dir),
-        )
-        print("Created MLflow experiment: {} (ID: {})".format(experiment_name, experiment_id))
-    else:
-        experiment_id = experiment.experiment_id
-        print("Using MLflow experiment: {} (ID: {})".format(experiment_name, experiment_id))
+    try:
+        experiment = mlflow.get_experiment_by_name(experiment_name)
+        if experiment is None:
+            experiment_id = mlflow.create_experiment(
+                experiment_name,
+                artifact_location=os.path.abspath(artifact_dir),
+            )
+            print("Created MLflow experiment: {} (ID: {})".format(experiment_name, experiment_id))
+        else:
+            experiment_id = experiment.experiment_id
+            print("Using MLflow experiment: {} (ID: {})".format(experiment_name, experiment_id))
 
-    mlflow.set_experiment(experiment_name=experiment_name)
+        mlflow.set_experiment(experiment_name=experiment_name)
+    except MlflowException as e:
+        if offline or not _mlflow_tracking_connection_failed(e):
+            raise
+        baklava_root = os.path.join(os.path.dirname(REPO_ROOT), "BAKLAVA")
+        starter = os.path.join(baklava_root, "scripts", "start_mlflow_services.sh")
+        raise RuntimeError(
+            "Cannot reach the MLflow tracking server at {!r} (connection refused or unreachable). "
+            "Start PostgreSQL + the MLflow server first, e.g. in tmux:\n"
+            "  conda activate nichecompass  # or your project env\n"
+            "  bash {}\n"
+            "Or run without a server by setting:\n"
+            "  export MLFLOW_OFFLINE_SQLITE=1\n"
+            "(uses a SQLite DB under the MultiGATE artifact directory; not for multi-node jobs.)"
+            .format(tracking_uri, starter)
+        ) from e
+
     return experiment_id
 
 
