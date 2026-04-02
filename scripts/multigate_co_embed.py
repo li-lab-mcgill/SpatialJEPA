@@ -225,8 +225,17 @@ def parse_args(notebook: bool = False):
 
 # ─── MLflow helpers ───────────────────────────────────────────────────────────
 
-def setup_mlflow_tracking():
-    """Point MLflow at the MultiGATE tracking DB, mirroring mouse_brain_spatial_rna_atac.py."""
+def setup_mlflow_tracking(backend_type="auto"):
+
+    valid_backends = ["auto", "sqlite", "postgres"]
+    if backend_type not in valid_backends:
+        raise ValueError(
+            "Invalid MLflow backend type '{}'. Expected one of {}.".format(
+                backend_type, valid_backends
+            )
+        )
+
+    # Keep MultiGATE artifacts/runs namespaced under a dedicated subdirectory.
     env_mlflow_base_dir = os.environ.get("MLFLOW_BASE_DIR")
     if env_mlflow_base_dir:
         mlflow_base_dir = os.path.abspath(env_mlflow_base_dir)
@@ -235,9 +244,23 @@ def setup_mlflow_tracking():
     else:
         mlflow_base_dir = os.path.join(BAKLAVA_BASE_DIR, "mlflow_tracking", "MultiGATE")
 
-    mlflow_db_path = os.path.join(mlflow_base_dir, "mlflow.db")
-    tracking_uri = "sqlite:///{}".format(mlflow_db_path)
-    os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
+    env_tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
+    if backend_type == "auto":
+        # If a non-SQLite tracking URI is present (e.g. http://127.0.0.1:5000),
+        # prefer it so this script can read runs logged through an MLflow server
+        # backed by PostgreSQL.
+        if env_tracking_uri and not env_tracking_uri.startswith("sqlite:///"):
+            backend_type = "postgres"
+        else:
+            backend_type = "sqlite"
+
+    if backend_type == "postgres":
+        tracking_uri = env_tracking_uri or "http://127.0.0.1:5000"
+    else:
+        mlflow_db_path = os.path.join(mlflow_base_dir, "mlflow.db")
+        tracking_uri = "sqlite:///{}".format(mlflow_db_path)
+        os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
+
     mlflow.set_tracking_uri(tracking_uri)
     print("MLflow tracking URI:", tracking_uri)
     return mlflow_base_dir
