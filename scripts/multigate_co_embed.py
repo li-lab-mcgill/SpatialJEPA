@@ -152,6 +152,42 @@ def parse_args(notebook: bool = False):
         ),
     )
     p.add_argument(
+        "--mlflow-backend",
+        choices=["auto", "sqlite", "server"],
+        default="auto",
+        help=(
+            "Tracking backend mode. "
+            "'auto' infers backend from --tracking-uri / MLFLOW_TRACKING_URI. "
+            "'sqlite' uses sqlite:///.../mlflow.db (auto-builds from --mlflow-base-dir when URI is absent). "
+            "'server' requires an http(s) tracking URI."
+        ),
+    )
+    p.add_argument(
+        "--tracking-uri",
+        default=None,
+        help=(
+            "Explicit MLflow tracking URI override. "
+            "Takes precedence over MLFLOW_TRACKING_URI."
+        ),
+    )
+    p.add_argument(
+        "--mlflow-base-dir",
+        default=None,
+        help=(
+            "Base directory for MultiGATE MLflow namespace. "
+            "Used to construct sqlite:///.../mlflow.db when --mlflow-backend sqlite "
+            "and no tracking URI is provided."
+        ),
+    )
+    p.add_argument(
+        "--experiment-name",
+        default="multigate_mouse_brain_live_zeroshot",
+        help=(
+            "MLflow experiment name used to resolve --run-name. "
+            "Defaults to the training script experiment."
+        ),
+    )
+    p.add_argument(
         "--source-model",
         choices=["stage1", "stage1_teacher", "stage1_student"],
         default="stage1",
@@ -225,9 +261,64 @@ def parse_args(notebook: bool = False):
 
 # ─── MLflow helpers ───────────────────────────────────────────────────────────
 
-def setup_mlflow_tracking(backend_type="auto"):
+def _normalize_mlflow_base_dir(mlflow_base_dir=None):
+    if mlflow_base_dir is not None:
+        raw_base_dir = mlflow_base_dir
+    elif os.environ.get("MLFLOW_BASE_DIR"):
+        raw_base_dir = os.environ["MLFLOW_BASE_DIR"]
+    else:
+        raw_base_dir = os.path.join(BAKLAVA_BASE_DIR, "mlflow_tracking")
 
-    valid_backends = ["auto", "sqlite", "postgres"]
+    normalized = os.path.abspath(raw_base_dir)
+    if os.path.basename(normalized.rstrip(os.sep)) != "MultiGATE":
+        normalized = os.path.join(normalized, "MultiGATE")
+    return normalized
+
+
+def _infer_tracking_backend_from_uri(tracking_uri):
+    if tracking_uri.startswith("sqlite:///"):
+        return "sqlite"
+    if tracking_uri.startswith("http://") or tracking_uri.startswith("https://"):
+        return "server"
+    raise ValueError(
+        "Unsupported tracking URI '{}'. Expected sqlite:///..., http://..., or https://...".format(
+            tracking_uri
+        )
+    )
+
+
+def _tracking_backend_hint(tracking_config):
+    if not tracking_config:
+        return ""
+
+    backend = tracking_config.get("backend")
+    if backend == "sqlite":
+        db_path = tracking_config.get("mlflow_db_path")
+        return (
+            " Backend=sqlite. Ensure this matches the training DB ({}) or pass "
+            "--tracking-uri sqlite:///.../mlflow.db / --mlflow-base-dir explicitly."
+        ).format(db_path)
+
+    if backend == "server":
+        uri = tracking_config.get("tracking_uri")
+        return (
+            " Backend=server at {}. Ensure the MLflow host is reachable from this job; "
+            "on remote/Slurm, 127.0.0.1 only works when the server is on the same node."
+        ).format(uri)
+
+    return ""
+
+
+def setup_mlflow_tracking(
+    backend_type="auto",
+    tracking_uri=None,
+    mlflow_base_dir=None,
+    experiment_name="multigate_mouse_brain_live_zeroshot",
+):
+    if backend_type == "postgres":
+        backend_type = "server"
+
+    valid_backends = ["auto", "sqlite", "server"]
     if backend_type not in valid_backends:
         raise ValueError(
             "Invalid MLflow backend type '{}'. Expected one of {}.".format(
@@ -235,38 +326,75 @@ def setup_mlflow_tracking(backend_type="auto"):
             )
         )
 
-    # Keep MultiGATE artifacts/runs namespaced under a dedicated subdirectory.
-    env_mlflow_base_dir = os.environ.get("MLFLOW_BASE_DIR")
-    if env_mlflow_base_dir:
-        mlflow_base_dir = os.path.abspath(env_mlflow_base_dir)
-        if os.path.basename(mlflow_base_dir.rstrip(os.sep)) != "MultiGATE":
-            mlflow_base_dir = os.path.join(mlflow_base_dir, "MultiGATE")
-    else:
-        mlflow_base_dir = os.path.join(BAKLAVA_BASE_DIR, "mlflow_tracking", "MultiGATE")
+    normalized_base_dir = _normalize_mlflow_base_dir(mlflow_base_dir)
+    resolved_tracking_uri = tracking_uri or os.environ.get("MLFLOW_TRACKING_URI")
+    resolved_backend = backend_type
 
-    env_tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
     if backend_type == "auto":
-        # If a non-SQLite tracking URI is present (e.g. http://127.0.0.1:5000),
-        # prefer it so this script can read runs logged through an MLflow server
-        # backed by PostgreSQL.
-        if env_tracking_uri and not env_tracking_uri.startswith("sqlite:///"):
-            backend_type = "postgres"
-        else:
-            backend_type = "sqlite"
+        if resolved_tracking_uri is None:
+            raise ValueError(
+                "MLflow backend is 'auto' but no tracking URI is configured. "
+                "Set --tracking-uri or MLFLOW_TRACKING_URI, or choose "
+                "--mlflow-backend sqlite to use a local mlflow.db."
+            )
+        resolved_backend = _infer_tracking_backend_from_uri(resolved_tracking_uri)
+    elif backend_type == "sqlite":
+        if resolved_tracking_uri is None:
+            mlflow_db_path = os.path.join(normalized_base_dir, "mlflow.db")
+            resolved_tracking_uri = "sqlite:///{}".format(mlflow_db_path)
+        inferred_backend = _infer_tracking_backend_from_uri(resolved_tracking_uri)
+        if inferred_backend != "sqlite":
+            raise ValueError(
+                "--mlflow-backend sqlite requires sqlite:///... URI, got '{}'.".format(
+                    resolved_tracking_uri
+                )
+            )
+    else:  # server
+        if resolved_tracking_uri is None:
+            raise ValueError(
+                "--mlflow-backend server requires --tracking-uri or MLFLOW_TRACKING_URI "
+                "(http://... or https://...)."
+            )
+        inferred_backend = _infer_tracking_backend_from_uri(resolved_tracking_uri)
+        if inferred_backend != "server":
+            raise ValueError(
+                "--mlflow-backend server requires http(s) URI, got '{}'.".format(
+                    resolved_tracking_uri
+                )
+            )
 
-    if backend_type == "postgres":
-        tracking_uri = env_tracking_uri or "http://127.0.0.1:5000"
-    else:
-        mlflow_db_path = os.path.join(mlflow_base_dir, "mlflow.db")
-        tracking_uri = "sqlite:///{}".format(mlflow_db_path)
-        os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
+    mlflow_db_path = None
+    if resolved_tracking_uri.startswith("sqlite:///"):
+        mlflow_db_path = resolved_tracking_uri[len("sqlite:///"):]
 
-    mlflow.set_tracking_uri(tracking_uri)
-    print("MLflow tracking URI:", tracking_uri)
-    return mlflow_base_dir
+    os.environ["MLFLOW_TRACKING_URI"] = resolved_tracking_uri
+    mlflow.set_tracking_uri(resolved_tracking_uri)
+
+    tracking_config = {
+        "backend": resolved_backend,
+        "tracking_uri": resolved_tracking_uri,
+        "mlflow_base_dir": normalized_base_dir,
+        "mlflow_db_path": mlflow_db_path,
+        "experiment_name": experiment_name,
+    }
+    print(
+        "MLflow config: backend={}, tracking_uri={}, experiment={}".format(
+            tracking_config["backend"],
+            tracking_config["tracking_uri"],
+            tracking_config["experiment_name"],
+        )
+    )
+    if mlflow_db_path:
+        print("MLflow sqlite db:", mlflow_db_path)
+    return tracking_config
 
 
-def resolve_run_id_from_name(client, run_name, experiment_name="multigate_mouse_brain_live_zeroshot"):
+def resolve_run_id_from_name(
+    client,
+    run_name,
+    experiment_name="multigate_mouse_brain_live_zeroshot",
+    tracking_config=None,
+):
     """
     Look up the run ID for a given run name within the MultiGATE experiment.
     MLflow stores the run name both in run.info.run_name and as the tag
@@ -277,9 +405,9 @@ def resolve_run_id_from_name(client, run_name, experiment_name="multigate_mouse_
     if experiment is None:
         raise ValueError(
             "MLflow experiment '{}' not found. "
-            "Ensure the tracking URI points to the correct database.".format(
+            "Ensure the tracking URI points to the correct tracking store.{}".format(
                 experiment_name
-            )
+            ) + _tracking_backend_hint(tracking_config)
         )
     runs = client.search_runs(
         experiment_ids=[experiment.experiment_id],
@@ -287,9 +415,9 @@ def resolve_run_id_from_name(client, run_name, experiment_name="multigate_mouse_
     )
     if len(runs) == 0:
         raise ValueError(
-            "No run named '{}' found in experiment '{}'.".format(
+            "No run named '{}' found in experiment '{}'.{}".format(
                 run_name, experiment_name
-            )
+            ) + _tracking_backend_hint(tracking_config)
         )
     if len(runs) > 1:
         ids = [r.info.run_id for r in runs]
@@ -352,7 +480,13 @@ def list_stage2_child_runs(client, experiment_id, parent_run_id):
 STAGE2_MODEL_ARTIFACT = "models/model_stage2.pth"
 
 
-def resolve_stage2_model_run(client, experiment_id, parent_run_id, stage2_run_name=None):
+def resolve_stage2_model_run(
+    client,
+    experiment_id,
+    parent_run_id,
+    stage2_run_name=None,
+    tracking_config=None,
+):
     """
     Resolve which run ID should provide model_stage2.pth.
 
@@ -365,25 +499,28 @@ def resolve_stage2_model_run(client, experiment_id, parent_run_id, stage2_run_na
     """
     stage2_children = list_stage2_child_runs(client, experiment_id, parent_run_id)
     parent_has_legacy = artifact_exists(client, parent_run_id, STAGE2_MODEL_ARTIFACT)
+    backend_hint = _tracking_backend_hint(tracking_config)
 
     if stage2_run_name is not None:
         matches = [r for r in stage2_children if r["run_name"] == stage2_run_name]
         if len(matches) == 0:
             raise ValueError(
                 "No stage2 child run named '{}' found under parent run {}. "
-                "Available stage2 child runs: {}".format(
+                "Available stage2 child runs: {}.{}".format(
                     stage2_run_name,
                     parent_run_id,
                     _format_stage2_run_choices(stage2_children),
+                    backend_hint,
                 )
             )
         if len(matches) > 1:
             raise ValueError(
                 "Multiple stage2 child runs named '{}' found under parent run {}: {}. "
-                "Use unique child run names.".format(
+                "Use unique child run names.{}".format(
                     stage2_run_name,
                     parent_run_id,
                     _format_stage2_run_choices(matches),
+                    backend_hint,
                 )
             )
         selected = matches[0]
@@ -395,11 +532,12 @@ def resolve_stage2_model_run(client, experiment_id, parent_run_id, stage2_run_na
             return parent_run_id, selected["run_name"], "parent_legacy"
         raise FileNotFoundError(
             "Stage-2 child run '{}' (ID: {}) has no artifact '{}', and parent run {} "
-            "has none either. Confirm the Run ID matches and that stage-2 logging finished.".format(
+            "has none either. Confirm the Run ID matches and that stage-2 logging finished.{}".format(
                 stage2_run_name,
                 selected["run_id"],
                 STAGE2_MODEL_ARTIFACT,
                 parent_run_id,
+                backend_hint,
             )
         )
 
@@ -412,20 +550,22 @@ def resolve_stage2_model_run(client, experiment_id, parent_run_id, stage2_run_na
         raise FileNotFoundError(
             "Child run '{}' (ID: {}) exists under parent but has no '{}'; "
             "parent {} also has no legacy checkpoint. "
-            "Re-run stage-2 or remove the empty nested run.".format(
+            "Re-run stage-2 or remove the empty nested run.{}".format(
                 selected["run_name"],
                 selected["run_id"],
                 STAGE2_MODEL_ARTIFACT,
                 parent_run_id,
+                backend_hint,
             )
         )
 
     if len(stage2_children) > 1:
         raise ValueError(
             "Found multiple stage2 child runs under parent run {}: {}. "
-            "Pass --stage2-run-name to select one.".format(
+            "Pass --stage2-run-name to select one.{}".format(
                 parent_run_id,
                 _format_stage2_run_choices(stage2_children),
+                backend_hint,
             )
         )
 
@@ -434,7 +574,11 @@ def resolve_stage2_model_run(client, experiment_id, parent_run_id, stage2_run_na
 
     raise ValueError(
         "No stage2 child runs found under parent run {} and no legacy "
-        "parent artifact {} exists.".format(parent_run_id, STAGE2_MODEL_ARTIFACT)
+        "parent artifact {} exists.{}".format(
+            parent_run_id,
+            STAGE2_MODEL_ARTIFACT,
+            backend_hint,
+        )
     )
 
 
@@ -645,9 +789,19 @@ def main():
     #args.run_name = '20260331_105802'
     #args.stage2_run_name = '20260331_105802_stage2_20260331_122453'
 
-    setup_mlflow_tracking()
+    tracking_config = setup_mlflow_tracking(
+        backend_type=args.mlflow_backend,
+        tracking_uri=args.tracking_uri,
+        mlflow_base_dir=args.mlflow_base_dir,
+        experiment_name=args.experiment_name,
+    )
     client = MlflowClient()
-    run_id = resolve_run_id_from_name(client, args.run_name)
+    run_id = resolve_run_id_from_name(
+        client,
+        args.run_name,
+        experiment_name=args.experiment_name,
+        tracking_config=tracking_config,
+    )
     run_params = load_run_params(client, run_id, args.run_name)
     parent_run = client.get_run(run_id)
     experiment_id = parent_run.info.experiment_id
@@ -683,6 +837,7 @@ def main():
             experiment_id=experiment_id,
             parent_run_id=run_id,
             stage2_run_name=args.stage2_run_name,
+            tracking_config=tracking_config,
         )
         if resolved_stage2_source_kind == "child":
             print(
@@ -1413,7 +1568,18 @@ def main():
 
     # Find the artifact path for the attention matrix
     with tempfile.TemporaryDirectory() as tmp_dir:
-        local_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path="matrices/source_peak_gene_attention.npz", dst_path=tmp_dir)
+        attention_artifact_path = "matrices/source_peak_gene_attention.npz"
+        if not artifact_exists(client, run_id, attention_artifact_path):
+            raise FileNotFoundError(
+                "Artifact '{}' not found for run {}.".format(
+                    attention_artifact_path, run_id
+                )
+            )
+        local_path = client.download_artifacts(
+            run_id,
+            attention_artifact_path,
+            tmp_dir,
+        )
         source_peak_gene_attention = sp.load_npz(local_path)
 
     attention_analysis_summary = run_gene_peak_attention_tutorial(
