@@ -786,8 +786,16 @@ def main():
     print("Device:", device, "(deterministic mode)")
 
     #%% ── MLflow setup ────────────────────────────────────────────────────────
-    #args.run_name = '20260331_105802'
-    #args.stage2_run_name = '20260331_105802_stage2_20260331_122453'
+    #bash /home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/scripts/start_mlflow_services.sh all
+
+    #args.run_name = '20260402_153455'
+    #args.stage2_run_name = '20260402_153455_stage2_20260402_165006'
+    #sqlite_tracking_uri = "sqlite:////home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db"
+    #postgres_tracking_uri = "http://127.0.0.1:5000"
+    #args.tracking_uri = postgres_tracking_uri
+
+    #lsof /home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db
+    #curl -i http://127.0.0.1:5000
 
     tracking_config = setup_mlflow_tracking(
         backend_type=args.mlflow_backend,
