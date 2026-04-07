@@ -1596,7 +1596,21 @@ def run_stage2_distillation(
             loss_val = float(distill_loss.detach().cpu().item())
             pbar.set_postfix({"distill_loss": "{:.4f}".format(loss_val)})
 
+            # Drop training forward tensors before periodic eval; otherwise eval runs
+            # with student_outputs/teacher_outputs still resident and OOMs on peak epochs.
+            del student_outputs, teacher_outputs
+            del student_clip_rna, student_clip_atac, teacher_clip_rna, teacher_clip_atac
+            del student_logits, teacher_logits, kd_ot_loss, kd_kl_loss, distill_loss
+
             if (epoch == 1) or (epoch % 500 == 0) or (epoch == stage2_epochs):
+                # Last epoch: teacher is not needed again; infer_* builds extra trainers and peaks VRAM.
+                if epoch == stage2_epochs:
+                    del teacher_model, teacher_trainer
+                    teacher_model = None
+                    teacher_trainer = None
+                    if str(student_trainer.device).startswith("cuda"):
+                        torch.cuda.empty_cache()
+
                 source_eval_embeddings, target_eval_embeddings, target_eval_trainer = infer_source_and_zero_shot_target_embeddings(
                     source_trainer=student_trainer,
                     source_graph_tf=source_eval_graph_tf,
@@ -1651,10 +1665,6 @@ def run_stage2_distillation(
                 mlflow.log_metric("stage2_source_target_balanced_mmd", stage2_mmd_value, step=epoch)
                 del source_eval_embeddings, target_eval_embeddings, target_eval_trainer
                 del source_eval_rna_embeddings, source_eval_atac_embeddings, target_eval_rna_embeddings, target_eval_atac_embeddings, stage2_mmd_value
-
-            del student_outputs, teacher_outputs
-            del student_clip_rna, student_clip_atac, teacher_clip_rna, teacher_clip_atac
-            del student_logits, teacher_logits, kd_ot_loss, kd_kl_loss, distill_loss
 
     final_target_embeddings, final_target_trainer = infer_target_embeddings_from_source_trainer(
         source_trainer=student_trainer,
