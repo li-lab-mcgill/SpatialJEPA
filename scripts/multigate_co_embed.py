@@ -40,6 +40,7 @@ Usage:
 """
 #%%
 import argparse
+import json
 import os
 import random
 import shutil
@@ -478,6 +479,7 @@ def list_stage2_child_runs(client, experiment_id, parent_run_id):
 
 
 STAGE2_MODEL_ARTIFACT = "models/model_stage2.pth"
+SPLIT_ARTIFACT = "splits/domain_splits.json"
 
 
 def resolve_stage2_model_run(
@@ -608,6 +610,44 @@ def download_model_artifact(client, run_id, artifact_name, dst_dir):
     print("  Downloading {} ...".format(artifact_path))
     local_path = client.download_artifacts(run_id, artifact_path, dst_dir)
     return local_path
+
+
+def load_domain_splits_artifact(client, run_id, dst_dir):
+    if not artifact_exists(client, run_id, SPLIT_ARTIFACT):
+        return None
+    local_path = client.download_artifacts(run_id, SPLIT_ARTIFACT, dst_dir)
+    with open(local_path, "r") as f:
+        return json.load(f)
+
+
+def subset_domain_to_saved_split(rna, atac, split_metadata, domain_name, split_name="eval"):
+    if split_metadata is None:
+        raise ValueError("split_metadata cannot be None when applying saved splits.")
+
+    domain_payload = split_metadata.get("domains", {}).get(domain_name)
+    if domain_payload is None:
+        raise KeyError("Split metadata missing domain '{}'.".format(domain_name))
+    split_payload = domain_payload.get("splits", {}).get(split_name)
+    if split_payload is None:
+        raise KeyError("Split metadata missing split '{}' for domain '{}'.".format(split_name, domain_name))
+
+    split_obs_names = [str(v) for v in split_payload.get("obs_names", [])]
+    if len(split_obs_names) == 0:
+        raise ValueError("Split '{}' for domain '{}' has zero observations.".format(split_name, domain_name))
+
+    missing_rna = [obs for obs in split_obs_names if obs not in rna.obs_names]
+    missing_atac = [obs for obs in split_obs_names if obs not in atac.obs_names]
+    if missing_rna or missing_atac:
+        raise KeyError(
+            "Saved split '{}' for domain '{}' does not match current AnnData obs_names "
+            "(missing in RNA: {}, missing in ATAC: {}).".format(
+                split_name,
+                domain_name,
+                len(missing_rna),
+                len(missing_atac),
+            )
+        )
+    return rna[split_obs_names].copy(), atac[split_obs_names].copy()
 
 
 # ─── Model reconstruction ─────────────────────────────────────────────────────
@@ -745,9 +785,21 @@ def run_inference(mgate, graph_tf, gp_tf, x1_df, x2_df, device):
     a_t  = _as_sparse_tensor(graph_tf, device)
     gp_t = _as_sparse_tensor(gp_tf,    device)
 
-    mgate.eval()
+    infer_mgate = mgate
+    infer_mode = getattr(mgate, "vgp_anchor_mode", "spot")
+    if infer_mode == "spot":
+        current_spot_num = int(mgate.vgp0.shape[0])
+        if current_spot_num != int(x1_t.shape[0]):
+            infer_mgate = build_zero_shot_mgate(
+                source_mgate=mgate,
+                target_spot_num=int(x1_t.shape[0]),
+                vgp_anchor_mode=infer_mode,
+                device=device,
+            )
+
+    infer_mgate.eval()
     with torch.no_grad():
-        outputs = mgate(a_t, a_t, gp_t, x1_t, x2_t)
+        outputs = infer_mgate(a_t, a_t, gp_t, x1_t, x2_t)
 
     rna_emb  = outputs[5].detach().cpu().numpy()
     atac_emb = outputs[6].detach().cpu().numpy()
@@ -823,10 +875,27 @@ def main():
     bp_width       = int(run_params.get("bp_width", 400))
     graph_type     = run_params.get("graph_type", "ATAC")
     dual_source_kd = run_params.get("stage1_dual_source_kd", "False").lower() == "true"
-    target_subsample_n = int(run_params.get("target_subsample_n", 5000))
-    target_subsample_seed = int(run_params.get("target_subsample_seed", 0))
-    if target_subsample_n <= 0:
+    legacy_target_subsample_n = int(run_params.get("target_subsample_n", 5000))
+    legacy_target_subsample_seed = int(run_params.get("target_subsample_seed", 0))
+    if legacy_target_subsample_n <= 0:
         raise ValueError("--target-subsample-n must be a positive integer.")
+
+    split_metadata = None
+    with tempfile.TemporaryDirectory() as split_tmpdir:
+        split_metadata = load_domain_splits_artifact(client, run_id, split_tmpdir)
+    if split_metadata is not None:
+        print(
+            "Loaded split artifact '{}' (evaluation split: {}). Using source/target eval subsets by default.".format(
+                SPLIT_ARTIFACT,
+                split_metadata.get("evaluation_split", "val_plus_test"),
+            )
+        )
+    else:
+        print(
+            "Split artifact '{}' not found. Falling back to legacy target subsampling.".format(
+                SPLIT_ARTIFACT
+            )
+        )
 
     # Validate model selections against available artifacts
     if args.source_model in ("stage1_teacher", "stage1_student") and not dual_source_kd:
@@ -1006,24 +1075,54 @@ def main():
             # Zero-shot: built after download, outside the tmpdir block
             target_mgate = None
 
-    #%% ── Subsample source cells to match target cells ────────────────────────────────────────────────────────────
-    '''
-    print("[TMP] Subsampling source cells to match target cells...")
-    source_rna, source_atac = pair_and_subsample_target(
-        source_rna, source_atac,
-        subsample_n=args.target_subsample_n,
-        seed=args.target_subsample_seed,
-    )
-    print("  {} cells after pairing/subsampling".format(source_rna.n_obs))
-    '''
-    #%% ── Source spatial graph ─────────────────────────────────────────────────
+    #%% ── Source/Target graph preparation ─────────────────────────────────────
     print("\nBuilding source spatial graph...")
     MultiGATE.Cal_Spatial_Net(source_rna, rad_cutoff=40)
     MultiGATE.Stats_Spatial_Net(source_rna)
     MultiGATE.Cal_Spatial_Net(source_atac, rad_cutoff=40)
     MultiGATE.Stats_Spatial_Net(source_atac)
-    # source_rna already has gene_peak_Net from above
     source_atac.uns["gene_peak_Net"] = gp_net.copy()
+
+    print("Building target graph (type: '{}')...".format(spatial_graph_type))
+    target_rna, target_atac = prepare_target_for_spatial_graph_type(
+        target_rna=target_rna,
+        target_atac=target_atac,
+        source_rna=source_rna,
+        source_atac=source_atac,
+        spatial_graph_type=spatial_graph_type,
+        gtf_path=gtf_path,
+    )
+
+    if split_metadata is not None:
+        source_rna, source_atac = subset_domain_to_saved_split(
+            source_rna,
+            source_atac,
+            split_metadata=split_metadata,
+            domain_name="source",
+            split_name="eval",
+        )
+        target_rna, target_atac = subset_domain_to_saved_split(
+            target_rna,
+            target_atac,
+            split_metadata=split_metadata,
+            domain_name="target",
+            split_name="eval",
+        )
+        print(
+            "Applied split artifact eval subsets: source={} cells, target={} cells".format(
+                source_rna.n_obs,
+                target_rna.n_obs,
+            )
+        )
+    else:
+        print("\nPairing and subsampling target cells (legacy fallback)...")
+        target_rna, target_atac = pair_and_subsample_target(
+            target_rna,
+            target_atac,
+            subsample_n=legacy_target_subsample_n,
+            seed=legacy_target_subsample_seed,
+        )
+        print("  {} cells after pairing/subsampling".format(target_rna.n_obs))
 
     source_graph_tf, source_gp_tf, source_x1, source_x2 = build_graph_inputs(
         source_rna, source_atac, bp_width=bp_width, graph_type=graph_type
@@ -1031,7 +1130,6 @@ def main():
     print("  Source graph built: {} cells".format(source_rna.n_obs))
 
     source_student_graph_type = run_params.get("stage1_student_graph", "identity")
-
     if args.source_model == "stage1_teacher":
         source_infer_graph_tf = source_graph_tf
         source_graph_mode = "spatial_teacher_graph"
@@ -1053,24 +1151,6 @@ def main():
             source_graph_mode = "stage1_primary_teacher_graph(spatial)"
     print("  Source inference graph:", source_graph_mode)
 
-    # ── Target graphs ────────────────────────────────────────────────────────
-    print("Building target graph (type: '{}')...".format(spatial_graph_type))
-    target_rna, target_atac = prepare_target_for_spatial_graph_type(
-        target_rna=target_rna,
-        target_atac=target_atac,
-        source_rna=source_rna,
-        source_atac=source_atac,
-        spatial_graph_type=spatial_graph_type,
-        gtf_path=gtf_path,
-    )
-    print("\nPairing and subsampling target cells...")
-    target_rna, target_atac = pair_and_subsample_target(
-        target_rna,
-        target_atac,
-        subsample_n=target_subsample_n,
-        seed=target_subsample_seed,
-    )
-    print("  {} cells after pairing/subsampling".format(target_rna.n_obs))
     target_graph_tf, target_gp_tf, target_x1, target_x2 = build_graph_inputs(
         target_rna, target_atac, bp_width=bp_width, graph_type=graph_type
     )

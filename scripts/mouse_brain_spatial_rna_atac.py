@@ -21,6 +21,11 @@ from dotenv import dotenv_values, load_dotenv
 ENV_FILE_PATH = "/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env"
 DEFAULT_SOURCE_LABEL_KEY = "RNA_clusters"
 DEFAULT_TARGET_LABEL_KEY = "arc_gex_kmeans_5_clusters_Cluster"
+SPLIT_RATIO_TRAIN = 0.7
+SPLIT_RATIO_VAL = 0.2
+SPLIT_RATIO_TEST = 0.1
+SPLIT_ARTIFACT_PATH = os.path.join("splits", "domain_splits.json")
+SPLIT_SCHEMA_VERSION = 1
 
 BASE_PATH = None
 REPO_ROOT = None
@@ -109,9 +114,34 @@ class DomainData:
 
 
 @dataclass
+class DomainSplitBundle:
+    full: DomainData
+    train: DomainData
+    val: DomainData
+    test: DomainData
+    eval: DomainData
+    split_indices: Dict[str, np.ndarray] = field(default_factory=dict)
+    split_obs_names: Dict[str, np.ndarray] = field(default_factory=dict)
+    split_seed: Optional[int] = None
+
+    @property
+    def rna(self):
+        return self.train.rna
+
+    @property
+    def atac(self):
+        return self.train.atac
+
+    @property
+    def label_key(self):
+        return self.train.label_key
+
+
+@dataclass
 class DataBundle:
-    source: DomainData
-    target: DomainData
+    source: DomainSplitBundle
+    target: DomainSplitBundle
+    split_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -186,16 +216,10 @@ class Stage1TrainerBundle:
 def parse_args(notebook: bool = False):
     parser = argparse.ArgumentParser(description="Train MultiGATE on source and run live zero-shot eval on target.")
     parser.add_argument(
-        "--target-subsample-n",
-        type=int,
-        default=5000,
-        help="Maximum number of paired target cells to keep for live evaluation.",
-    )
-    parser.add_argument(
-        "--target-subsample-seed",
+        "--split-seed",
         type=int,
         default=0,
-        help="Random seed used when subsampling target cells.",
+        help="Random seed used to generate deterministic 70/20/10 train/val/test splits for both domains.",
     )
     parser.add_argument(
         "--stage1-epochs",
@@ -520,6 +544,78 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_anchor_m
     return target_trainer
 
 
+def _effective_vgp_anchor_mode(trainer, vgp_anchor_mode=None):
+    if vgp_anchor_mode is not None:
+        return vgp_anchor_mode
+    return getattr(trainer.mgate, "vgp_anchor_mode", "spot")
+
+
+def maybe_resize_trainer_for_inference(source_trainer, spot_num, vgp_anchor_mode=None):
+    mode = _effective_vgp_anchor_mode(source_trainer, vgp_anchor_mode=vgp_anchor_mode)
+    if mode != "spot":
+        return source_trainer
+
+    current_spot_num = int(source_trainer.mgate.vgp0.shape[0])
+    if current_spot_num == int(spot_num):
+        return source_trainer
+    return build_zero_shot_target_trainer(
+        source_trainer=source_trainer,
+        target_spot_num=int(spot_num),
+        vgp_anchor_mode=mode,
+    )
+
+
+def infer_source_embeddings(
+    source_trainer,
+    source_graph_tf,
+    source_gp_tf,
+    source_x1,
+    source_x2,
+    vgp_anchor_mode=None,
+):
+    source_infer_trainer = maybe_resize_trainer_for_inference(
+        source_trainer,
+        source_x1.shape[0],
+        vgp_anchor_mode=vgp_anchor_mode,
+    )
+    source_infer_trainer.mgate.eval()
+    with torch.no_grad():
+        source_embeddings = source_infer_trainer.infer(
+            source_graph_tf,
+            source_graph_tf,
+            source_gp_tf,
+            source_x1,
+            source_x2,
+        )
+    return source_embeddings, source_infer_trainer
+
+
+def infer_target_embeddings_from_source_trainer(
+    source_trainer,
+    target_graph_tf,
+    target_gp_tf,
+    target_x1,
+    target_x2,
+    target_spot_num,
+    vgp_anchor_mode=None,
+):
+    target_trainer = build_zero_shot_target_trainer(
+        source_trainer,
+        target_spot_num,
+        vgp_anchor_mode=vgp_anchor_mode,
+    )
+    target_trainer.mgate.eval()
+    with torch.no_grad():
+        target_embeddings = target_trainer.infer(
+            target_graph_tf,
+            target_graph_tf,
+            target_gp_tf,
+            target_x1,
+            target_x2,
+        )
+    return target_embeddings, target_trainer
+
+
 def infer_source_and_zero_shot_target_embeddings(
     source_trainer,
     source_graph_tf,
@@ -533,31 +629,29 @@ def infer_source_and_zero_shot_target_embeddings(
     target_spot_num,
     vgp_anchor_mode=None,
 ):
-    target_trainer = build_zero_shot_target_trainer(
-        source_trainer,
-        target_spot_num,
+    source_embeddings, source_infer_trainer = infer_source_embeddings(
+        source_trainer=source_trainer,
+        source_graph_tf=source_graph_tf,
+        source_gp_tf=source_gp_tf,
+        source_x1=source_x1,
+        source_x2=source_x2,
         vgp_anchor_mode=vgp_anchor_mode,
     )
-    source_trainer.mgate.eval()
-    target_trainer.mgate.eval()
-    with torch.no_grad():
-        source_embeddings = source_trainer.infer(
-            source_graph_tf,
-            source_graph_tf,
-            source_gp_tf,
-            source_x1,
-            source_x2,
-        )
-        target_embeddings = target_trainer.infer(
-            target_graph_tf,
-            target_graph_tf,
-            target_gp_tf,
-            target_x1,
-            target_x2,
-        )
+    target_embeddings, target_trainer = infer_target_embeddings_from_source_trainer(
+        source_trainer=source_trainer,
+        target_graph_tf=target_graph_tf,
+        target_gp_tf=target_gp_tf,
+        target_x1=target_x1,
+        target_x2=target_x2,
+        target_spot_num=target_spot_num,
+        vgp_anchor_mode=vgp_anchor_mode,
+    )
+    del source_infer_trainer
     return source_embeddings, target_embeddings, target_trainer
 
 
+# Legacy helper kept for compatibility with older co-embed runs that do not
+# have split artifacts.
 def pair_and_subsample_target(target_rna, target_atac, subsample_n, seed):
     shared_obs = target_rna.obs_names.intersection(target_atac.obs_names)
     if len(shared_obs) == 0:
@@ -575,6 +669,116 @@ def pair_and_subsample_target(target_rna, target_atac, subsample_n, seed):
         target_atac = target_atac[selected].copy()
 
     return target_rna, target_atac
+
+
+def pair_modalities(rna, atac, domain_name):
+    shared_obs = rna.obs_names.intersection(atac.obs_names)
+    if len(shared_obs) == 0:
+        raise ValueError("{} RNA/ATAC share zero cells after preprocessing.".format(domain_name))
+    return rna[shared_obs].copy(), atac[shared_obs].copy()
+
+
+def _build_split_indices(n_obs, seed, domain_name):
+    if n_obs <= 0:
+        raise ValueError("{} has zero observations and cannot be split.".format(domain_name))
+
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(n_obs)
+    train_n = int(np.floor(SPLIT_RATIO_TRAIN * n_obs))
+    val_n = int(np.floor(SPLIT_RATIO_VAL * n_obs))
+    test_n = int(n_obs - train_n - val_n)
+    if train_n <= 0 or val_n <= 0 or test_n <= 0:
+        raise ValueError(
+            "{} split would create an empty subset with n_obs={} (train={}, val={}, test={}).".format(
+                domain_name,
+                n_obs,
+                train_n,
+                val_n,
+                test_n,
+            )
+        )
+
+    idx_train = perm[:train_n]
+    idx_val = perm[train_n:train_n + val_n]
+    idx_test = perm[train_n + val_n:]
+    idx_eval = np.concatenate([idx_val, idx_test], axis=0)
+    return {
+        "train": idx_train,
+        "val": idx_val,
+        "test": idx_test,
+        "eval": idx_eval,
+    }
+
+
+def _subset_domain(rna, atac, obs_names, label_key):
+    sub_rna = rna[obs_names].copy()
+    sub_atac = atac[obs_names].copy()
+    sub_rna.uns["label_key"] = label_key
+    return DomainData(rna=sub_rna, atac=sub_atac, label_key=label_key)
+
+
+def build_domain_split_bundle(rna, atac, label_key, split_seed, domain_name):
+    split_indices = _build_split_indices(rna.n_obs, split_seed, domain_name)
+    split_obs_names = {
+        split_name: np.asarray(rna.obs_names)[indices]
+        for split_name, indices in split_indices.items()
+    }
+    full_domain = _subset_domain(rna, atac, rna.obs_names, label_key)
+    train_domain = _subset_domain(rna, atac, split_obs_names["train"], label_key)
+    val_domain = _subset_domain(rna, atac, split_obs_names["val"], label_key)
+    test_domain = _subset_domain(rna, atac, split_obs_names["test"], label_key)
+    eval_domain = _subset_domain(rna, atac, split_obs_names["eval"], label_key)
+
+    return DomainSplitBundle(
+        full=full_domain,
+        train=train_domain,
+        val=val_domain,
+        test=test_domain,
+        eval=eval_domain,
+        split_indices=split_indices,
+        split_obs_names=split_obs_names,
+        split_seed=split_seed,
+    )
+
+
+def build_split_metadata(source_split_bundle, target_split_bundle):
+    def _domain_payload(bundle):
+        return {
+            "n_obs": int(bundle.full.rna.n_obs),
+            "seed": int(bundle.split_seed),
+            "splits": {
+                split_name: {
+                    "indices": [int(v) for v in bundle.split_indices[split_name].tolist()],
+                    "obs_names": [str(v) for v in bundle.split_obs_names[split_name].tolist()],
+                    "n_obs": int(len(bundle.split_indices[split_name])),
+                }
+                for split_name in ("train", "val", "test", "eval")
+            },
+        }
+
+    return {
+        "schema_version": SPLIT_SCHEMA_VERSION,
+        "evaluation_split": "val_plus_test",
+        "ratios": {
+            "train": SPLIT_RATIO_TRAIN,
+            "val": SPLIT_RATIO_VAL,
+            "test": SPLIT_RATIO_TEST,
+        },
+        "domains": {
+            "source": _domain_payload(source_split_bundle),
+            "target": _domain_payload(target_split_bundle),
+        },
+    }
+
+
+def log_split_metadata_artifact(split_metadata):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        artifact_dir = os.path.dirname(SPLIT_ARTIFACT_PATH)
+        artifact_name = os.path.basename(SPLIT_ARTIFACT_PATH)
+        local_path = os.path.join(tmpdir, artifact_name)
+        with open(local_path, "w") as f:
+            json.dump(split_metadata, f, indent=2)
+        mlflow.log_artifact(local_path, artifact_path=artifact_dir)
 
 
 def apply_hvg_and_gp_filtering(
@@ -1252,16 +1456,24 @@ def build_stage1_trainer_from_state_dict(
 
 def run_stage2_distillation(
     source_trainer,
-    target_rna,
-    target_atac,
-    target_graph_tf,
-    target_gp_tf,
-    target_x1,
-    target_x2,
-    source_graph_tf,
-    source_gp_tf,
-    source_x1,
-    source_x2,
+    target_train_rna,
+    target_train_atac,
+    target_train_graph_tf,
+    target_train_gp_tf,
+    target_train_x1,
+    target_train_x2,
+    source_eval_rna,
+    source_eval_atac,
+    source_eval_graph_tf,
+    source_eval_gp_tf,
+    source_eval_x1,
+    source_eval_x2,
+    target_eval_rna,
+    target_eval_atac,
+    target_eval_graph_tf,
+    target_eval_gp_tf,
+    target_eval_x1,
+    target_eval_x2,
     stage2_epochs,
     lambda_kd,
     kd_mix_kl,
@@ -1277,7 +1489,7 @@ def run_stage2_distillation(
 
     teacher_trainer = build_zero_shot_target_trainer(
         source_trainer,
-        target_rna.n_obs,
+        target_train_rna.n_obs,
         vgp_anchor_mode=vgp_anchor_mode,
     )
     teacher_model = teacher_trainer.mgate
@@ -1288,7 +1500,7 @@ def run_stage2_distillation(
     student_trainer = MultiGATETrainer(
         hidden_dims1=source_trainer.mgate.hidden_dims1,
         hidden_dims2=source_trainer.mgate.hidden_dims2,
-        spot_num=target_rna.n_obs,
+        spot_num=target_train_rna.n_obs,
         temp=float(source_trainer.mgate.logit_scale.detach().cpu().item()),
         vgp_anchor_mode=(vgp_anchor_mode or getattr(source_trainer.mgate, "vgp_anchor_mode", "spot")),
         n_epochs=stage2_epochs,
@@ -1300,20 +1512,12 @@ def run_stage2_distillation(
         config={"device": str(source_trainer.device)},
     )
 
-    source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t = student_trainer._prepare_inputs(
-        source_graph_tf,
-        source_graph_tf,
-        source_gp_tf,
-        source_x1,
-        source_x2,
-    )
-
-    target_a_t, target_prune_t, target_gp_t, target_x1_t, target_x2_t = student_trainer._prepare_inputs(
-        target_graph_tf,
-        target_graph_tf,
-        target_gp_tf,
-        target_x1,
-        target_x2,
+    target_train_a_t, target_train_prune_t, target_train_gp_t, target_train_x1_t, target_train_x2_t = student_trainer._prepare_inputs(
+        target_train_graph_tf,
+        target_train_graph_tf,
+        target_train_gp_tf,
+        target_train_x1,
+        target_train_x2,
     )
 
     parent_run = mlflow.active_run()
@@ -1344,6 +1548,8 @@ def run_stage2_distillation(
         )
         mlflow.log_param("teacher_init", teacher_init_mode)
         mlflow.log_param("stage2_target_label_key", target_label_key if target_label_key is not None else "None")
+        mlflow.log_param("stage2_target_train_cells", int(target_train_rna.n_obs))
+        mlflow.log_param("stage2_target_eval_cells", int(target_eval_rna.n_obs))
         target_scib_label_mode_logged = False
         target_scib_effective_label_key_logged = False
 
@@ -1352,9 +1558,21 @@ def run_stage2_distillation(
             student_trainer.mgate.train()
             student_trainer.optimizer.zero_grad(set_to_none=True)
 
-            student_outputs = student_trainer.mgate(target_a_t, target_prune_t, target_gp_t, target_x1_t, target_x2_t)
+            student_outputs = student_trainer.mgate(
+                target_train_a_t,
+                target_train_prune_t,
+                target_train_gp_t,
+                target_train_x1_t,
+                target_train_x2_t,
+            )
             with torch.no_grad():
-                teacher_outputs = teacher_model(target_a_t, target_prune_t, target_gp_t, target_x1_t, target_x2_t)
+                teacher_outputs = teacher_model(
+                    target_train_a_t,
+                    target_train_prune_t,
+                    target_train_gp_t,
+                    target_train_x1_t,
+                    target_train_x2_t,
+                )
 
             student_clip_rna, student_clip_atac = student_outputs[5], student_outputs[6]
             teacher_clip_rna, teacher_clip_atac = teacher_outputs[5], teacher_outputs[6]
@@ -1378,30 +1596,37 @@ def run_stage2_distillation(
             loss_val = float(distill_loss.detach().cpu().item())
             pbar.set_postfix({"distill_loss": "{:.4f}".format(loss_val)})
 
-            if (epoch==1) or (epoch % 500 == 0) or (epoch == stage2_epochs):
-
-                student_trainer.mgate.eval()
-                with torch.no_grad():
-                    source_student_outputs = student_trainer.mgate(source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t)
-                    source_student_rna_embeddings = source_student_outputs[5].detach().cpu().numpy()
-                    source_student_atac_embeddings = source_student_outputs[6].detach().cpu().numpy()
-
-                    target_student_outputs = student_trainer.mgate(target_a_t, target_prune_t, target_gp_t, target_x1_t, target_x2_t)
-                    target_student_rna_embeddings = target_student_outputs[5].detach().cpu().numpy()
-                    target_student_atac_embeddings = target_student_outputs[6].detach().cpu().numpy()
+            if (epoch == 1) or (epoch % 500 == 0) or (epoch == stage2_epochs):
+                source_eval_embeddings, target_eval_embeddings, target_eval_trainer = infer_source_and_zero_shot_target_embeddings(
+                    source_trainer=student_trainer,
+                    source_graph_tf=source_eval_graph_tf,
+                    source_gp_tf=source_eval_gp_tf,
+                    source_x1=source_eval_x1,
+                    source_x2=source_eval_x2,
+                    target_graph_tf=target_eval_graph_tf,
+                    target_gp_tf=target_eval_gp_tf,
+                    target_x1=target_eval_x1,
+                    target_x2=target_eval_x2,
+                    target_spot_num=target_eval_rna.n_obs,
+                    vgp_anchor_mode=vgp_anchor_mode,
+                )
+                source_eval_rna_embeddings = source_eval_embeddings[0]
+                source_eval_atac_embeddings = source_eval_embeddings[1]
+                target_eval_rna_embeddings = target_eval_embeddings[0]
+                target_eval_atac_embeddings = target_eval_embeddings[1]
 
                 set_multigate_embeddings(
-                    target_rna,
-                    target_atac,
-                    target_student_rna_embeddings,
-                    target_student_atac_embeddings,
+                    target_eval_rna,
+                    target_eval_atac,
+                    target_eval_rna_embeddings,
+                    target_eval_atac_embeddings,
                     key_added="MultiGATE",
                 )
 
                 # compute and log scib metrics for target data
                 target_scib_metrics = compute_scib_metrics_for_domain(
-                    rna_adata=target_rna,
-                    atac_adata=target_atac,
+                    rna_adata=target_eval_rna,
+                    atac_adata=target_eval_atac,
                     domain_name="target",
                     label_key=target_label_key,
                     scib_n_jobs=scib_n_jobs,
@@ -1418,32 +1643,36 @@ def run_stage2_distillation(
                     target_scib_effective_label_key_logged = True
 
                 stage2_mmd_value = compute_balanced_source_target_mmd(
-                    source_student_rna_embeddings,
-                    source_student_atac_embeddings,
-                    target_student_rna_embeddings,
-                    target_student_atac_embeddings,
+                    source_eval_rna_embeddings,
+                    source_eval_atac_embeddings,
+                    target_eval_rna_embeddings,
+                    target_eval_atac_embeddings,
                 )
                 mlflow.log_metric("stage2_source_target_balanced_mmd", stage2_mmd_value, step=epoch)
-                del source_student_rna_embeddings, source_student_atac_embeddings, target_student_rna_embeddings, target_student_atac_embeddings, stage2_mmd_value
+                del source_eval_embeddings, target_eval_embeddings, target_eval_trainer
+                del source_eval_rna_embeddings, source_eval_atac_embeddings, target_eval_rna_embeddings, target_eval_atac_embeddings, stage2_mmd_value
 
             del student_outputs, teacher_outputs
             del student_clip_rna, student_clip_atac, teacher_clip_rna, teacher_clip_atac
             del student_logits, teacher_logits, kd_ot_loss, kd_kl_loss, distill_loss
 
-    final_target_embeddings = student_trainer.infer(
-        target_graph_tf,
-        target_graph_tf,
-        target_gp_tf,
-        target_x1,
-        target_x2,
+    final_target_embeddings, final_target_trainer = infer_target_embeddings_from_source_trainer(
+        source_trainer=student_trainer,
+        target_graph_tf=target_eval_graph_tf,
+        target_gp_tf=target_eval_gp_tf,
+        target_x1=target_eval_x1,
+        target_x2=target_eval_x2,
+        target_spot_num=target_eval_rna.n_obs,
+        vgp_anchor_mode=vgp_anchor_mode,
     )
     set_multigate_embeddings(
-        target_rna,
-        target_atac,
+        target_eval_rna,
+        target_eval_atac,
         final_target_embeddings[0],
         final_target_embeddings[1],
         key_added="MultiGATE",
     )
+    del final_target_trainer
 
     return student_trainer, stage2_run_id
 
@@ -1492,12 +1721,14 @@ def log_stage2_artifacts_for_run(
             log_mudata_umaps=log_mudata_umaps,
         )
 
-        stage2_target_embeddings = stage2_trainer.infer(
-            target_graph_tf,
-            target_graph_tf,
-            target_gp_tf,
-            target_x1,
-            target_x2,
+        stage2_target_embeddings, stage2_target_infer_trainer = infer_target_embeddings_from_source_trainer(
+            source_trainer=stage2_trainer,
+            target_graph_tf=target_graph_tf,
+            target_gp_tf=target_gp_tf,
+            target_x1=target_x1,
+            target_x2=target_x2,
+            target_spot_num=target_x1.shape[0],
+            vgp_anchor_mode=getattr(stage2_trainer.mgate, "vgp_anchor_mode", "spot"),
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             log_torch_state_dict_artifacts(
@@ -1513,6 +1744,7 @@ def log_stage2_artifacts_for_run(
                         "target_peak_gene_attention.npz": stage2_target_embeddings[4][0],
                     },
                 )
+        del stage2_target_infer_trainer
 
 
 def _mlflow_namespace_dir():
@@ -1610,8 +1842,8 @@ def is_notebook():
 
 
 def validate_args(args):
-    if args.target_subsample_n <= 0:
-        raise ValueError("--target-subsample-n must be a positive integer.")
+    if args.split_seed < 0:
+        raise ValueError("--split-seed must be a non-negative integer.")
     if args.stage1_epochs <= 0:
         raise ValueError("--stage1-epochs must be a positive integer.")
     if args.stage2_epochs < 0:
@@ -1763,49 +1995,57 @@ def load_and_prepare_data_bundle(args):
         spatial_graph_type=args.spatial_graph_type,
         gtf_path=gtf_path,
     )
-    print("[INFO] Pairing and subsampling target data...")
-    target_rna, target_atac = pair_and_subsample_target(
+    source_rna, source_atac = pair_modalities(source_rna, source_atac, domain_name="Source")
+    target_rna, target_atac = pair_modalities(target_rna, target_atac, domain_name="Target")
+
+    source_split_bundle = build_domain_split_bundle(
+        source_rna,
+        source_atac,
+        label_key=source_label_key,
+        split_seed=int(args.split_seed),
+        domain_name="Source",
+    )
+    target_split_bundle = build_domain_split_bundle(
         target_rna,
         target_atac,
-        subsample_n=args.target_subsample_n,
-        seed=args.target_subsample_seed,
+        label_key=target_label_key,
+        split_seed=int(args.split_seed + 1),
+        domain_name="Target",
     )
 
+    split_metadata = build_split_metadata(source_split_bundle, target_split_bundle)
     data_bundle = DataBundle(
-        source=DomainData(rna=source_rna, atac=source_atac, label_key=source_label_key),
-        target=DomainData(rna=target_rna, atac=target_atac, label_key=target_label_key),
+        source=source_split_bundle,
+        target=target_split_bundle,
+        split_metadata=split_metadata,
     )
 
     if args.switcharoo:
+        swapped_metadata = split_metadata.copy()
+        swapped_metadata["domains"] = {
+            "source": split_metadata["domains"]["target"],
+            "target": split_metadata["domains"]["source"],
+        }
         data_bundle = DataBundle(
-            source=DomainData(
-                rna=data_bundle.target.rna.copy(),
-                atac=data_bundle.target.atac.copy(),
-                label_key=data_bundle.target.label_key,
-            ),
-            target=DomainData(
-                rna=data_bundle.source.rna.copy(),
-                atac=data_bundle.source.atac.copy(),
-                label_key=data_bundle.source.label_key,
-            ),
+            source=data_bundle.target,
+            target=data_bundle.source,
+            split_metadata=swapped_metadata,
         )
 
-    data_bundle.source.rna.uns["label_key"] = data_bundle.source.label_key
-    data_bundle.target.rna.uns["label_key"] = data_bundle.target.label_key
     return data_bundle
 
 
-def build_graph_bundle(data_bundle, bp_width=400, graph_type="ATAC", protein_value=0.001):
+def build_graph_bundle_from_domains(source_domain, target_domain, bp_width=400, graph_type="ATAC", protein_value=0.001):
     source_graph_tf, source_gp_tf, source_x1, source_x2 = build_graph_inputs(
-        data_bundle.source.rna,
-        data_bundle.source.atac,
+        source_domain.rna,
+        source_domain.atac,
         bp_width=bp_width,
         graph_type=graph_type,
         protein_value=protein_value,
     )
     target_graph_tf, target_gp_tf, target_x1, target_x2 = build_graph_inputs(
-        data_bundle.target.rna,
-        data_bundle.target.atac,
+        target_domain.rna,
+        target_domain.atac,
         bp_width=bp_width,
         graph_type=graph_type,
         protein_value=protein_value,
@@ -1825,6 +2065,16 @@ def build_graph_bundle(data_bundle, bp_width=400, graph_type="ATAC", protein_val
     return GraphBundle(
         source=GraphInputBundle(graph_tf=source_graph_tf, gp_tf=source_gp_tf, x1=source_x1, x2=source_x2),
         target=GraphInputBundle(graph_tf=target_graph_tf, gp_tf=target_gp_tf, x1=target_x1, x2=target_x2),
+        bp_width=bp_width,
+        graph_type=graph_type,
+        protein_value=protein_value,
+    )
+
+
+def build_graph_bundle(data_bundle, bp_width=400, graph_type="ATAC", protein_value=0.001):
+    return build_graph_bundle_from_domains(
+        source_domain=data_bundle.source.train,
+        target_domain=data_bundle.target.train,
         bp_width=bp_width,
         graph_type=graph_type,
         protein_value=protein_value,
@@ -1991,7 +2241,16 @@ def load_cached_stage1_primary_trainer(data_bundle, graph_bundle, cache_config, 
     )
 
 
-def maybe_run_stage2_and_log(args, data_bundle, graph_bundle, trainer_bundle, source_embeddings, vgp_anchor_mode):
+def maybe_run_stage2_and_log(
+    args,
+    data_bundle,
+    train_graph_bundle,
+    eval_graph_bundle,
+    source_eval_graph_tf,
+    trainer_bundle,
+    source_eval_embeddings,
+    vgp_anchor_mode,
+):
     if args.stage2_epochs <= 0:
         print("[Stage2 KD] Skipped because --stage2-epochs is 0.")
         return None, None
@@ -2007,21 +2266,29 @@ def maybe_run_stage2_and_log(args, data_bundle, graph_bundle, trainer_bundle, so
 
     stage2_trainer, stage2_run_id = run_stage2_distillation(
         source_trainer=trainer_bundle.primary,
-        target_rna=data_bundle.target.rna,
-        target_atac=data_bundle.target.atac,
-        target_graph_tf=graph_bundle.target.graph_tf,
-        target_gp_tf=graph_bundle.target.gp_tf,
-        target_x1=graph_bundle.target.x1,
-        target_x2=graph_bundle.target.x2,
-        source_graph_tf=trainer_bundle.primary_source_graph_tf,
-        source_gp_tf=graph_bundle.source.gp_tf,
-        source_x1=graph_bundle.source.x1,
-        source_x2=graph_bundle.source.x2,
+        target_train_rna=data_bundle.target.train.rna,
+        target_train_atac=data_bundle.target.train.atac,
+        target_train_graph_tf=train_graph_bundle.target.graph_tf,
+        target_train_gp_tf=train_graph_bundle.target.gp_tf,
+        target_train_x1=train_graph_bundle.target.x1,
+        target_train_x2=train_graph_bundle.target.x2,
+        source_eval_rna=data_bundle.source.eval.rna,
+        source_eval_atac=data_bundle.source.eval.atac,
+        source_eval_graph_tf=source_eval_graph_tf,
+        source_eval_gp_tf=eval_graph_bundle.source.gp_tf,
+        source_eval_x1=eval_graph_bundle.source.x1,
+        source_eval_x2=eval_graph_bundle.source.x2,
+        target_eval_rna=data_bundle.target.eval.rna,
+        target_eval_atac=data_bundle.target.eval.atac,
+        target_eval_graph_tf=eval_graph_bundle.target.graph_tf,
+        target_eval_gp_tf=eval_graph_bundle.target.gp_tf,
+        target_eval_x1=eval_graph_bundle.target.x1,
+        target_eval_x2=eval_graph_bundle.target.x2,
         stage2_epochs=args.stage2_epochs,
         lambda_kd=args.lambda_kd,
         kd_mix_kl=args.kd_mix_kl,
         kd_mix_ot=args.kd_mix_ot,
-        target_label_key=data_bundle.target.label_key,
+        target_label_key=data_bundle.target.eval.label_key,
         scib_n_jobs=args.scib_n_jobs,
         vgp_anchor_mode=vgp_anchor_mode,
     )
@@ -2029,33 +2296,57 @@ def maybe_run_stage2_and_log(args, data_bundle, graph_bundle, trainer_bundle, so
         raise RuntimeError("Stage-2 trainer/run-id was not returned despite stage2_epochs > 0.")
 
     set_multigate_embeddings(
-        data_bundle.source.rna,
-        data_bundle.source.atac,
-        source_embeddings[0],
-        source_embeddings[1],
+        data_bundle.source.eval.rna,
+        data_bundle.source.eval.atac,
+        source_eval_embeddings[0],
+        source_eval_embeddings[1],
         key_added="MultiGATE",
     )
     log_stage2_artifacts_for_run(
         stage2_run_id=stage2_run_id,
         stage2_trainer=stage2_trainer,
-        source_rna=data_bundle.source.rna,
-        source_atac=data_bundle.source.atac,
-        target_rna=data_bundle.target.rna,
-        target_atac=data_bundle.target.atac,
-        target_graph_tf=graph_bundle.target.graph_tf,
-        target_gp_tf=graph_bundle.target.gp_tf,
-        target_x1=graph_bundle.target.x1,
-        target_x2=graph_bundle.target.x2,
+        source_rna=data_bundle.source.eval.rna,
+        source_atac=data_bundle.source.eval.atac,
+        target_rna=data_bundle.target.eval.rna,
+        target_atac=data_bundle.target.eval.atac,
+        target_graph_tf=eval_graph_bundle.target.graph_tf,
+        target_gp_tf=eval_graph_bundle.target.gp_tf,
+        target_x1=eval_graph_bundle.target.x1,
+        target_x2=eval_graph_bundle.target.x2,
         log_mudata_umaps=args.log_mudata_umaps,
     )
     return stage2_trainer, stage2_run_id
 
 
-def run_stage1_training_and_log(args, experiment_id, run_name, eval_every, num_epochs, data_bundle, graph_bundle, trainer_bundle, cache_config):
-    source_rna = data_bundle.source.rna
-    source_atac = data_bundle.source.atac
-    target_rna = data_bundle.target.rna
-    target_atac = data_bundle.target.atac
+def run_stage1_training_and_log(
+    args,
+    experiment_id,
+    run_name,
+    eval_every,
+    num_epochs,
+    data_bundle,
+    train_graph_bundle,
+    eval_graph_bundle,
+    trainer_bundle,
+    cache_config,
+):
+    source_train_rna = data_bundle.source.train.rna
+    source_train_atac = data_bundle.source.train.atac
+    target_train_rna = data_bundle.target.train.rna
+    target_train_atac = data_bundle.target.train.atac
+    source_eval_rna = data_bundle.source.eval.rna
+    source_eval_atac = data_bundle.source.eval.atac
+    target_eval_rna = data_bundle.target.eval.rna
+    target_eval_atac = data_bundle.target.eval.atac
+    source_eval_student_graph_tf = None
+    if cache_config.dual_source_kd:
+        source_eval_student_graph_tf = build_source_student_graph_tf(
+            source_rna=source_eval_rna,
+            spatial_graph_type=cache_config.student_graph_type,
+        )
+    source_eval_primary_graph_tf = (
+        source_eval_student_graph_tf if cache_config.dual_source_kd else eval_graph_bundle.source.graph_tf
+    )
 
     trainer = trainer_bundle.teacher
     student_trainer = trainer_bundle.student
@@ -2083,21 +2374,33 @@ def run_stage1_training_and_log(args, experiment_id, run_name, eval_every, num_e
         mlflow.log_param("lambda_kd", args.lambda_kd)
         mlflow.log_param("kd_mix_kl", args.kd_mix_kl)
         mlflow.log_param("kd_mix_ot", args.kd_mix_ot)
-        mlflow.log_param("bp_width", graph_bundle.bp_width)
-        mlflow.log_param("target_subsample_n", args.target_subsample_n)
-        mlflow.log_param("target_subsample_seed", args.target_subsample_seed)
+        mlflow.log_param("bp_width", train_graph_bundle.bp_width)
+        mlflow.log_param("split_seed", args.split_seed)
+        mlflow.log_param("split_ratio_train", SPLIT_RATIO_TRAIN)
+        mlflow.log_param("split_ratio_val", SPLIT_RATIO_VAL)
+        mlflow.log_param("split_ratio_test", SPLIT_RATIO_TEST)
+        mlflow.log_param("evaluation_split", "val_plus_test")
         mlflow.log_param("log_mudata_umaps", args.log_mudata_umaps)
         mlflow.log_param("source_label_key_requested", args.source_label_key if args.source_label_key is not None else "None")
         mlflow.log_param("target_label_key_requested", args.target_label_key if args.target_label_key is not None else "None")
-        mlflow.log_param("source_label_key", data_bundle.source.label_key if data_bundle.source.label_key is not None else "None")
-        mlflow.log_param("target_label_key", data_bundle.target.label_key if data_bundle.target.label_key is not None else "None")
-        mlflow.log_param("target_effective_n", int(target_rna.n_obs))
+        mlflow.log_param("source_label_key", data_bundle.source.train.label_key if data_bundle.source.train.label_key is not None else "None")
+        mlflow.log_param("target_label_key", data_bundle.target.train.label_key if data_bundle.target.train.label_key is not None else "None")
         mlflow.log_param("eval_every", eval_every)
-        mlflow.log_param("source_cells", int(source_rna.n_obs))
-        mlflow.log_param("target_cells", int(target_rna.n_obs))
-        mlflow.log_param("n_genes", int(source_rna.n_vars))
-        mlflow.log_param("n_peaks", int(source_atac.n_vars))
-        mlflow.log_param("graph_type", graph_bundle.graph_type)
+        mlflow.log_param("source_cells_train", int(source_train_rna.n_obs))
+        mlflow.log_param("source_cells_eval", int(source_eval_rna.n_obs))
+        mlflow.log_param("target_cells_train", int(target_train_rna.n_obs))
+        mlflow.log_param("target_cells_eval", int(target_eval_rna.n_obs))
+        mlflow.log_param("n_genes", int(source_train_rna.n_vars))
+        mlflow.log_param("n_peaks", int(source_train_atac.n_vars))
+        mlflow.log_param("graph_type", train_graph_bundle.graph_type)
+        mlflow.log_param("source_split_train_n", int(data_bundle.split_metadata["domains"]["source"]["splits"]["train"]["n_obs"]))
+        mlflow.log_param("source_split_val_n", int(data_bundle.split_metadata["domains"]["source"]["splits"]["val"]["n_obs"]))
+        mlflow.log_param("source_split_test_n", int(data_bundle.split_metadata["domains"]["source"]["splits"]["test"]["n_obs"]))
+        mlflow.log_param("source_split_eval_n", int(data_bundle.split_metadata["domains"]["source"]["splits"]["eval"]["n_obs"]))
+        mlflow.log_param("target_split_train_n", int(data_bundle.split_metadata["domains"]["target"]["splits"]["train"]["n_obs"]))
+        mlflow.log_param("target_split_val_n", int(data_bundle.split_metadata["domains"]["target"]["splits"]["val"]["n_obs"]))
+        mlflow.log_param("target_split_test_n", int(data_bundle.split_metadata["domains"]["target"]["splits"]["test"]["n_obs"]))
+        mlflow.log_param("target_split_eval_n", int(data_bundle.split_metadata["domains"]["target"]["splits"]["eval"]["n_obs"]))
         mlflow.log_param("stage1_dual_source_kd", bool(cache_config.dual_source_kd))
         mlflow.log_param("stage1_primary_model", trainer_bundle.primary_model_name)
         mlflow.log_param("stage1_teacher_graph", "spatial")
@@ -2109,6 +2412,7 @@ def run_stage1_training_and_log(args, experiment_id, run_name, eval_every, num_e
         )
         mlflow.log_param("vgp_anchor_mode", cache_config.vgp_anchor_mode)
         mlflow.log_param("skip_gp_attention", trainer.mgate.skip_gp_attention)
+        log_split_metadata_artifact(data_bundle.split_metadata)
 
         source_scib_label_mode_logged = False
         target_scib_label_mode_logged = False
@@ -2186,25 +2490,37 @@ def run_stage1_training_and_log(args, experiment_id, run_name, eval_every, num_e
 
             source_embeddings, target_embeddings, trainer_target = infer_source_and_zero_shot_target_embeddings(
                 source_trainer=trainer_bundle.primary,
-                source_graph_tf=trainer_bundle.primary_source_graph_tf,
-                source_gp_tf=graph_bundle.source.gp_tf,
-                source_x1=graph_bundle.source.x1,
-                source_x2=graph_bundle.source.x2,
-                target_graph_tf=graph_bundle.target.graph_tf,
-                target_gp_tf=graph_bundle.target.gp_tf,
-                target_x1=graph_bundle.target.x1,
-                target_x2=graph_bundle.target.x2,
-                target_spot_num=target_rna.n_obs,
+                source_graph_tf=source_eval_primary_graph_tf,
+                source_gp_tf=eval_graph_bundle.source.gp_tf,
+                source_x1=eval_graph_bundle.source.x1,
+                source_x2=eval_graph_bundle.source.x2,
+                target_graph_tf=eval_graph_bundle.target.graph_tf,
+                target_gp_tf=eval_graph_bundle.target.gp_tf,
+                target_x1=eval_graph_bundle.target.x1,
+                target_x2=eval_graph_bundle.target.x2,
+                target_spot_num=target_eval_rna.n_obs,
                 vgp_anchor_mode=cache_config.vgp_anchor_mode,
             )
-            set_multigate_embeddings(source_rna, source_atac, source_embeddings[0], source_embeddings[1], key_added="MultiGATE")
-            set_multigate_embeddings(target_rna, target_atac, target_embeddings[0], target_embeddings[1], key_added="MultiGATE")
+            set_multigate_embeddings(
+                source_eval_rna,
+                source_eval_atac,
+                source_embeddings[0],
+                source_embeddings[1],
+                key_added="MultiGATE",
+            )
+            set_multigate_embeddings(
+                target_eval_rna,
+                target_eval_atac,
+                target_embeddings[0],
+                target_embeddings[1],
+                key_added="MultiGATE",
+            )
 
             source_scib_metrics = compute_scib_metrics_for_domain(
-                rna_adata=source_rna,
-                atac_adata=source_atac,
+                rna_adata=source_eval_rna,
+                atac_adata=source_eval_atac,
                 domain_name="source",
-                label_key=data_bundle.source.label_key,
+                label_key=data_bundle.source.eval.label_key,
                 scib_n_jobs=args.scib_n_jobs,
             )
             log_scib_metrics(prefix="source", metrics=source_scib_metrics, step=epoch)
@@ -2216,10 +2532,10 @@ def run_stage1_training_and_log(args, experiment_id, run_name, eval_every, num_e
                 source_scib_effective_label_key_logged = True
 
             target_scib_metrics = compute_scib_metrics_for_domain(
-                rna_adata=target_rna,
-                atac_adata=target_atac,
+                rna_adata=target_eval_rna,
+                atac_adata=target_eval_atac,
                 domain_name="target",
-                label_key=data_bundle.target.label_key,
+                label_key=data_bundle.target.eval.label_key,
                 scib_n_jobs=args.scib_n_jobs,
             )
             log_scib_metrics(prefix="target", metrics=target_scib_metrics, step=epoch)
@@ -2231,10 +2547,10 @@ def run_stage1_training_and_log(args, experiment_id, run_name, eval_every, num_e
                 target_scib_effective_label_key_logged = True
 
             mmd_value = compute_balanced_source_target_mmd(
-                source_rna.obsm["MultiGATE"],
-                source_atac.obsm["MultiGATE"],
-                target_rna.obsm["MultiGATE"],
-                target_atac.obsm["MultiGATE"],
+                source_eval_rna.obsm["MultiGATE"],
+                source_eval_atac.obsm["MultiGATE"],
+                target_eval_rna.obsm["MultiGATE"],
+                target_eval_atac.obsm["MultiGATE"],
             )
             mlflow.log_metric("stage1_source_target_balanced_mmd", mmd_value, step=epoch)
 
@@ -2242,37 +2558,37 @@ def run_stage1_training_and_log(args, experiment_id, run_name, eval_every, num_e
                 nonspatial_source_embeddings, nonspatial_target_embeddings, nonspatial_target_trainer = (
                     infer_source_and_zero_shot_target_embeddings(
                         source_trainer=nonspatial_trainer,
-                        source_graph_tf=trainer_bundle.source_student_graph_tf,
-                        source_gp_tf=graph_bundle.source.gp_tf,
-                        source_x1=graph_bundle.source.x1,
-                        source_x2=graph_bundle.source.x2,
-                        target_graph_tf=graph_bundle.target.graph_tf,
-                        target_gp_tf=graph_bundle.target.gp_tf,
-                        target_x1=graph_bundle.target.x1,
-                        target_x2=graph_bundle.target.x2,
-                        target_spot_num=target_rna.n_obs,
+                        source_graph_tf=source_eval_student_graph_tf,
+                        source_gp_tf=eval_graph_bundle.source.gp_tf,
+                        source_x1=eval_graph_bundle.source.x1,
+                        source_x2=eval_graph_bundle.source.x2,
+                        target_graph_tf=eval_graph_bundle.target.graph_tf,
+                        target_gp_tf=eval_graph_bundle.target.gp_tf,
+                        target_x1=eval_graph_bundle.target.x1,
+                        target_x2=eval_graph_bundle.target.x2,
+                        target_spot_num=target_eval_rna.n_obs,
                         vgp_anchor_mode=cache_config.vgp_anchor_mode,
                     )
                 )
                 set_multigate_embeddings(
-                    source_rna,
-                    source_atac,
+                    source_eval_rna,
+                    source_eval_atac,
                     nonspatial_source_embeddings[0],
                     nonspatial_source_embeddings[1],
                     key_added="MultiGATE_nonspatial",
                 )
                 set_multigate_embeddings(
-                    target_rna,
-                    target_atac,
+                    target_eval_rna,
+                    target_eval_atac,
                     nonspatial_target_embeddings[0],
                     nonspatial_target_embeddings[1],
                     key_added="MultiGATE_nonspatial",
                 )
                 nonspatial_mmd_value = compute_balanced_source_target_mmd(
-                    source_rna.obsm["MultiGATE_nonspatial"],
-                    source_atac.obsm["MultiGATE_nonspatial"],
-                    target_rna.obsm["MultiGATE_nonspatial"],
-                    target_atac.obsm["MultiGATE_nonspatial"],
+                    source_eval_rna.obsm["MultiGATE_nonspatial"],
+                    source_eval_atac.obsm["MultiGATE_nonspatial"],
+                    target_eval_rna.obsm["MultiGATE_nonspatial"],
+                    target_eval_atac.obsm["MultiGATE_nonspatial"],
                 )
                 mlflow.log_metric("stage1_nonspatial_source_target_balanced_mmd", nonspatial_mmd_value, step=epoch)
                 if epoch != num_epochs:
@@ -2287,10 +2603,10 @@ def run_stage1_training_and_log(args, experiment_id, run_name, eval_every, num_e
             raise RuntimeError("Stage-1 source embeddings were not computed before artifact logging.")
 
         log_stage_umap_artifacts(
-            source_rna=source_rna,
-            source_atac=source_atac,
-            target_rna=target_rna,
-            target_atac=target_atac,
+            source_rna=source_eval_rna,
+            source_atac=source_eval_atac,
+            target_rna=target_eval_rna,
+            target_atac=target_eval_atac,
             stage_label="stage1",
             log_mudata_umaps=args.log_mudata_umaps,
         )
@@ -2299,37 +2615,37 @@ def run_stage1_training_and_log(args, experiment_id, run_name, eval_every, num_e
             teacher_source_embeddings, teacher_target_embeddings, teacher_target_trainer = (
                 infer_source_and_zero_shot_target_embeddings(
                     source_trainer=trainer,
-                    source_graph_tf=graph_bundle.source.graph_tf,
-                    source_gp_tf=graph_bundle.source.gp_tf,
-                    source_x1=graph_bundle.source.x1,
-                    source_x2=graph_bundle.source.x2,
-                    target_graph_tf=graph_bundle.target.graph_tf,
-                    target_gp_tf=graph_bundle.target.gp_tf,
-                    target_x1=graph_bundle.target.x1,
-                    target_x2=graph_bundle.target.x2,
-                    target_spot_num=target_rna.n_obs,
+                    source_graph_tf=eval_graph_bundle.source.graph_tf,
+                    source_gp_tf=eval_graph_bundle.source.gp_tf,
+                    source_x1=eval_graph_bundle.source.x1,
+                    source_x2=eval_graph_bundle.source.x2,
+                    target_graph_tf=eval_graph_bundle.target.graph_tf,
+                    target_gp_tf=eval_graph_bundle.target.gp_tf,
+                    target_x1=eval_graph_bundle.target.x1,
+                    target_x2=eval_graph_bundle.target.x2,
+                    target_spot_num=target_eval_rna.n_obs,
                     vgp_anchor_mode=cache_config.vgp_anchor_mode,
                 )
             )
             set_multigate_embeddings(
-                source_rna,
-                source_atac,
+                source_eval_rna,
+                source_eval_atac,
                 teacher_source_embeddings[0],
                 teacher_source_embeddings[1],
                 key_added="MultiGATE_teacher",
             )
             set_multigate_embeddings(
-                target_rna,
-                target_atac,
+                target_eval_rna,
+                target_eval_atac,
                 teacher_target_embeddings[0],
                 teacher_target_embeddings[1],
                 key_added="MultiGATE_teacher",
             )
             log_stage_umap_artifacts(
-                source_rna=source_rna,
-                source_atac=source_atac,
-                target_rna=target_rna,
-                target_atac=target_atac,
+                source_rna=source_eval_rna,
+                source_atac=source_eval_atac,
+                target_rna=target_eval_rna,
+                target_atac=target_eval_atac,
                 stage_label="stage1_teacher",
                 log_mudata_umaps=args.log_mudata_umaps,
                 embedding_key="MultiGATE_teacher",
@@ -2341,37 +2657,37 @@ def run_stage1_training_and_log(args, experiment_id, run_name, eval_every, num_e
             nonspatial_source_embeddings_final, nonspatial_target_embeddings_final, nonspatial_target_trainer_final = (
                 infer_source_and_zero_shot_target_embeddings(
                     source_trainer=nonspatial_trainer,
-                    source_graph_tf=trainer_bundle.source_student_graph_tf,
-                    source_gp_tf=graph_bundle.source.gp_tf,
-                    source_x1=graph_bundle.source.x1,
-                    source_x2=graph_bundle.source.x2,
-                    target_graph_tf=graph_bundle.target.graph_tf,
-                    target_gp_tf=graph_bundle.target.gp_tf,
-                    target_x1=graph_bundle.target.x1,
-                    target_x2=graph_bundle.target.x2,
-                    target_spot_num=target_rna.n_obs,
+                    source_graph_tf=source_eval_student_graph_tf,
+                    source_gp_tf=eval_graph_bundle.source.gp_tf,
+                    source_x1=eval_graph_bundle.source.x1,
+                    source_x2=eval_graph_bundle.source.x2,
+                    target_graph_tf=eval_graph_bundle.target.graph_tf,
+                    target_gp_tf=eval_graph_bundle.target.gp_tf,
+                    target_x1=eval_graph_bundle.target.x1,
+                    target_x2=eval_graph_bundle.target.x2,
+                    target_spot_num=target_eval_rna.n_obs,
                     vgp_anchor_mode=cache_config.vgp_anchor_mode,
                 )
             )
             set_multigate_embeddings(
-                source_rna,
-                source_atac,
+                source_eval_rna,
+                source_eval_atac,
                 nonspatial_source_embeddings_final[0],
                 nonspatial_source_embeddings_final[1],
                 key_added="MultiGATE_nonspatial",
             )
             set_multigate_embeddings(
-                target_rna,
-                target_atac,
+                target_eval_rna,
+                target_eval_atac,
                 nonspatial_target_embeddings_final[0],
                 nonspatial_target_embeddings_final[1],
                 key_added="MultiGATE_nonspatial",
             )
             log_stage_umap_artifacts(
-                source_rna=source_rna,
-                source_atac=source_atac,
-                target_rna=target_rna,
-                target_atac=target_atac,
+                source_rna=source_eval_rna,
+                source_atac=source_eval_atac,
+                target_rna=target_eval_rna,
+                target_atac=target_eval_atac,
                 stage_label="stage1_nonspatial",
                 log_mudata_umaps=args.log_mudata_umaps,
                 embedding_key="MultiGATE_nonspatial",
@@ -2403,16 +2719,25 @@ def run_stage1_training_and_log(args, experiment_id, run_name, eval_every, num_e
         maybe_run_stage2_and_log(
             args=args,
             data_bundle=data_bundle,
-            graph_bundle=graph_bundle,
+            train_graph_bundle=train_graph_bundle,
+            eval_graph_bundle=eval_graph_bundle,
+            source_eval_graph_tf=source_eval_primary_graph_tf,
             trainer_bundle=trainer_bundle,
-            source_embeddings=source_embeddings,
+            source_eval_embeddings=source_embeddings,
             vgp_anchor_mode=cache_config.vgp_anchor_mode,
         )
 
 
 def summarize_stage1_setup(num_epochs, data_bundle, cache_config, trainer_bundle):
     print("Training epochs for stage 1:", num_epochs)
-    print("Target paired cells after subsampling:", data_bundle.target.rna.n_obs)
+    print(
+        "Target split sizes (train/val/test/eval): {}/{}/{}/{}".format(
+            data_bundle.target.train.rna.n_obs,
+            data_bundle.target.val.rna.n_obs,
+            data_bundle.target.test.rna.n_obs,
+            data_bundle.target.eval.rna.n_obs,
+        )
+    )
     if cache_config.dual_source_kd:
         print(
             "[Stage1 Dual KD] Enabled: teacher graph=spatial, student graph={}".format(
@@ -2444,12 +2769,19 @@ def main():
     mlflow_client = MlflowClient()
     cache_config = resolve_stage1_cache_config(args, mlflow_client)
     data_bundle = load_and_prepare_data_bundle(args)
-    graph_bundle = build_graph_bundle(data_bundle)
+    train_graph_bundle = build_graph_bundle(data_bundle)
+    eval_graph_bundle = build_graph_bundle_from_domains(
+        source_domain=data_bundle.source.eval,
+        target_domain=data_bundle.target.eval,
+        bp_width=train_graph_bundle.bp_width,
+        graph_type=train_graph_bundle.graph_type,
+        protein_value=train_graph_bundle.protein_value,
+    )
 
     if cache_config.use_cache:
         trainer_bundle = load_cached_stage1_primary_trainer(
             data_bundle=data_bundle,
-            graph_bundle=graph_bundle,
+            graph_bundle=train_graph_bundle,
             cache_config=cache_config,
             mlflow_client=mlflow_client,
             num_epochs=num_epochs,
@@ -2462,28 +2794,39 @@ def main():
             )
         )
         with mlflow.start_run(run_id=cache_config.run_id):
-            trainer_bundle.primary.mgate.eval()
-            with torch.no_grad():
-                source_embeddings = trainer_bundle.primary.infer(
-                    trainer_bundle.primary_source_graph_tf,
-                    trainer_bundle.primary_source_graph_tf,
-                    graph_bundle.source.gp_tf,
-                    graph_bundle.source.x1,
-                    graph_bundle.source.x2,
+            source_eval_student_graph_tf = None
+            if cache_config.dual_source_kd:
+                source_eval_student_graph_tf = build_source_student_graph_tf(
+                    source_rna=data_bundle.source.eval.rna,
+                    spatial_graph_type=cache_config.student_graph_type,
                 )
+            source_eval_primary_graph_tf = (
+                source_eval_student_graph_tf if cache_config.dual_source_kd else eval_graph_bundle.source.graph_tf
+            )
+            source_embeddings, source_infer_trainer = infer_source_embeddings(
+                source_trainer=trainer_bundle.primary,
+                source_graph_tf=source_eval_primary_graph_tf,
+                source_gp_tf=eval_graph_bundle.source.gp_tf,
+                source_x1=eval_graph_bundle.source.x1,
+                source_x2=eval_graph_bundle.source.x2,
+                vgp_anchor_mode=cache_config.vgp_anchor_mode,
+            )
+            del source_infer_trainer
             maybe_run_stage2_and_log(
                 args=args,
                 data_bundle=data_bundle,
-                graph_bundle=graph_bundle,
+                train_graph_bundle=train_graph_bundle,
+                eval_graph_bundle=eval_graph_bundle,
+                source_eval_graph_tf=source_eval_primary_graph_tf,
                 trainer_bundle=trainer_bundle,
-                source_embeddings=source_embeddings,
+                source_eval_embeddings=source_embeddings,
                 vgp_anchor_mode=cache_config.vgp_anchor_mode,
             )
         return
 
     trainer_bundle = initialize_stage1_trainers_for_training(
         data_bundle=data_bundle,
-        graph_bundle=graph_bundle,
+        graph_bundle=train_graph_bundle,
         cache_config=cache_config,
         num_epochs=num_epochs,
     )
@@ -2495,7 +2838,8 @@ def main():
         eval_every=eval_every,
         num_epochs=num_epochs,
         data_bundle=data_bundle,
-        graph_bundle=graph_bundle,
+        train_graph_bundle=train_graph_bundle,
+        eval_graph_bundle=eval_graph_bundle,
         trainer_bundle=trainer_bundle,
         cache_config=cache_config,
     )
