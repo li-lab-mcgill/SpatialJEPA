@@ -1568,13 +1568,13 @@ def main():
 
     #%% ── Inference, combined target embeddings ────────────────────────────────────────────────────────────
     source_rna_emb, source_atac_emb = run_inference(
-        target_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+        source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
     print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
     target_rna_emb, target_atac_emb = run_inference(
-        target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
+        source_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
     )
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
@@ -1649,6 +1649,76 @@ def main():
     sc.pl.umap(target_adata, color="leiden", ax=axs[1, 1], size=50, show=False)
     axs[0, 0].set_title('Source Spatial'); axs[0, 1].set_title('Source UMAP'); axs[1, 0].set_title('Target Spatial'); axs[1, 1].set_title('Target UMAP')
     plt.tight_layout(); plt.show()
+
+    #%% compare spatial graph with latent knn graph
+    n_neighbors = 100
+
+    sc.pp.neighbors(source_rna, use_rep='MultiGATE', n_neighbors=n_neighbors)
+    multigate_knn_graph = source_rna.obsp['connectivities']
+
+    MultiGATE.Cal_Spatial_Net(source_rna, model='KNN', k_cutoff=n_neighbors)
+    MultiGATE.Cal_Spatial_Net(source_atac, model='KNN', k_cutoff=n_neighbors)
+
+    spatial_knn_graph, _, _, _ = build_graph_inputs(source_rna, source_atac)
+    indices, values, shape = spatial_knn_graph
+    indices = np.asarray(indices)
+    row, col = indices[:, 0], indices[:, 1]
+    spatial_knn_graph = sp.coo_matrix((values, (row, col)), shape=shape).tocsr()
+    assert indices.shape[1] == 2, "spatial_knn_graph should have 2 columns"
+
+    def jaccard_per_sample_csr(
+        a: sp.csr_matrix,
+        b: sp.csr_matrix,
+        *,
+        binarize: bool = True,
+        empty_value: float = 1.0,
+    ) -> np.ndarray:
+        if not sp.isspmatrix_csr(a):
+            a = a.tocsr()
+        else:
+            a = a.copy()
+
+        if not sp.isspmatrix_csr(b):
+            b = b.tocsr()
+        else:
+            b = b.copy()
+
+        if a.shape != b.shape:
+            raise ValueError(f"Shape mismatch: {a.shape} vs {b.shape}")
+
+        a.sum_duplicates()
+        b.sum_duplicates()
+        a.eliminate_zeros()
+        b.eliminate_zeros()
+
+        if binarize:
+            a.data = np.ones_like(a.data, dtype=np.uint8)
+            b.data = np.ones_like(b.data, dtype=np.uint8)
+
+        # For binary matrices:
+        # intersection count per row = number of coordinates nonzero in both
+        inter = a.multiply(b).count_nonzero(axis=1)
+
+        # union count per row = nnz(a_row) + nnz(b_row) - intersection
+        a_nnz = a.count_nonzero(axis=1)
+        b_nnz = b.count_nonzero(axis=1)
+        union = a_nnz + b_nnz - inter
+
+        inter = np.asarray(inter).ravel()
+        union = np.asarray(union).ravel()
+
+        out = np.empty(a.shape[0], dtype=float)
+        mask = union == 0
+        out[~mask] = inter[~mask] / union[~mask]
+        out[mask] = empty_value
+        return out
+        
+    # compute the Jaccard similarity between the two graphs
+    jaccard_similarity = jaccard_per_sample_csr(multigate_knn_graph, spatial_knn_graph)
+    plt.hist(jaccard_similarity, bins=100)
+    
+    
+    
     
     #%% attention matrix analysis
     from post_hoc_utils import run_gene_peak_attention_tutorial
