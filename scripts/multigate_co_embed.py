@@ -1257,7 +1257,7 @@ def main():
 
     #%% Inference, all same model
 
-    model = target_mgate
+    model = source_mgate
 
     ## (teacher) source inference
     teacher_source_rna_emb, teacher_source_atac_emb = run_inference(
@@ -1567,14 +1567,16 @@ def main():
 
 
     #%% ── Inference, combined target embeddings ────────────────────────────────────────────────────────────
+    model = teacher_source_mgate
+
     source_rna_emb, source_atac_emb = run_inference(
-        source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+        model, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
     print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
     target_rna_emb, target_atac_emb = run_inference(
-        source_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
+        model, target_graph_tf, target_gp_tf, target_x1, target_x2, device
     )
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
@@ -1654,7 +1656,13 @@ def main():
     n_neighbors = 100
 
     sc.pp.neighbors(source_rna, use_rep='MultiGATE', n_neighbors=n_neighbors)
-    multigate_knn_graph = source_rna.obsp['connectivities']
+    sc.pp.neighbors(source_atac, use_rep='MultiGATE', n_neighbors=n_neighbors)
+    rna_multigate_knn_graph = source_rna.obsp['connectivities']
+    atac_multigate_knn_graph = source_atac.obsp['connectivities']
+
+    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
+    source_concat_adata.obs['jaccard_similarity'] = jaccard_similarity
+    source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
 
     MultiGATE.Cal_Spatial_Net(source_rna, model='KNN', k_cutoff=n_neighbors)
     MultiGATE.Cal_Spatial_Net(source_atac, model='KNN', k_cutoff=n_neighbors)
@@ -1714,9 +1722,25 @@ def main():
         return out
         
     # compute the Jaccard similarity between the two graphs
-    jaccard_similarity = jaccard_per_sample_csr(multigate_knn_graph, spatial_knn_graph)
-    plt.hist(jaccard_similarity, bins=100)
-    
+    rna_jaccard_similarity = jaccard_per_sample_csr(rna_multigate_knn_graph, spatial_knn_graph)
+    atac_jaccard_similarity = jaccard_per_sample_csr(atac_multigate_knn_graph, spatial_knn_graph)
+    jaccard_similarity = np.concatenate([rna_jaccard_similarity, atac_jaccard_similarity])
+    plt.hist(jaccard_similarity, bins=50)
+
+    '''
+    compute_concat_umap(
+        source_concat_adata,
+        n_neighbors=n_neighbors,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    sc.pl.umap(source_concat_adata, color=['jaccard_similarity', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout()
+    plt.show()
+    '''
+    sc.pl.embedding(source_concat_adata, basis="spatial", color="jaccard_similarity", s=50, legend_loc='None')
+    sc.pl.embedding(source_concat_adata, basis="spatial", color="RNA_clusters", s=50, legend_loc='None')
     
     
     
