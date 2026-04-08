@@ -1284,13 +1284,7 @@ def main():
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
 
-    compute_concat_umap(
-        teacher_source_concat_adata,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
+    ## compute UMAP for source data
     compute_concat_umap(
         source_concat_adata,
         n_neighbors=10,
@@ -1298,21 +1292,30 @@ def main():
         deterministic=True,
         random_state=deterministic_seed,
     )
-    compute_concat_umap(
-        target_concat_adata,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
+ 
+    ## ingest source embeddings into target data
+    sc.tl.ingest(teacher_source_concat_adata, source_concat_adata, embedding_method='umap')
+    sc.tl.ingest(target_concat_adata, source_concat_adata, embedding_method='umap')
     target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
 
-    sc.pl.umap(teacher_source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
-    sc.pl.umap(source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
-    sc.pl.umap(target_concat_adata, color=['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
+    ## confirm that the ingested representations are the same as the original embeddings
+    assert (teacher_source_concat_adata.obsm['rep'] == teacher_source_concat_adata.X).all()
+    assert (target_concat_adata.obsm['rep'] == target_concat_adata.X).all()
+
+    try:
+        sc.pl.umap(teacher_source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+        plt.tight_layout(); plt.show()
+        sc.pl.umap(source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+        plt.tight_layout(); plt.show()
+        sc.pl.umap(target_concat_adata, color=['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
+        plt.tight_layout(); plt.show()
+    except:
+        sc.pl.umap(teacher_source_concat_adata, color=['modality', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+        plt.tight_layout(); plt.show()
+        sc.pl.umap(source_concat_adata, color=['modality', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+        plt.tight_layout(); plt.show()
+        sc.pl.umap(target_concat_adata, color=['modality', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
+        plt.tight_layout(); plt.show()
 
 
     #%% AJIVE analysis
@@ -1567,7 +1570,7 @@ def main():
 
 
     #%% ── Inference, combined target embeddings ────────────────────────────────────────────────────────────
-    model = teacher_source_mgate
+    model = source_mgate
 
     source_rna_emb, source_atac_emb = run_inference(
         model, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
@@ -1581,12 +1584,44 @@ def main():
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
-    # Plot combined UMAP
+    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
+    target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
+
+    # Compute combined UMAP
+    compute_concat_umap(
+        source_concat_adata,
+        n_neighbors=50,
+        resolution=0.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+
+    source_concat_adata.obs['source_obs_names'] = source_concat_adata.obs_names
+
+    sc.tl.ingest(
+        target_concat_adata,
+        source_concat_adata,
+        embedding_method='umap',
+        obs='source_obs_names',
+        k=1,
+        )
+
+    ## compute neighbors & leiden clustering for source data and assign target leiden clusters
+    sc.pp.neighbors(source_concat_adata, use_rep='X', n_neighbors=100)
+    sc.tl.leiden(source_concat_adata, resolution=0.5)
+    target_concat_adata.obs['leiden'] = source_concat_adata.obs['leiden'].loc[target_concat_adata.obs['source_obs_names']].values
+
+    source_target_adata = sc.concat([source_concat_adata, target_concat_adata], axis=0)
+    source_target_adata.obs["source_or_target"] = ["source"] * source_concat_adata.n_obs + ["target"] * target_concat_adata.n_obs
+    source_hits_df = target_concat_adata.obs['source_obs_names'].value_counts()
+    source_concat_adata.obs = source_concat_adata.obs.merge(source_hits_df, left_index=True, right_index=True, how='left')
+
+    '''
+    ## concatenate source and target data
     source_target_rna = sc.concat([source_rna, target_rna], axis=0)
     source_target_atac = sc.concat([source_atac, target_atac], axis=0)
     source_target_rna.obs["source_or_target"] = ["source"] * source_rna.n_obs + ["target"] * target_rna.n_obs
     source_target_atac.obs["source_or_target"] = ["source"] * source_atac.n_obs + ["target"] * target_atac.n_obs
-
     source_target_adata = build_concat_adata_for_umap(source_target_rna, source_target_atac, embedding_key="MultiGATE")
     compute_concat_umap(
         source_target_adata,
@@ -1595,11 +1630,12 @@ def main():
         deterministic=True,
         random_state=deterministic_seed,
     )
+    '''
     # Randomly permute the rows before plotting the UMAP
     permuted_idx = np.random.RandomState(deterministic_seed).permutation(source_target_adata.n_obs)
     sc.pl.umap(
         source_target_adata[permuted_idx],
-        color=["modality", "source_or_target", "leiden"],
+        color=["modality", "source_or_target", 'leiden'],
         ncols=3,
         wspace=0.2,
         size=25,
@@ -1609,37 +1645,21 @@ def main():
     import matplotlib.pyplot as plt
     from scipy.optimize import linear_sum_assignment
 
-    ## define bounding indices for source and target data
-    bounds = [
-        source_rna.n_obs,
-        source_rna.n_obs + target_rna.n_obs,
-        source_rna.n_obs + target_rna.n_obs + source_atac.n_obs,
-    ]
-
-    ## get connectivities between source and target data
-    conns = source_target_adata.obsp['connectivities']
-    conns_source_target_rna = conns[:bounds[0], bounds[0]:bounds[1]].toarray()
-    conns_source_target_atac = conns[bounds[1]:bounds[2], bounds[2]:].toarray()
-
-    ## get optimal assignment of source and target data
-    rna_source_idx, rna_target_idx = linear_sum_assignment(1 - conns_source_target_rna)
-    atac_source_idx, atac_target_idx = linear_sum_assignment(1 - conns_source_target_atac)
-
-    ## create arrays for target spatial coordinates
-    target_rna_spatial = np.empty((target_rna.n_obs, source_rna.obsm["spatial"].shape[1]))
-    target_atac_spatial = np.empty((target_atac.n_obs, source_atac.obsm["spatial"].shape[1]))
-    target_rna_spatial[rna_target_idx] = source_rna.obsm["spatial"][rna_source_idx]
-    target_atac_spatial[atac_target_idx] = source_atac.obsm["spatial"][atac_source_idx]
+    ## assign target spatial coordinates to source_target_adata
+    rna_source_obs_names = target_concat_adata.obs["source_obs_names"].loc[target_concat_adata.obs["modality"].eq("rna")].str.split("_").str[0]
+    atac_source_obs_names = target_concat_adata.obs["source_obs_names"].loc[target_concat_adata.obs["modality"].eq("atac")].str.split("_").str[0]
+    target_rna_spatial = source_rna[rna_source_obs_names].obsm["spatial"]
+    target_atac_spatial = source_atac[atac_source_obs_names].obsm["spatial"]
 
     ## add spatial coordinates to source_target_adata
     source_target_adata.obsm["spatial"] = np.concatenate([
         source_rna.obsm["spatial"],
-        target_rna_spatial,
         source_atac.obsm["spatial"],
+        target_rna_spatial,
         target_atac_spatial,
     ], axis=0)
 
-    ## assign target spatial coordinates to source_target_adata
+    ## split source_target_adata into source and target data
     source_adata = source_target_adata[source_target_adata.obs["source_or_target"].eq("source")]
     target_adata = source_target_adata[source_target_adata.obs["source_or_target"].eq("target")]
 
@@ -1652,6 +1672,9 @@ def main():
     axs[0, 0].set_title('Source Spatial'); axs[0, 1].set_title('Source UMAP'); axs[1, 0].set_title('Target Spatial'); axs[1, 1].set_title('Target UMAP')
     plt.tight_layout(); plt.show()
 
+    #%% plot activation of all latent dimensions
+
+    
     #%% compare spatial graph with latent knn graph
     n_neighbors = 100
 
@@ -1727,18 +1750,6 @@ def main():
     jaccard_similarity = np.concatenate([rna_jaccard_similarity, atac_jaccard_similarity])
     plt.hist(jaccard_similarity, bins=50)
 
-    '''
-    compute_concat_umap(
-        source_concat_adata,
-        n_neighbors=n_neighbors,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    sc.pl.umap(source_concat_adata, color=['jaccard_similarity', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout()
-    plt.show()
-    '''
     sc.pl.embedding(source_concat_adata, basis="spatial", color="jaccard_similarity", s=50, legend_loc='None')
     sc.pl.embedding(source_concat_adata, basis="spatial", color="RNA_clusters", s=50, legend_loc='None')
     
