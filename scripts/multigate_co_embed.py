@@ -85,6 +85,10 @@ REPO_ROOT = os.path.join(BAKLAVA_BASE_DIR, "MultiGATE")
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+baklava_repo_root = os.path.join(BAKLAVA_BASE_DIR, "BAKLAVA")
+if os.path.isdir(baklava_repo_root) and baklava_repo_root not in sys.path:
+    sys.path.insert(0, baklava_repo_root)
+
 # Ensure the active conda env's bin directory is on PATH so bedtools is found
 # when the script is invoked without an activated shell.
 _env_bin = os.path.dirname(sys.executable)
@@ -108,14 +112,15 @@ from MultiGATE.model_MultiGATE import MGATE
 print("Using MultiGATE module:", MultiGATE.__file__)
 
 from mouse_brain_spatial_rna_atac import (  # noqa: E402
+    apply_hvg_and_gp_filtering,
+    build_concat_adata_for_umap,
     build_graph_inputs,
     build_source_student_graph_tf,
-    set_multigate_embeddings,
-    pair_and_subsample_target,
-    apply_hvg_and_gp_filtering,
-    prepare_target_for_spatial_graph_type,
-    build_concat_adata_for_umap,
     compute_concat_umap,
+    load_nichecompass_combined_gp_dict_mouse,
+    pair_and_subsample_target,
+    prepare_target_for_spatial_graph_type,
+    set_multigate_embeddings,
 )
 
 
@@ -254,6 +259,15 @@ def parse_args(notebook: bool = False):
         action="store_true",
         default=False,
         help="Save the annotated source and target AnnData objects as h5ad files.",
+    )
+    p.add_argument(
+        "--no-combined-gp-dict",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip loading the NicheCompass combined_gp_dict (same as mouse_brain_spatial_rna_atac.py). "
+            "When not set, the dict is loaded for optional downstream use (not yet applied to co-embedding)."
+        ),
     )
     if notebook:
         return p.parse_known_args()[0]
@@ -1190,6 +1204,11 @@ def main():
     )
     if not os.path.exists(gtf_path):
         raise FileNotFoundError("GTF annotation file not found: {}".format(gtf_path))
+
+    combined_gp_dict = None
+    if not getattr(args, "no_combined_gp_dict", False):
+        print("\nLoading NicheCompass combined_gp_dict...")
+        combined_gp_dict = load_nichecompass_combined_gp_dict_mouse(verbose=True)
 
     #%% ── Load raw aligned datasets ────────────────────────────────────────────
     print("\nLoading source and target datasets...")

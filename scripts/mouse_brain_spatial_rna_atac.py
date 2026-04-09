@@ -63,6 +63,10 @@ def bootstrap_runtime():
     if REPO_ROOT not in sys.path:
         sys.path.insert(0, REPO_ROOT)
 
+    baklava_repo_root = os.path.join(baklava_base_dir, "BAKLAVA")
+    if os.path.isdir(baklava_repo_root) and baklava_repo_root not in sys.path:
+        sys.path.insert(0, baklava_repo_root)
+
     # Make sure env-local binaries (e.g., bedtools) are discoverable when running
     # with an explicit python path instead of an activated conda shell.
     env_bin = os.path.dirname(sys.executable)
@@ -84,6 +88,51 @@ def bootstrap_runtime():
 def require_runtime_bootstrap():
     if BASE_PATH is None or REPO_ROOT is None or MultiGATE is None or MultiGATETrainer is None:
         raise RuntimeError("bootstrap_runtime() must be called before training or data preparation.")
+
+
+def load_nichecompass_combined_gp_dict_mouse(*, species: str = "mouse", verbose: bool = True) -> Dict[str, Any]:
+    """Load the same combined_gp_dict as BAKLAVA `mouse_brain_multimodal.py` / `data_utils.build_combined_gp_dict_mouse_brain`.
+
+    Expects `DATAPATH` and `BAKLAVA_BASE_DIR` (and BAKLAVA repo on sys.path from `bootstrap_runtime`).
+    Gene-program CSVs live under ``{DATAPATH}/gene_programs/``; orthologs under ``{DATAPATH}/gene_annotations/``.
+    """
+    datapath = os.getenv("DATAPATH")
+    if datapath is None:
+        raise EnvironmentError("DATAPATH must be set to load combined_gp_dict.")
+
+    ga_data_folder_path = os.path.join(datapath, "gene_annotations")
+    gp_data_folder_path = os.path.join(datapath, "gene_programs")
+    omnipath_lr_network_file_path = os.path.join(gp_data_folder_path, "omnipath_lr_network.csv")
+    nichenet_lr_network_file_path = os.path.join(
+        gp_data_folder_path, "nichenet_lr_network_v2_{}.csv".format(species)
+    )
+    nichenet_ligand_target_matrix_file_path = os.path.join(
+        gp_data_folder_path, "nichenet_ligand_target_matrix_v2_{}.csv".format(species)
+    )
+    mebocost_enzyme_sensor_interactions_folder_path = os.path.join(
+        gp_data_folder_path, "metabolite_enzyme_sensor_gps"
+    )
+    collectri_tf_network_file_path = os.path.join(
+        gp_data_folder_path, "collectri_tf_network_{}.csv".format(species)
+    )
+    gene_orthologs_mapping_file_path = os.path.join(ga_data_folder_path, "human_mouse_gene_orthologs.csv")
+
+    from data_utils import build_combined_gp_dict_mouse_brain
+
+    combined = build_combined_gp_dict_mouse_brain(
+        species=species,
+        omnipath_lr_network_file_path=omnipath_lr_network_file_path,
+        nichenet_lr_network_file_path=nichenet_lr_network_file_path,
+        nichenet_ligand_target_matrix_file_path=nichenet_ligand_target_matrix_file_path,
+        mebocost_enzyme_sensor_interactions_folder_path=mebocost_enzyme_sensor_interactions_folder_path,
+        collectri_tf_network_file_path=collectri_tf_network_file_path,
+        gene_orthologs_mapping_file_path=gene_orthologs_mapping_file_path,
+        verbose=verbose,
+    )
+    if verbose:
+        print("Loaded NicheCompass combined_gp_dict with {} gene programs.".format(len(combined)))
+    return combined
+
 
 import matplotlib.pyplot as plt
 import mlflow
@@ -142,6 +191,8 @@ class DataBundle:
     source: DomainSplitBundle
     target: DomainSplitBundle
     split_metadata: Dict[str, Any] = field(default_factory=dict)
+    # NicheCompass prior gene programs (OmniPath, NicheNet, MEBOCOST, CollecTRI); optional until wired into MGATE.
+    combined_gp_dict: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -330,6 +381,15 @@ def parse_args(notebook: bool = False):
         action="store_true",
         default=False,
         help="If set, swap source and target.",
+    )
+    parser.add_argument(
+        "--no-combined-gp-dict",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, skip loading the NicheCompass combined_gp_dict from BAKLAVA data_utils "
+            "(gene_programs/ CSVs under DATAPATH). Use when files are missing or to save startup time."
+        ),
     )
     if notebook:
         return parser.parse_known_args()[0]
@@ -1941,6 +2001,10 @@ def resolve_domain_label_key(adata, requested_key, default_key, domain_name):
 def load_and_prepare_data_bundle(args):
     require_runtime_bootstrap()
 
+    combined_gp_dict = None
+    if not getattr(args, "no_combined_gp_dict", False):
+        combined_gp_dict = load_nichecompass_combined_gp_dict_mouse(verbose=True)
+
     source_rna = sc.read_h5ad(os.path.join(BASE_PATH, "source_rna_aligned.h5ad"))
     source_atac = sc.read_h5ad(os.path.join(BASE_PATH, "source_atac_aligned.h5ad"))
     source_rna.obsm["spatial"] = source_rna.obsm["spatial"] * -1
@@ -2028,6 +2092,7 @@ def load_and_prepare_data_bundle(args):
         source=source_split_bundle,
         target=target_split_bundle,
         split_metadata=split_metadata,
+        combined_gp_dict=combined_gp_dict,
     )
 
     if args.switcharoo:
@@ -2040,6 +2105,7 @@ def load_and_prepare_data_bundle(args):
             source=data_bundle.target,
             target=data_bundle.source,
             split_metadata=swapped_metadata,
+            combined_gp_dict=combined_gp_dict,
         )
 
     return data_bundle
@@ -2857,3 +2923,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# %%
