@@ -90,7 +90,12 @@ def require_runtime_bootstrap():
         raise RuntimeError("bootstrap_runtime() must be called before training or data preparation.")
 
 
-def load_nichecompass_combined_gp_dict_mouse(*, species: str = "mouse", verbose: bool = True) -> Dict[str, Any]:
+def load_nichecompass_combined_gp_dict_mouse(
+    *,
+    species: str = "mouse",
+    load_from_disk: bool = False,
+    verbose: bool = True,
+) -> Dict[str, Any]:
     """Load the same combined_gp_dict as BAKLAVA `mouse_brain_multimodal.py` / `data_utils.build_combined_gp_dict_mouse_brain`.
 
     Expects `DATAPATH` and `BAKLAVA_BASE_DIR` (and BAKLAVA repo on sys.path from `bootstrap_runtime`).
@@ -127,6 +132,7 @@ def load_nichecompass_combined_gp_dict_mouse(*, species: str = "mouse", verbose:
         mebocost_enzyme_sensor_interactions_folder_path=mebocost_enzyme_sensor_interactions_folder_path,
         collectri_tf_network_file_path=collectri_tf_network_file_path,
         gene_orthologs_mapping_file_path=gene_orthologs_mapping_file_path,
+        load_from_disk=load_from_disk,
         verbose=verbose,
     )
     if verbose:

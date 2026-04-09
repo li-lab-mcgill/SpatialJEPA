@@ -98,6 +98,8 @@ class PathwayEmbeddingConfig:
     layer: Optional[str] = None
     correlation_method: Literal["spearman"] = "spearman"
     extract_pathway_genes: PathwayGeneExtractor = default_extract_pathway_genes
+    # Mean pathway score per cluster; set to None to disable. Skipped if column missing on AnnData.
+    cluster_obs_key: Optional[str] = "leiden"
 
 
 @dataclass
@@ -108,6 +110,8 @@ class PathwayEmbeddingResult:
     n_genes_per_pathway: pd.Series
     skipped_pathways: List[str]
     config: PathwayEmbeddingConfig = field(repr=False)
+    pathway_mean_by_cluster: Optional[pd.DataFrame] = None
+    cluster_obs_key_used: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +168,32 @@ def compute_pathway_scores(
 
     n_genes_series = pd.Series(n_genes, dtype=int)
     return scores, n_genes_series, skipped
+
+
+def mean_pathway_scores_by_cluster(
+    adata_rna: AnnData,
+    pathway_scores: pd.DataFrame,
+    obs_key: str,
+) -> Optional[pd.DataFrame]:
+    """
+    Mean per-cell pathway scores within each ``obs[obs_key]`` group (e.g. Leiden).
+
+    Returns a DataFrame (clusters × pathways), or None if ``obs_key`` is absent.
+    """
+    if obs_key not in adata_rna.obs.columns:
+        return None
+
+    scores = pathway_scores.reindex(adata_rna.obs_names)
+    labels_raw = adata_rna.obs[obs_key]
+    mask = labels_raw.notna()
+    labels = labels_raw.astype(str)
+    mask = mask & ~labels.str.lower().isin({"nan", "none", ""})
+    if not mask.any():
+        return None
+
+    grouped = scores.loc[mask].groupby(labels.loc[mask], observed=True).mean()
+    grouped.index.name = obs_key
+    return grouped
 
 
 def correlate_pathways_with_embedding(
@@ -264,6 +294,13 @@ def run_pathway_embedding_analysis(
         method=cfg.correlation_method,
     )
 
+    cluster_means: Optional[pd.DataFrame] = None
+    cluster_key_used: Optional[str] = None
+    if cfg.cluster_obs_key is not None:
+        cluster_means = mean_pathway_scores_by_cluster(adata_rna, scores, cfg.cluster_obs_key)
+        if cluster_means is not None:
+            cluster_key_used = cfg.cluster_obs_key
+
     return PathwayEmbeddingResult(
         pathway_scores=scores,
         correlation=rho,
@@ -271,6 +308,8 @@ def run_pathway_embedding_analysis(
         n_genes_per_pathway=n_genes_series,
         skipped_pathways=skipped,
         config=cfg,
+        pathway_mean_by_cluster=cluster_means,
+        cluster_obs_key_used=cluster_key_used,
     )
 
 
@@ -299,6 +338,11 @@ def save_pathway_embedding_results(result: PathwayEmbeddingResult, out_dir: str)
     )
     summary.to_csv(paths["summary_top"])
 
+    if result.pathway_mean_by_cluster is not None:
+        p_cluster = os.path.join(out_dir, "pathway_mean_by_cluster.csv")
+        result.pathway_mean_by_cluster.to_csv(p_cluster)
+        paths["pathway_mean_by_cluster"] = p_cluster
+
     cfg = result.config
     cfg_dump = {
         "embedding_key": cfg.embedding_key,
@@ -309,6 +353,8 @@ def save_pathway_embedding_results(result: PathwayEmbeddingResult, out_dir: str)
         "layer": cfg.layer,
         "correlation_method": cfg.correlation_method,
         "extract_pathway_genes": getattr(cfg.extract_pathway_genes, "__name__", "custom"),
+        "cluster_obs_key": cfg.cluster_obs_key,
+        "cluster_obs_key_used": result.cluster_obs_key_used,
     }
     with open(paths["config"], "w") as f:
         json.dump(cfg_dump, f, indent=2)

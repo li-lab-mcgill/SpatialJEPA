@@ -134,6 +134,7 @@ def run_co_embed_pathway_embedding_analysis(
     target_rna,
     embedding_key="MultiGATE",
     include_teacher=False,
+    cluster_obs_key="leiden",
 ):
     """
     Spearman correlation between NicheCompass pathway activity scores and MultiGATE obsm columns.
@@ -144,6 +145,9 @@ def run_co_embed_pathway_embedding_analysis(
     missing.
 
     Inspect in a session: ``result["source_rna"].correlation``, ``.pathway_scores``, ``.p_values``, etc.
+    If ``cluster_obs_key`` is set (e.g. ``"leiden"`` or ``"RNA_clusters"``) and that column exists on
+    ``adata.obs``, each result includes ``pathway_mean_by_cluster`` (groups × pathways) and
+    ``cluster_obs_key_used``. Pass ``cluster_obs_key=None`` to skip group means.
     To persist, call ``save_pathway_embedding_results(result[k], out_dir)`` on any non-None entry.
     """
     if combined_gp_dict is None:
@@ -175,15 +179,23 @@ def run_co_embed_pathway_embedding_analysis(
             )
             results[label] = None
             return
-        cfg = PathwayEmbeddingConfig(embedding_key=key)
+        cfg = PathwayEmbeddingConfig(embedding_key=key, cluster_obs_key=cluster_obs_key)
         try:
             res = run_pathway_embedding_analysis(adata, combined_gp_dict, cfg)
             results[label] = res
+            cluster_msg = ""
+            if res.pathway_mean_by_cluster is not None:
+                cluster_msg = "; mean by obs['{}'] {} × {}".format(
+                    res.cluster_obs_key_used or cluster_obs_key,
+                    res.pathway_mean_by_cluster.shape[0],
+                    res.pathway_mean_by_cluster.shape[1],
+                )
             print(
-                "[pathway_embedding_analysis] {}: {} pathways x {} dims.".format(
+                "[pathway_embedding_analysis] {}: {} pathways x {} dims{}.".format(
                     label,
                     res.correlation.shape[0],
                     res.correlation.shape[1],
+                    cluster_msg,
                 )
             )
         except Exception as exc:
@@ -1284,7 +1296,10 @@ def main():
     combined_gp_dict = None
     if not getattr(args, "no_combined_gp_dict", False):
         print("\nLoading NicheCompass combined_gp_dict...")
-        combined_gp_dict = load_nichecompass_combined_gp_dict_mouse(verbose=True)
+        combined_gp_dict = load_nichecompass_combined_gp_dict_mouse(
+            load_from_disk=True,
+            verbose=True,
+        )
 
     #%% ── Load raw aligned datasets ────────────────────────────────────────────
     print("\nLoading source and target datasets...")
@@ -1613,6 +1628,7 @@ def main():
         target_rna=target_rna,
         embedding_key="MultiGATE",
         include_teacher=True,
+        cluster_obs_key="RNA_clusters",
     )
 
     gp_name = "COMPLEX:GAD2_SLC6A13_ligand_receptor_GP"
@@ -1657,6 +1673,30 @@ def main():
         sc.pl.umap(target_concat_adata, color=['modality', 'arc_gex_kmeans_5_clusters_Cluster', gp_name], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
 
+    #%% staircase heatmap for gene-program p-values
+    cluster_gp_scores = pathway_embedding_results['source_rna'].pathway_mean_by_cluster.T
+    cluster_gp_scores.columns = pd.Categorical(cluster_gp_scores.columns, ordered=True, categories=['R0', 'R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10'])
+    cluster_gp_scores = cluster_gp_scores.sort_index(axis=1)
+
+    topks = []
+    for clust in cluster_gp_scores.columns:
+        clust_p = cluster_gp_scores[clust]
+        topk_gps = clust_p.nlargest(5).index
+        topks.append(topk_gps)
+
+    topks = np.hstack(topks)
+
+    cluster_gp_scores_topks = cluster_gp_scores.loc[topks]
+
+    fig, axs = plt.subplots(1, 2, figsize=(10, 10), sharey=True)
+    sns.heatmap(cluster_gp_scores_topks, cmap='viridis', ax=axs[0])
+    sign = np.sign(cluster_gp_scores_topks)
+    cluster_gp_scores_topks_abs = np.abs(cluster_gp_scores_topks)
+    col_min = cluster_gp_scores_topks_abs.min(axis=0)
+    col_max = cluster_gp_scores_topks_abs.max(axis=0)
+    cluster_gp_scores_topks_scaled = sign * (cluster_gp_scores_topks_abs - col_min) / (col_max - col_min)
+    sns.heatmap(cluster_gp_scores_topks_scaled, cmap='viridis', ax=axs[1])
+    plt.tight_layout(); plt.show()
 
     #%% AJIVE analysis
     from mvlearn.decomposition import AJIVE
@@ -1970,6 +2010,8 @@ def main():
     )
 
     #%% plot activation of all latent dimensions
+
+
 
     
     #%% compare spatial graph with latent knn graph
