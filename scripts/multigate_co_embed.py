@@ -37,6 +37,9 @@ Usage:
 
   # Use the spatial teacher for source and zero-shot for target:
   python multigate_co_embed.py --run-name 20260314_095952 --source-model stage1_teacher --target-model zero_shot
+
+  When combined_gp_dict is loaded (omit --no-combined-gp-dict), pathway-vs-embedding
+  Spearman analysis runs in memory; ``main()`` returns those results as the 5th value.
 """
 #%%
 import argparse
@@ -122,6 +125,77 @@ from mouse_brain_spatial_rna_atac import (  # noqa: E402
     prepare_target_for_spatial_graph_type,
     set_multigate_embeddings,
 )
+
+
+def run_co_embed_pathway_embedding_analysis(
+    *,
+    combined_gp_dict,
+    source_rna,
+    target_rna,
+    embedding_key="MultiGATE",
+    include_teacher=False,
+):
+    """
+    Spearman correlation between NicheCompass pathway activity scores and MultiGATE obsm columns.
+
+    Returns a dict of ``PathwayEmbeddingResult`` objects (from ``multigate_pathway_embedding_analysis``)
+    keyed by ``source_rna``, ``target_rna``, and optionally ``source_rna_teacher``. Values are ``None``
+    if that run was skipped (missing embedding) or failed. Returns ``None`` if ``combined_gp_dict`` is
+    missing.
+
+    Inspect in a session: ``result["source_rna"].correlation``, ``.pathway_scores``, ``.p_values``, etc.
+    To persist, call ``save_pathway_embedding_results(result[k], out_dir)`` on any non-None entry.
+    """
+    if combined_gp_dict is None:
+        print(
+            "[pathway_embedding_analysis] Skipped: no combined_gp_dict "
+            "(omit --no-combined-gp-dict to load it)."
+        )
+        return None
+
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+
+    from multigate_pathway_embedding_analysis import (  # noqa: E402
+        PathwayEmbeddingConfig,
+        run_pathway_embedding_analysis,
+    )
+
+    results = {}
+
+    def _one(label, adata, key):
+        if key not in adata.obsm:
+            print(
+                "[pathway_embedding_analysis] Skip {}: obsm['{}'] missing (keys: {}).".format(
+                    label,
+                    key,
+                    list(adata.obsm.keys()),
+                )
+            )
+            results[label] = None
+            return
+        cfg = PathwayEmbeddingConfig(embedding_key=key)
+        try:
+            res = run_pathway_embedding_analysis(adata, combined_gp_dict, cfg)
+            results[label] = res
+            print(
+                "[pathway_embedding_analysis] {}: {} pathways x {} dims.".format(
+                    label,
+                    res.correlation.shape[0],
+                    res.correlation.shape[1],
+                )
+            )
+        except Exception as exc:
+            print("[pathway_embedding_analysis] Failed for {}: {}".format(label, exc))
+            results[label] = None
+
+    _one("source_rna", source_rna, embedding_key)
+    _one("target_rna", target_rna, embedding_key)
+    if include_teacher:
+        _one("source_rna_teacher", source_rna, "MultiGATE_teacher")
+
+    return results
 
 
 #%% ─── Argument parsing ─────────────────────────────────────────────────────────
@@ -266,7 +340,7 @@ def parse_args(notebook: bool = False):
         default=False,
         help=(
             "Skip loading the NicheCompass combined_gp_dict (same as mouse_brain_spatial_rna_atac.py). "
-            "When not set, the dict is loaded for optional downstream use (not yet applied to co-embedding)."
+            "Also skips in-memory pathway-vs-embedding analysis."
         ),
     )
     if notebook:
@@ -1062,6 +1136,8 @@ def main():
     if args.stage2_run_name is not None and args.target_model != "stage2":
         raise ValueError("--stage2-run-name is only valid with --target-model stage2.")
 
+    pathway_embedding_results = None
+
     deterministic_seed = 0
     random.seed(deterministic_seed)
     np.random.seed(deterministic_seed)
@@ -1531,7 +1607,20 @@ def main():
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
+    pathway_embedding_results = run_co_embed_pathway_embedding_analysis(
+        combined_gp_dict=combined_gp_dict,
+        source_rna=source_rna,
+        target_rna=target_rna,
+        embedding_key="MultiGATE",
+        include_teacher=True,
+    )
+
+    gp_name = "COMPLEX:GAD2_SLC6A13_ligand_receptor_GP"
+    source_rna.obs[gp_name] = pathway_embedding_results["source_rna"].pathway_scores[gp_name]
+    target_rna.obs[gp_name] = pathway_embedding_results["target_rna"].pathway_scores[gp_name]
+
     teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher")
+    del teacher_source_concat_adata.obs[gp_name] # if keep gp, misleading
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
 
@@ -1556,16 +1645,16 @@ def main():
     try:
         sc.pl.umap(teacher_source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
-        sc.pl.umap(source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+        sc.pl.umap(source_concat_adata, color=['modality', 'leiden', 'RNA_clusters', gp_name], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
-        sc.pl.umap(target_concat_adata, color=['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
+        sc.pl.umap(target_concat_adata, color=['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster', gp_name], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
     except:
         sc.pl.umap(teacher_source_concat_adata, color=['modality', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
-        sc.pl.umap(source_concat_adata, color=['modality', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+        sc.pl.umap(source_concat_adata, color=['modality', 'RNA_clusters', gp_name], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
-        sc.pl.umap(target_concat_adata, color=['modality', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
+        sc.pl.umap(target_concat_adata, color=['modality', 'arc_gex_kmeans_5_clusters_Cluster', gp_name], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
 
 
@@ -2007,7 +2096,15 @@ def main():
         "\nDone. Embeddings are stored in obsm['MultiGATE'] and "
         "obsm['MultiGATE_clip_all'] for each AnnData."
     )
-    return source_rna, source_atac, target_rna, target_atac
+    if pathway_embedding_results is not None:
+        print(
+            "Pathway embedding analysis: "
+            + ", ".join(
+                "{}={}".format(k, "ok" if v is not None else "skipped/failed")
+                for k, v in pathway_embedding_results.items()
+            )
+        )
+    return source_rna, source_atac, target_rna, target_atac, pathway_embedding_results
 
 #%%
 if __name__ == "__main__":
