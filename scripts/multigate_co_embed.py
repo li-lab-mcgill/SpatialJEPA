@@ -1650,7 +1650,7 @@ def main():
 
     #%% staircase heatmap for gene-program p-values
 
-    def staircase_heatmap(pathway_embedding_results, adata, adata_label, plot_spatial=False):
+    def staircase_heatmap(pathway_embedding_results, adata, adata_label, plot_spatial=False, gp_name=None):
 
         cluster_gp_scores = pathway_embedding_results[adata_label].pathway_mean_by_cluster.T
         cluster_gp_scores.columns = pd.Categorical(cluster_gp_scores.columns, ordered=True, categories=['R0', 'R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10'])
@@ -1659,14 +1659,14 @@ def main():
         topks = []
         for clust in cluster_gp_scores.columns:
             clust_p = cluster_gp_scores[clust]
-            topk_gps = clust_p.nlargest(5).index
+            topk_gps = clust_p.nlargest(3).index
             topks.append(topk_gps)
 
         topks = np.hstack(topks)
 
         cluster_gp_scores_topks = cluster_gp_scores.loc[topks]
 
-        fig, axs = plt.subplots(1, 2, figsize=(12, 10), sharey=True)
+        fig, axs = plt.subplots(1, 2, figsize=(12, 12), sharey=True)
         sns.heatmap(cluster_gp_scores_topks, cmap='viridis', ax=axs[0])
         sign = np.sign(cluster_gp_scores_topks)
         cluster_gp_scores_topks_abs = np.abs(cluster_gp_scores_topks)
@@ -1679,15 +1679,91 @@ def main():
         if plot_spatial:
             top_idxs = np.stack(np.where(cluster_gp_scores_topks == cluster_gp_scores_topks.values.max())).flatten()
             top_gp_name = cluster_gp_scores_topks.iloc[top_idxs[0]].name
+            if gp_name is not None:
+                top_gp_name = gp_name
             top_gp_scores = pathway_embedding_results[adata_label].pathway_scores.loc[:,top_gp_name]
             adata.obs[top_gp_name] = top_gp_scores
             sc.pl.embedding(adata, basis='spatial', color=['RNA_clusters', top_gp_name], ncols=3, wspace=0.2, size=75)
             plt.tight_layout(); plt.show()
 
-        return
+        return cluster_gp_scores
 
-    staircase_heatmap(pathway_embedding_results, source_rna, 'source_rna', plot_spatial=True)
-    staircase_heatmap(pathway_embedding_results, target_rna, 'target_rna', plot_spatial=True)
+    # Myc_TF_target_genes_GP, Apex1_TF_target_genes_GP
+    source_rna_cluster_gp_scores = staircase_heatmap(pathway_embedding_results, source_rna, 'source_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP')
+    target_rna_cluster_gp_scores = staircase_heatmap(pathway_embedding_results, target_rna, 'target_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP')
+
+    # Cluster-by-cluster comparison: grid of panels (scatter + linear fit per cluster)
+    from scipy.stats import pearsonr
+
+    overlap_clusters = source_rna_cluster_gp_scores.columns.intersection(target_rna_cluster_gp_scores.columns)
+    all_data = []
+    for cluster in overlap_clusters:
+        source_cluster_gp_scores = source_rna_cluster_gp_scores[cluster]
+        target_cluster_gp_scores = target_rna_cluster_gp_scores[cluster]
+        for gp in source_cluster_gp_scores.index:
+            all_data.append({
+                'source': source_cluster_gp_scores[gp],
+                'target': target_cluster_gp_scores[gp],
+                'Gene Program': gp,
+                'Cluster': cluster
+            })
+    all_data_df = pd.DataFrame(all_data)
+    import seaborn as sns
+
+    n_clust = len(overlap_clusters)
+    rna_cluster_colormaps = dict(zip(
+        source_concat_adata.obs['RNA_clusters'].cat.categories.tolist(),
+        source_concat_adata.uns['RNA_clusters_colors']
+    ))
+    if n_clust > 0:
+        ncols = n_clust // 2
+        nrows = 2
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(3.4 * ncols, 3.4 * nrows),
+            sharex=True,
+            sharey=True,
+            squeeze=False,
+        )
+        axes_flat = axes.flatten()
+        line_color = '#1a1a1a'
+        for i, cluster in enumerate(overlap_clusters):
+            ax = axes_flat[i]
+            sub = all_data_df.loc[all_data_df['Cluster'] == cluster]
+            marker_color = rna_cluster_colormaps[cluster]
+            # Compute Pearson r for this cluster
+            if len(sub) > 1:
+                pearson_r, _ = pearsonr(sub['source'], sub['target'])
+                pearson_r_str = f" (r={pearson_r:.2f})"
+            else:
+                pearson_r_str = ""
+            sns.regplot(
+                data=sub,
+                x='source',
+                y='target',
+                ax=ax,
+                ci=None,
+                scatter_kws={
+                    's': 36,
+                    'alpha': 0.75,
+                    'marker': 'x',
+                    'color': marker_color,
+                    'edgecolor': marker_color,
+                },
+                line_kws={'color': line_color, 'lw': 2, 'alpha': 0.95},
+            )
+            ax.set_title(f"{cluster}{pearson_r_str}", fontsize=10)
+            ax.grid(True, color='#dddddd', linewidth=0.5)
+        for j in range(n_clust, len(axes_flat)):
+            axes_flat[j].set_visible(False)
+        fig.suptitle('Source vs target gene program scores (per cluster)', y=1.02)
+        fig.supxlabel('source cluster GP score')
+        fig.supylabel('target cluster GP score')
+        plt.tight_layout(rect=[0.04, 0.04, 1, 0.98])
+        plt.show()
+
+ 
 
 
     #%% AJIVE analysis
