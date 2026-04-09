@@ -962,27 +962,13 @@ def _spatial_target_from_target_reference(
 
 
 def run_alignment_and_spatial_plot(
-    *,
     model,
     source_mgate,
     target_mgate,
-    source_infer_graph_tf,
-    source_gp_tf,
-    source_x1,
-    source_x2,
-    target_graph_tf,
-    target_gp_tf,
-    target_x1,
-    target_x2,
     source_rna,
     source_atac,
-    target_rna,
-    target_atac,
-    device,
-    run_inference,
-    set_multigate_embeddings,
-    build_concat_adata_for_umap,
-    compute_concat_umap,
+    source_concat_adata,
+    target_concat_adata,
     deterministic_seed: int,
     umap_n_neighbors: int = 50,
     umap_resolution: float = 0.5,
@@ -994,23 +980,6 @@ def run_alignment_and_spatial_plot(
     Full path: inference → MultiGATE in obsm → concat → UMAP ref → ingest → Leiden →
     joint AnnData → spatial → sc.pl.embedding (spatial + UMAP panels).
     """
-    # --- 1) Inference -----------------------------------------------------------
-    source_rna_emb, source_atac_emb = run_inference(
-        model, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
-    )
-    target_rna_emb, target_atac_emb = run_inference(
-        model, target_graph_tf, target_gp_tf, target_x1, target_x2, device
-    )
-    set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
-    set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
-
-    # --- 2) Concat latent AnnData ----------------------------------------------
-    source_concat_adata = build_concat_adata_for_umap(
-        source_rna, source_atac, embedding_key="MultiGATE"
-    )
-    target_concat_adata = build_concat_adata_for_umap(
-        target_rna, target_atac, embedding_key="MultiGATE"
-    )
 
     # --- 3) Reference-specific UMAP + ingest + Leiden ----------------------------
     if model is source_mgate:
@@ -1622,6 +1591,39 @@ def main():
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
+    teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher")
+    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
+    target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
+
+    source_target_adata, source_concat_adata, target_concat_adata = run_alignment_and_spatial_plot(
+        model,
+        source_mgate,
+        target_mgate,
+        source_rna,
+        source_atac,
+        source_concat_adata,
+        target_concat_adata,
+        deterministic_seed,
+    )
+
+    target_rna.obsm['spatial'] = source_target_adata[
+        source_target_adata.obs['modality'].eq('rna') &
+        source_target_adata.obs['source_or_target'].eq('target')
+    ].obsm['spatial'].copy()
+ 
+    ## ingest source embeddings into target data
+    sc.tl.ingest(teacher_source_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters')
+    sc.tl.ingest(target_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters')
+    target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
+
+    ## confirm that the ingested representations are the same as the original embeddings
+    assert (teacher_source_concat_adata.obsm['rep'] == teacher_source_concat_adata.X).all()
+    assert (target_concat_adata.obsm['rep'] == target_concat_adata.X).all()
+
+    ingested_rna_clusters = target_concat_adata.obs.loc[target_concat_adata.obs['modality'].eq('rna'), 'RNA_clusters']
+    ingested_rna_clusters.index = ingested_rna_clusters.index.str.replace('_rna', '')
+    target_rna.obs['RNA_clusters'] = ingested_rna_clusters
+
     pathway_embedding_results = run_co_embed_pathway_embedding_analysis(
         combined_gp_dict=combined_gp_dict,
         source_rna=source_rna,
@@ -1631,72 +1633,62 @@ def main():
         cluster_obs_key="RNA_clusters",
     )
 
-    gp_name = "COMPLEX:GAD2_SLC6A13_ligand_receptor_GP"
-    source_rna.obs[gp_name] = pathway_embedding_results["source_rna"].pathway_scores[gp_name]
-    target_rna.obs[gp_name] = pathway_embedding_results["target_rna"].pathway_scores[gp_name]
-
-    teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher")
-    del teacher_source_concat_adata.obs[gp_name] # if keep gp, misleading
-    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
-    target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
-
-    ## compute UMAP for source data
-    compute_concat_umap(
-        source_concat_adata,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
- 
-    ## ingest source embeddings into target data
-    sc.tl.ingest(teacher_source_concat_adata, source_concat_adata, embedding_method='umap')
-    sc.tl.ingest(target_concat_adata, source_concat_adata, embedding_method='umap')
-    target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
-
-    ## confirm that the ingested representations are the same as the original embeddings
-    assert (teacher_source_concat_adata.obsm['rep'] == teacher_source_concat_adata.X).all()
-    assert (target_concat_adata.obsm['rep'] == target_concat_adata.X).all()
-
     try:
         sc.pl.umap(teacher_source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
-        sc.pl.umap(source_concat_adata, color=['modality', 'leiden', 'RNA_clusters', gp_name], ncols=3, wspace=0.2, size=25)
+        sc.pl.umap(source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
-        sc.pl.umap(target_concat_adata, color=['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster', gp_name], ncols=3, wspace=0.2, size=25)
+        sc.pl.umap(target_concat_adata, color=['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
     except:
         sc.pl.umap(teacher_source_concat_adata, color=['modality', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
-        sc.pl.umap(source_concat_adata, color=['modality', 'RNA_clusters', gp_name], ncols=3, wspace=0.2, size=25)
+        sc.pl.umap(source_concat_adata, color=['modality', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
-        sc.pl.umap(target_concat_adata, color=['modality', 'arc_gex_kmeans_5_clusters_Cluster', gp_name], ncols=3, wspace=0.2, size=25)
+        sc.pl.umap(target_concat_adata, color=['modality', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
 
     #%% staircase heatmap for gene-program p-values
-    cluster_gp_scores = pathway_embedding_results['source_rna'].pathway_mean_by_cluster.T
-    cluster_gp_scores.columns = pd.Categorical(cluster_gp_scores.columns, ordered=True, categories=['R0', 'R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10'])
-    cluster_gp_scores = cluster_gp_scores.sort_index(axis=1)
 
-    topks = []
-    for clust in cluster_gp_scores.columns:
-        clust_p = cluster_gp_scores[clust]
-        topk_gps = clust_p.nlargest(5).index
-        topks.append(topk_gps)
+    def staircase_heatmap(pathway_embedding_results, adata, adata_label, plot_spatial=False):
 
-    topks = np.hstack(topks)
+        cluster_gp_scores = pathway_embedding_results[adata_label].pathway_mean_by_cluster.T
+        cluster_gp_scores.columns = pd.Categorical(cluster_gp_scores.columns, ordered=True, categories=['R0', 'R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10'])
+        cluster_gp_scores = cluster_gp_scores.sort_index(axis=1)
 
-    cluster_gp_scores_topks = cluster_gp_scores.loc[topks]
+        topks = []
+        for clust in cluster_gp_scores.columns:
+            clust_p = cluster_gp_scores[clust]
+            topk_gps = clust_p.nlargest(5).index
+            topks.append(topk_gps)
 
-    fig, axs = plt.subplots(1, 2, figsize=(10, 10), sharey=True)
-    sns.heatmap(cluster_gp_scores_topks, cmap='viridis', ax=axs[0])
-    sign = np.sign(cluster_gp_scores_topks)
-    cluster_gp_scores_topks_abs = np.abs(cluster_gp_scores_topks)
-    col_min = cluster_gp_scores_topks_abs.min(axis=0)
-    col_max = cluster_gp_scores_topks_abs.max(axis=0)
-    cluster_gp_scores_topks_scaled = sign * (cluster_gp_scores_topks_abs - col_min) / (col_max - col_min)
-    sns.heatmap(cluster_gp_scores_topks_scaled, cmap='viridis', ax=axs[1])
-    plt.tight_layout(); plt.show()
+        topks = np.hstack(topks)
+
+        cluster_gp_scores_topks = cluster_gp_scores.loc[topks]
+
+        fig, axs = plt.subplots(1, 2, figsize=(12, 10), sharey=True)
+        sns.heatmap(cluster_gp_scores_topks, cmap='viridis', ax=axs[0])
+        sign = np.sign(cluster_gp_scores_topks)
+        cluster_gp_scores_topks_abs = np.abs(cluster_gp_scores_topks)
+        col_min = cluster_gp_scores_topks_abs.min(axis=0)
+        col_max = cluster_gp_scores_topks_abs.max(axis=0)
+        cluster_gp_scores_topks_scaled = sign * (cluster_gp_scores_topks_abs - col_min) / (col_max - col_min)
+        sns.heatmap(cluster_gp_scores_topks_scaled, cmap='viridis', ax=axs[1])
+        plt.tight_layout(); plt.show()
+
+        if plot_spatial:
+            top_idxs = np.stack(np.where(cluster_gp_scores_topks == cluster_gp_scores_topks.values.max())).flatten()
+            top_gp_name = cluster_gp_scores_topks.iloc[top_idxs[0]].name
+            top_gp_scores = pathway_embedding_results[adata_label].pathway_scores.loc[:,top_gp_name]
+            adata.obs[top_gp_name] = top_gp_scores
+            sc.pl.embedding(adata, basis='spatial', color=['RNA_clusters', top_gp_name], ncols=3, wspace=0.2, size=75)
+            plt.tight_layout(); plt.show()
+
+        return
+
+    staircase_heatmap(pathway_embedding_results, source_rna, 'source_rna', plot_spatial=True)
+    staircase_heatmap(pathway_embedding_results, target_rna, 'target_rna', plot_spatial=True)
+
 
     #%% AJIVE analysis
     from mvlearn.decomposition import AJIVE
@@ -1950,54 +1942,7 @@ def main():
 
 
     #%% ── Inference, combined target embeddings ─────────────────────────────
-    # Same object identity as source_mgate / target_mgate selects UMAP reference + ingest direction
-    # inside run_alignment_and_spatial_plot (source- vs target-anchored).
-    alignment_model = source_mgate
 
-    source_target_adata, source_concat_adata, target_concat_adata = run_alignment_and_spatial_plot(
-        model=alignment_model,
-        source_mgate=source_mgate,
-        target_mgate=target_mgate,
-        source_infer_graph_tf=source_infer_graph_tf,
-        source_gp_tf=source_gp_tf,
-        source_x1=source_x1,
-        source_x2=source_x2,
-        target_graph_tf=target_graph_tf,
-        target_gp_tf=target_gp_tf,
-        target_x1=target_x1,
-        target_x2=target_x2,
-        source_rna=source_rna,
-        source_atac=source_atac,
-        target_rna=target_rna,
-        target_atac=target_atac,
-        device=device,
-        run_inference=run_inference,
-        set_multigate_embeddings=set_multigate_embeddings,
-        build_concat_adata_for_umap=build_concat_adata_for_umap,
-        compute_concat_umap=compute_concat_umap,
-        deterministic_seed=deterministic_seed,
-        umap_n_neighbors=50,
-        umap_resolution=0.5,
-        leiden_neighbors=100,
-        leiden_resolution=0.5,
-        embedding_point_size=50.0,
-    )
-
-    '''
-    ## concatenate source and target data
-    source_target_rna = sc.concat([source_rna, target_rna], axis=0)
-    source_target_atac = sc.concat([source_atac, target_atac], axis=0)
-    source_target_rna.obs["source_or_target"] = ["source"] * source_rna.n_obs + ["target"] * target_rna.n_obs
-    source_target_atac.obs["source_or_target"] = ["source"] * source_atac.n_obs + ["target"] * target_atac.n_obs
-    source_target_adata = build_concat_adata_for_umap(source_target_rna, source_target_atac, embedding_key="MultiGATE")
-    compute_concat_umap(
-        source_target_adata,
-        n_neighbors=50,
-        resolution=0.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    '''
     # Randomly permute the rows before plotting the UMAP
     permuted_idx = np.random.RandomState(deterministic_seed).permutation(source_target_adata.n_obs)
     color_list = ["modality", "source_or_target", "leiden", "map_count"]
@@ -2008,11 +1953,6 @@ def main():
         wspace=0.2,
         size=25,
     )
-
-    #%% plot activation of all latent dimensions
-
-
-
     
     #%% compare spatial graph with latent knn graph
     n_neighbors = 100
