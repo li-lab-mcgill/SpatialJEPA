@@ -98,6 +98,7 @@ warnings.filterwarnings("ignore")
 import mlflow
 from mlflow.tracking import MlflowClient
 import numpy as np
+import pandas as pd
 import scanpy as sc
 import torch
 
@@ -804,6 +805,237 @@ def run_inference(mgate, graph_tf, gp_tf, x1_df, x2_df, device):
     rna_emb  = outputs[5].detach().cpu().numpy()
     atac_emb = outputs[6].detach().cpu().numpy()
     return rna_emb, atac_emb
+
+def _concat_obs_to_barcode(concat_obs: pd.Index, modality: str) -> np.ndarray:
+    suffix = "_rna" if modality == "rna" else "_atac"
+    idx = pd.Index(concat_obs).astype(str)
+    if not idx.str.endswith(suffix).all():
+        raise ValueError("concat obs must end with %r for modality %r" % (suffix, modality))
+    return idx.str.slice(0, -len(suffix)).values
+
+
+def _spatial_target_from_source_reference(
+    target_concat_adata, source_rna, source_atac,
+    *,
+    mapping_col: str = "source_obs_names",
+):
+    """One source barcode per target row (source-anchored UMAP + ingest)."""
+    rna_t = target_concat_adata.obs["modality"].eq("rna")
+    atac_t = target_concat_adata.obs["modality"].eq("atac")
+    rna_keys = pd.Index(target_concat_adata.obs.loc[rna_t, mapping_col]).astype(str).str.rsplit("_", n=1).str[0]
+    atac_keys = pd.Index(target_concat_adata.obs.loc[atac_t, mapping_col]).astype(str).str.rsplit("_", n=1).str[0]
+    target_rna_spatial = np.asarray(source_rna[rna_keys].obsm["spatial"])
+    target_atac_spatial = np.asarray(source_atac[atac_keys].obsm["spatial"])
+    return target_rna_spatial, target_atac_spatial
+
+
+def _spatial_target_from_target_reference(
+    source_concat_adata,
+    target_concat_adata,
+    source_rna,
+    source_atac,
+    *,
+    mapping_col: str = "target_obs_names",
+):
+    """Mean source spatial over source rows mapping to each target (target-anchored UMAP + ingest)."""
+    def _block(tgt_mask, src_mask, modality, source_adata):
+        tgt_names = target_concat_adata.obs_names[tgt_mask]
+        src_ix = source_concat_adata.obs_names[src_mask]
+        barcodes = _concat_obs_to_barcode(src_ix, modality)
+        src_map = source_concat_adata.obs.loc[src_ix, mapping_col]
+        coords = np.asarray(source_adata[barcodes].obsm["spatial"])
+        out = np.full((tgt_names.size, coords.shape[1]), np.nan, dtype=float)
+        for i, tname in enumerate(tgt_names):
+            sel = src_map.to_numpy() == tname
+            if np.any(sel):
+                out[i] = coords[sel].mean(axis=0)
+        return out
+
+    rna_t = target_concat_adata.obs["modality"].eq("rna")
+    atac_t = target_concat_adata.obs["modality"].eq("atac")
+    rna_s = source_concat_adata.obs["modality"].eq("rna")
+    atac_s = source_concat_adata.obs["modality"].eq("atac")
+    return (
+        _block(rna_t, rna_s, "rna", source_rna),
+        _block(atac_t, atac_s, "atac", source_atac),
+    )
+
+
+def run_alignment_and_spatial_plot(
+    *,
+    model,
+    source_mgate,
+    target_mgate,
+    source_infer_graph_tf,
+    source_gp_tf,
+    source_x1,
+    source_x2,
+    target_graph_tf,
+    target_gp_tf,
+    target_x1,
+    target_x2,
+    source_rna,
+    source_atac,
+    target_rna,
+    target_atac,
+    device,
+    run_inference,
+    set_multigate_embeddings,
+    build_concat_adata_for_umap,
+    compute_concat_umap,
+    deterministic_seed: int,
+    umap_n_neighbors: int = 50,
+    umap_resolution: float = 0.5,
+    leiden_neighbors: int = 100,
+    leiden_resolution: float = 0.5,
+    embedding_point_size: float = 50.0,
+):
+    """
+    Full path: inference → MultiGATE in obsm → concat → UMAP ref → ingest → Leiden →
+    joint AnnData → spatial → sc.pl.embedding (spatial + UMAP panels).
+    """
+    # --- 1) Inference -----------------------------------------------------------
+    source_rna_emb, source_atac_emb = run_inference(
+        model, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+    )
+    target_rna_emb, target_atac_emb = run_inference(
+        model, target_graph_tf, target_gp_tf, target_x1, target_x2, device
+    )
+    set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
+    set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
+
+    # --- 2) Concat latent AnnData ----------------------------------------------
+    source_concat_adata = build_concat_adata_for_umap(
+        source_rna, source_atac, embedding_key="MultiGATE"
+    )
+    target_concat_adata = build_concat_adata_for_umap(
+        target_rna, target_atac, embedding_key="MultiGATE"
+    )
+
+    # --- 3) Reference-specific UMAP + ingest + Leiden ----------------------------
+    if model is source_mgate:
+        compute_concat_umap(
+            source_concat_adata,
+            n_neighbors=umap_n_neighbors,
+            resolution=umap_resolution,
+            deterministic=True,
+            random_state=deterministic_seed,
+        )
+        source_concat_adata.obs["source_obs_names"] = source_concat_adata.obs_names
+        sc.tl.ingest(
+            target_concat_adata,
+            source_concat_adata,
+            embedding_method="umap",
+            obs="source_obs_names",
+            k=1,
+        )
+        sc.pp.neighbors(source_concat_adata, use_rep="X", n_neighbors=leiden_neighbors)
+        sc.tl.leiden(source_concat_adata, resolution=leiden_resolution)
+        target_concat_adata.obs["leiden"] = (
+            source_concat_adata.obs["leiden"]
+            .loc[target_concat_adata.obs["source_obs_names"]]
+            .values
+        )
+        target_rna_spatial, target_atac_spatial = _spatial_target_from_source_reference(
+            target_concat_adata, source_rna, source_atac, mapping_col="source_obs_names"
+        )
+
+    elif model is target_mgate:
+        compute_concat_umap(
+            target_concat_adata,
+            n_neighbors=umap_n_neighbors,
+            resolution=umap_resolution,
+            deterministic=True,
+            random_state=deterministic_seed,
+        )
+        target_concat_adata.obs["target_obs_names"] = target_concat_adata.obs_names
+        sc.tl.ingest(
+            source_concat_adata,
+            target_concat_adata,
+            embedding_method="umap",
+            obs="target_obs_names",
+            k=1,
+        )
+        sc.pp.neighbors(target_concat_adata, use_rep="X", n_neighbors=leiden_neighbors)
+        sc.tl.leiden(target_concat_adata, resolution=leiden_resolution)
+        source_concat_adata.obs["leiden"] = (
+            target_concat_adata.obs["leiden"]
+            .loc[source_concat_adata.obs["target_obs_names"]]
+            .values
+        )
+        target_rna_spatial, target_atac_spatial = _spatial_target_from_target_reference(
+            source_concat_adata,
+            target_concat_adata,
+            source_rna,
+            source_atac,
+            mapping_col="target_obs_names",
+        )
+    else:
+        raise ValueError("model must be source_mgate or target_mgate (same object identity).")
+
+    # --- 4) Joint object for plotting ------------------------------------------
+    source_target_adata = sc.concat([source_concat_adata, target_concat_adata], axis=0)
+    source_target_adata.obs["source_or_target"] = (
+        ["source"] * source_concat_adata.n_obs + ["target"] * target_concat_adata.n_obs
+    )
+
+    # --- 4b) Per-reference hit counts (must run before joint concat) ----------
+    if model is source_mgate:
+        count_series = target_concat_adata.obs["source_obs_names"].value_counts().rename("map_count")
+    else:
+        count_series = source_concat_adata.obs["target_obs_names"].value_counts().rename("map_count")
+        
+    source_target_adata.obs = source_target_adata.obs.merge(
+        count_series,
+        left_index=True,
+        right_index=True,
+        how="left",
+    )
+
+    # --- 5) Spatial coordinates (source truth + imputed target) ----------------
+    source_target_adata.obsm["spatial"] = np.concatenate(
+        [
+            np.asarray(source_rna.obsm["spatial"]),
+            np.asarray(source_atac.obsm["spatial"]),
+            target_rna_spatial,
+            target_atac_spatial,
+        ],
+        axis=0,
+    )
+
+    # --- 6) Split + plot spatial (sc.pl.embedding) and UMAP --------------------
+    source_adata = source_target_adata[source_target_adata.obs["source_or_target"].eq("source")]
+    target_adata = source_target_adata[source_target_adata.obs["source_or_target"].eq("target")]
+
+    _, axs = plt.subplots(2, 2, figsize=(10, 8))
+    sc.pl.embedding(
+        source_adata,
+        basis="spatial",
+        color="leiden",
+        s=embedding_point_size,
+        show=False,
+        ax=axs[0, 0],
+        legend_loc="none",
+    )
+    sc.pl.umap(source_adata, color="leiden", ax=axs[0, 1], size=embedding_point_size, show=False)
+    sc.pl.embedding(
+        target_adata,
+        basis="spatial",
+        color="leiden",
+        s=embedding_point_size,
+        show=False,
+        ax=axs[1, 0],
+        legend_loc="none",
+    )
+    sc.pl.umap(target_adata, color="leiden", ax=axs[1, 1], size=embedding_point_size, show=False)
+    axs[0, 0].set_title("Source spatial")
+    axs[0, 1].set_title("Source UMAP")
+    axs[1, 0].set_title("Target spatial (imputed from source)")
+    axs[1, 1].set_title("Target UMAP")
+    plt.tight_layout()
+    plt.show()
+
+    return source_target_adata, source_concat_adata, target_concat_adata
 
 
 #%% ─── Main ─────────────────────────────────────────────────────────────────────
@@ -1569,52 +1801,39 @@ def main():
     plt.tight_layout(); plt.show()
 
 
-    #%% ── Inference, combined target embeddings ────────────────────────────────────────────────────────────
-    model = source_mgate
+    #%% ── Inference, combined target embeddings ─────────────────────────────
+    # Same object identity as source_mgate / target_mgate selects UMAP reference + ingest direction
+    # inside run_alignment_and_spatial_plot (source- vs target-anchored).
+    alignment_model = source_mgate
 
-    source_rna_emb, source_atac_emb = run_inference(
-        model, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+    source_target_adata, source_concat_adata, target_concat_adata = run_alignment_and_spatial_plot(
+        model=alignment_model,
+        source_mgate=source_mgate,
+        target_mgate=target_mgate,
+        source_infer_graph_tf=source_infer_graph_tf,
+        source_gp_tf=source_gp_tf,
+        source_x1=source_x1,
+        source_x2=source_x2,
+        target_graph_tf=target_graph_tf,
+        target_gp_tf=target_gp_tf,
+        target_x1=target_x1,
+        target_x2=target_x2,
+        source_rna=source_rna,
+        source_atac=source_atac,
+        target_rna=target_rna,
+        target_atac=target_atac,
+        device=device,
+        run_inference=run_inference,
+        set_multigate_embeddings=set_multigate_embeddings,
+        build_concat_adata_for_umap=build_concat_adata_for_umap,
+        compute_concat_umap=compute_concat_umap,
+        deterministic_seed=deterministic_seed,
+        umap_n_neighbors=50,
+        umap_resolution=0.5,
+        leiden_neighbors=100,
+        leiden_resolution=0.5,
+        embedding_point_size=50.0,
     )
-    set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
-    print("  Source embeddings: shape {}".format(source_rna_emb.shape))
-
-    target_rna_emb, target_atac_emb = run_inference(
-        model, target_graph_tf, target_gp_tf, target_x1, target_x2, device
-    )
-    set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
-    print("  Target embeddings: shape {}".format(target_rna_emb.shape))
-
-    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
-    target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
-
-    # Compute combined UMAP
-    compute_concat_umap(
-        source_concat_adata,
-        n_neighbors=50,
-        resolution=0.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-
-    source_concat_adata.obs['source_obs_names'] = source_concat_adata.obs_names
-
-    sc.tl.ingest(
-        target_concat_adata,
-        source_concat_adata,
-        embedding_method='umap',
-        obs='source_obs_names',
-        k=1,
-        )
-
-    ## compute neighbors & leiden clustering for source data and assign target leiden clusters
-    sc.pp.neighbors(source_concat_adata, use_rep='X', n_neighbors=100)
-    sc.tl.leiden(source_concat_adata, resolution=0.5)
-    target_concat_adata.obs['leiden'] = source_concat_adata.obs['leiden'].loc[target_concat_adata.obs['source_obs_names']].values
-
-    source_target_adata = sc.concat([source_concat_adata, target_concat_adata], axis=0)
-    source_target_adata.obs["source_or_target"] = ["source"] * source_concat_adata.n_obs + ["target"] * target_concat_adata.n_obs
-    source_hits_df = target_concat_adata.obs['source_obs_names'].value_counts()
-    source_concat_adata.obs = source_concat_adata.obs.merge(source_hits_df, left_index=True, right_index=True, how='left')
 
     '''
     ## concatenate source and target data
@@ -1633,44 +1852,14 @@ def main():
     '''
     # Randomly permute the rows before plotting the UMAP
     permuted_idx = np.random.RandomState(deterministic_seed).permutation(source_target_adata.n_obs)
+    color_list = ["modality", "source_or_target", "leiden", "map_count"]
     sc.pl.umap(
         source_target_adata[permuted_idx],
-        color=["modality", "source_or_target", 'leiden'],
-        ncols=3,
+        color=color_list,
+        ncols=len(color_list),
         wspace=0.2,
         size=25,
     )
-
-    #%% plot source and target spatial and UMAP
-    import matplotlib.pyplot as plt
-    from scipy.optimize import linear_sum_assignment
-
-    ## assign target spatial coordinates to source_target_adata
-    rna_source_obs_names = target_concat_adata.obs["source_obs_names"].loc[target_concat_adata.obs["modality"].eq("rna")].str.split("_").str[0]
-    atac_source_obs_names = target_concat_adata.obs["source_obs_names"].loc[target_concat_adata.obs["modality"].eq("atac")].str.split("_").str[0]
-    target_rna_spatial = source_rna[rna_source_obs_names].obsm["spatial"]
-    target_atac_spatial = source_atac[atac_source_obs_names].obsm["spatial"]
-
-    ## add spatial coordinates to source_target_adata
-    source_target_adata.obsm["spatial"] = np.concatenate([
-        source_rna.obsm["spatial"],
-        source_atac.obsm["spatial"],
-        target_rna_spatial,
-        target_atac_spatial,
-    ], axis=0)
-
-    ## split source_target_adata into source and target data
-    source_adata = source_target_adata[source_target_adata.obs["source_or_target"].eq("source")]
-    target_adata = source_target_adata[source_target_adata.obs["source_or_target"].eq("target")]
-
-    ## plot source and target spatial and UMAP
-    _, axs = plt.subplots(2, 2, figsize=(10, 8))
-    sc.pl.embedding(source_adata, basis="spatial", color="leiden", s=50, show=False, ax=axs[0, 0], legend_loc='None')
-    sc.pl.umap(source_adata, color="leiden", ax=axs[0, 1], size=50, show=False)
-    sc.pl.embedding(target_adata, basis="spatial", color="leiden", s=50, show=False, ax=axs[1, 0], legend_loc='None')
-    sc.pl.umap(target_adata, color="leiden", ax=axs[1, 1], size=50, show=False)
-    axs[0, 0].set_title('Source Spatial'); axs[0, 1].set_title('Source UMAP'); axs[1, 0].set_title('Target Spatial'); axs[1, 1].set_title('Target UMAP')
-    plt.tight_layout(); plt.show()
 
     #%% plot activation of all latent dimensions
 
