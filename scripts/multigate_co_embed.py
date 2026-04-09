@@ -1650,7 +1650,21 @@ def main():
 
     #%% staircase heatmap for gene-program p-values
 
+    _gene_programs_plots_artifact_dir = "gene_programs_plots"
+
+    def _log_mlflow_figure(fig, artifact_filename):
+        with tempfile.TemporaryDirectory() as _fig_tmp:
+            _path = os.path.join(_fig_tmp, artifact_filename)
+            fig.savefig(_path, format="svg", bbox_inches="tight")
+            client.log_artifact(run_id, _path, artifact_path=_gene_programs_plots_artifact_dir)
+        print(
+            "Logged {}/{} to MLflow run {}.".format(
+                _gene_programs_plots_artifact_dir, artifact_filename, run_id
+            )
+        )
+
     def staircase_heatmap(pathway_embedding_results, adata, adata_label, plot_spatial=False, gp_name=None):
+        import seaborn as sns
 
         cluster_gp_scores = pathway_embedding_results[adata_label].pathway_mean_by_cluster.T
         cluster_gp_scores.columns = pd.Categorical(cluster_gp_scores.columns, ordered=True, categories=['R0', 'R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10'])
@@ -1666,7 +1680,7 @@ def main():
 
         cluster_gp_scores_topks = cluster_gp_scores.loc[topks]
 
-        fig, axs = plt.subplots(1, 2, figsize=(12, 12), sharey=True)
+        fig_heatmap, axs = plt.subplots(1, 2, figsize=(12, 12), sharey=True)
         sns.heatmap(cluster_gp_scores_topks, cmap='viridis', ax=axs[0])
         sign = np.sign(cluster_gp_scores_topks)
         cluster_gp_scores_topks_abs = np.abs(cluster_gp_scores_topks)
@@ -1674,8 +1688,11 @@ def main():
         col_max = cluster_gp_scores_topks_abs.max(axis=0)
         cluster_gp_scores_topks_scaled = sign * (cluster_gp_scores_topks_abs - col_min) / (col_max - col_min)
         sns.heatmap(cluster_gp_scores_topks_scaled, cmap='viridis', ax=axs[1])
-        plt.tight_layout(); plt.show()
+        plt.tight_layout()
+        _log_mlflow_figure(fig_heatmap, "staircase_gp_heatmap_{}.svg".format(adata_label))
+        plt.show()
 
+        fig_spatial = None
         if plot_spatial:
             top_idxs = np.stack(np.where(cluster_gp_scores_topks == cluster_gp_scores_topks.values.max())).flatten()
             top_gp_name = cluster_gp_scores_topks.iloc[top_idxs[0]].name
@@ -1683,14 +1700,29 @@ def main():
                 top_gp_name = gp_name
             top_gp_scores = pathway_embedding_results[adata_label].pathway_scores.loc[:,top_gp_name]
             adata.obs[top_gp_name] = top_gp_scores
-            sc.pl.embedding(adata, basis='spatial', color=['RNA_clusters', top_gp_name], ncols=3, wspace=0.2, size=75)
-            plt.tight_layout(); plt.show()
+            sc.pl.embedding(
+                adata,
+                basis='spatial',
+                color=['RNA_clusters', top_gp_name],
+                ncols=3,
+                wspace=0.2,
+                size=75,
+                show=False,
+            )
+            fig_spatial = plt.gcf()
+            plt.tight_layout()
+            _log_mlflow_figure(fig_spatial, "staircase_gp_spatial_{}.svg".format(adata_label))
+            plt.show()
 
-        return cluster_gp_scores
+        return cluster_gp_scores, fig_heatmap, fig_spatial
 
     # Myc_TF_target_genes_GP, Apex1_TF_target_genes_GP
-    source_rna_cluster_gp_scores = staircase_heatmap(pathway_embedding_results, source_rna, 'source_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP')
-    target_rna_cluster_gp_scores = staircase_heatmap(pathway_embedding_results, target_rna, 'target_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP')
+    source_rna_cluster_gp_scores, _fig_stair_heatmap_source, _fig_stair_spatial_source = staircase_heatmap(
+        pathway_embedding_results, source_rna, 'source_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
+    )
+    target_rna_cluster_gp_scores, _fig_stair_heatmap_target, _fig_stair_spatial_target = staircase_heatmap(
+        pathway_embedding_results, target_rna, 'target_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
+    )
 
     # Cluster-by-cluster comparison: grid of panels (scatter + linear fit per cluster)
     from scipy.stats import pearsonr
@@ -1761,10 +1793,8 @@ def main():
         fig.supxlabel('source cluster GP score')
         fig.supylabel('target cluster GP score')
         plt.tight_layout(rect=[0.04, 0.04, 1, 0.98])
+        _log_mlflow_figure(fig, "source_vs_target_gene_program_scores_per_cluster.svg")
         plt.show()
-
- 
-
 
     #%% AJIVE analysis
     from mvlearn.decomposition import AJIVE
@@ -2017,18 +2047,7 @@ def main():
     plt.tight_layout(); plt.show()
 
 
-    #%% ── Inference, combined target embeddings ─────────────────────────────
 
-    # Randomly permute the rows before plotting the UMAP
-    permuted_idx = np.random.RandomState(deterministic_seed).permutation(source_target_adata.n_obs)
-    color_list = ["modality", "source_or_target", "leiden", "map_count"]
-    sc.pl.umap(
-        source_target_adata[permuted_idx],
-        color=color_list,
-        ncols=len(color_list),
-        wspace=0.2,
-        size=25,
-    )
     
     #%% compare spatial graph with latent knn graph
     n_neighbors = 100
