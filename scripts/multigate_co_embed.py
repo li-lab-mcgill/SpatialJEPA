@@ -1849,6 +1849,128 @@ def main():
         _log_mlflow_figure(fig, "source_vs_target_gene_program_scores_per_cluster.svg")
         plt.show()
 
+    #%% cellphoneDB analysis
+    import squidpy as sq
+
+    source_rna.var["gene_symbol_upper"] = source_rna.var_names.str.upper()
+
+    res = sq.gr.ligrec(
+        source_rna,
+        n_perms=1000,
+        threshold=0.005, # default 0.01
+        cluster_key="RNA_clusters",
+        copy=True,
+        use_raw=False,
+        gene_symbols="gene_symbol_upper",
+        transmitter_params={"categories": "ligand"},
+        receiver_params={"categories": "receptor"},
+        n_jobs=1,
+        show_progress_bar=False,
+        numba_parallel=False,
+    )
+
+    sq.pl.ligrec(res, alpha=0.05)
+    plt.show()
+
+    #%% LIANA+ inflow analysis
+    import liana as li
+    import plotnine as p9
+    import squidpy as sq
+
+    bandwidth = 40
+    s = 60
+    cell_type_col = "RNA_clusters"
+    spatial_key = "spatial"
+
+    adata = source_rna.copy()
+    sc.pl.embedding(adata, basis="spatial", color=["RNA_clusters"], wspace=0.4, s=60)
+
+    plot, df = li.ut.query_bandwidth(
+        coordinates=adata.obsm["spatial"],
+        start=5,         
+        end=60,           
+        interval_n=40    
+    )
+    plot + p9.scale_y_continuous(breaks=range(int(df.neighbours.min()), 
+                                        int(df.neighbours.max())+1))
+
+    li.ut.spatial_neighbors(adata=adata, bandwidth=bandwidth, spatial_key="spatial")
+    li.pl.connectivity(adata, idx=5500, size=0.01, figure_size=(6, 5), spatial_key="spatial")
+
+    sq.gr.spatial_autocorr(adata, mode='moran', use_raw=False, show_progress_bar=True)
+    svgs = adata.uns['moranI'].index[(adata.uns['moranI']['pval_norm_fdr_bh'] < 0.05) & (adata.uns['moranI']['I'] > 0.01)]
+    adata = adata[:, svgs]
+    print(f"Number of spatially variable genes: {len(svgs)}")
+
+    map_df = pd.read_csv(os.path.join(os.environ.get('DATAPATH'), 'gene_annotations', 'human_mouse_gene_orthologs.csv')) 
+    map_df = map_df.rename(columns={"Gene name": "source", "Mouse gene name": "target"})
+    map_df = map_df.drop(columns=["Gene stable ID", "Mouse gene stable ID"])
+
+    resource = li.rs.select_resource('consensus') #NOTE: there is a mouse_consensus resource and we should recreate it once we update consensus :)
+    resource = li.rs.translate_resource(resource,
+                                    map_df=map_df,
+                                    columns=['ligand', 'receptor'],
+                                    replace=True,
+                                    # Here, we will be harsher and only keep mappings that don't map to more than 1 mouse gene
+                                    one_to_many=2
+                                    )
+
+    lrdata = li.mt.inflow(adata,
+                        groupby='RNA_clusters',
+                        resource=resource,
+                        use_raw=False)
+
+    sq.gr.spatial_autocorr(lrdata, mode='moran', use_raw=False)
+    svis = lrdata.uns['moranI'].index[(lrdata.uns['moranI']['pval_norm_fdr_bh'] <= 0.05) & (lrdata.uns['moranI']['I'] > 0.01)]
+    print(f"Number of spatially variable ligand-receptor interactions: {len(svis)}")
+    lrdata = lrdata[:, svis]
+    lrdata.uns['moranI'].sort_values("I").tail(30)
+
+    ligands = lrdata.var_names.str.split("^").str[1]
+    receptors = lrdata.var_names.str.split("^").str[2]
+    fused_I = adata.uns['moranI'].loc[ligands, 'I'].values * adata.uns['moranI'].loc[receptors, 'I'].values
+
+    print(lrdata.var_names[np.flip(fused_I.argsort())])
+
+    interaction = 'R1^Mdk^Alk'
+    comp = interaction.split("^")
+
+    sc.pl.embedding(
+        lrdata,
+        basis=spatial_key,
+        color=interaction,
+        s=s,
+        ncols=2,
+    )
+
+    sc.pl.embedding(
+        adata,
+        basis=spatial_key,
+        color=[comp[1], comp[2]],
+        s=s,
+        use_raw=False,
+        ncols=2,
+    )
+
+    fig, ax = plt.subplots(figsize=(14, 5)) 
+    sc.pl.violin(lrdata, groupby=cell_type_col, keys=interaction,size=0.5,rotation=90, ax=ax)
+    plt.tight_layout()
+    plt.show()
+
+    li.pl.feature_by_group(
+        adata=lrdata,
+        spatial_key=spatial_key,
+        feature=interaction,
+        groupby=cell_type_col,
+        percentile_scaling = (1,97),
+        labels=["R2", "R4", "R7"],
+        show_counts=False,
+        normalize=True,
+        figure_size=(10,8)
+    )
+
+    ## stopped at "Global Summaries"
+
     #%% embedding-to-gene modelling
     from sklearn.cross_decomposition import PLSRegression
     from sklearn.linear_model import LogisticRegression, PoissonRegressor
