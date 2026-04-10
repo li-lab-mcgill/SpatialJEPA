@@ -1849,6 +1849,58 @@ def main():
         _log_mlflow_figure(fig, "source_vs_target_gene_program_scores_per_cluster.svg")
         plt.show()
 
+    #%% embedding-to-gene modelling
+    from sklearn.cross_decomposition import PLSRegression
+    from sklearn.linear_model import LogisticRegression, PoissonRegressor
+    from sklearn.multioutput import MultiOutputRegressor
+
+    #X = pathway_embedding_results['source_rna'].pathway_scores.to_numpy()
+    X = source_rna.X.toarray()
+    Z = source_rna.obsm['MultiGATE'].copy()
+    C = source_rna.obs['RNA_clusters'].copy()
+
+    pls = PLSRegression(n_components=30)
+    pls.fit(Z, X)
+    T = pls.transform(Z)
+
+    model = MultiOutputRegressor(PoissonRegressor())
+    model.fit(T, X)
+    #model.fit(Z, X)
+
+    B = np.column_stack([est.coef_ for est in model.estimators_])
+    b = np.array([est.intercept_ for est in model.estimators_])
+
+    genes_to_embs = (pls.x_weights_ @ B).T
+    #genes_to_embs = B.T
+    n_genes, n_embs = genes_to_embs.shape # shape: (n_emb, n_genes)
+
+    # Get gene names and embedding names
+    gene_names = source_rna.var_names
+    emb_names = [f"emb_{i}" for i in range(n_embs)]
+
+    # For each embedding dimension, find top 5 genes by absolute coefficient
+    topk = 5
+    top_genes = []
+
+    for emb_idx in range(n_embs):
+        col = genes_to_embs[:, emb_idx]
+        col = abs(col)
+        top_gene_indices = np.argsort(col)[::-1][:topk]
+        top_genes.append(gene_names[top_gene_indices])
+
+    top_genes = np.hstack(top_genes)
+
+    genes_to_embs_df = pd.DataFrame(genes_to_embs, index=gene_names, columns=emb_names)
+    top_genes_to_embs_df = genes_to_embs_df.loc[top_genes]
+    top_genes_to_embs_df = top_genes_to_embs_df.abs()
+
+    sns.heatmap(top_genes_to_embs_df, cmap='viridis', cbar=True)
+    plt.title("Top 5 genes per embedding (PLS coefficients)")
+    plt.ylabel("Gene")
+    plt.xlabel("Embedding dimension")
+    plt.tight_layout()
+    plt.show()
+
     #%% AJIVE analysis
     from mvlearn.decomposition import AJIVE
     import seaborn as sns
