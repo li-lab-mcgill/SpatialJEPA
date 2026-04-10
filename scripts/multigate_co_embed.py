@@ -1568,7 +1568,7 @@ def main():
 
     #%% Inference, all same model
 
-    model = source_mgate
+    model = target_mgate
 
     ## (teacher) source inference
     teacher_source_rna_emb, teacher_source_atac_emb = run_inference(
@@ -1611,15 +1611,25 @@ def main():
         source_target_adata.obs['source_or_target'].eq('target')
     ].obsm['spatial'].copy()
  
-    ## ingest source embeddings into target data
-    sc.tl.ingest(teacher_source_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters')
-    sc.tl.ingest(target_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters')
     target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
 
-    ## confirm that the ingested representations are the same as the original embeddings
-    assert (teacher_source_concat_adata.obsm['rep'] == teacher_source_concat_adata.X).all()
-    assert (target_concat_adata.obsm['rep'] == target_concat_adata.X).all()
+    ## ingest source embeddings into target data
+    if model is source_mgate:
+        #sc.tl.ingest(teacher_source_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters')
+        sc.tl.ingest(target_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters')
+        ## confirm that the ingested representations are the same as the original embeddings
+        #assert (teacher_source_concat_adata.obsm['rep'] == teacher_source_concat_adata.X).all()
+        assert (target_concat_adata.obsm['rep'] == target_concat_adata.X).all()
+    elif model is target_mgate:
+        rna_target_obs_names = source_concat_adata.obs.loc[source_concat_adata.obs['modality'].eq('rna'), 'target_obs_names']
+        atac_target_obs_names = source_concat_adata.obs.loc[source_concat_adata.obs['modality'].eq('atac'), 'target_obs_names']
+        target_concat_adata.obs.loc[rna_target_obs_names.values, 'RNA_clusters'] = source_concat_adata.obs.loc[rna_target_obs_names.index, 'RNA_clusters'].values
+        target_concat_adata.obs.loc[atac_target_obs_names.values, 'RNA_clusters'] = source_concat_adata.obs.loc[atac_target_obs_names.index, 'RNA_clusters'].values
+        ## confirm that the ingested representations are the same as the original embeddings
+        #assert (target_concat_adata.obsm['rep'] == target_concat_adata.X).all()
+        assert (source_concat_adata.obsm['rep'] == source_concat_adata.X).all()
 
+    # assign RNA_clusters to target_rna specifically
     ingested_rna_clusters = target_concat_adata.obs.loc[target_concat_adata.obs['modality'].eq('rna'), 'RNA_clusters']
     ingested_rna_clusters.index = ingested_rna_clusters.index.str.replace('_rna', '')
     target_rna.obs['RNA_clusters'] = ingested_rna_clusters
@@ -1634,15 +1644,15 @@ def main():
     )
 
     try:
-        sc.pl.umap(teacher_source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-        plt.tight_layout(); plt.show()
+        #sc.pl.umap(teacher_source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+        #plt.tight_layout(); plt.show()
         sc.pl.umap(source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
         sc.pl.umap(target_concat_adata, color=['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
     except:
-        sc.pl.umap(teacher_source_concat_adata, color=['modality', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-        plt.tight_layout(); plt.show()
+        #sc.pl.umap(teacher_source_concat_adata, color=['modality', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+        #plt.tight_layout(); plt.show()
         sc.pl.umap(source_concat_adata, color=['modality', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
         sc.pl.umap(target_concat_adata, color=['modality', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
@@ -1650,7 +1660,8 @@ def main():
 
     #%% staircase heatmap for gene-program p-values
 
-    _gene_programs_plots_artifact_dir = "gene_programs_plots"
+    _gene_programs_plots_artifact_suffix = "source_mgate" if model is source_mgate else "target_mgate"
+    _gene_programs_plots_artifact_dir = "gene_programs_plots/{}".format(_gene_programs_plots_artifact_suffix)
 
     def _log_mlflow_figure(fig, artifact_filename):
         with tempfile.TemporaryDirectory() as _fig_tmp:
@@ -1748,7 +1759,7 @@ def main():
         source_concat_adata.uns['RNA_clusters_colors']
     ))
     if n_clust > 0:
-        ncols = n_clust // 2
+        ncols = int(np.ceil(n_clust / 2))
         nrows = 2
         fig, axes = plt.subplots(
             nrows,
