@@ -111,6 +111,9 @@ class PathwayEmbeddingResult:
     skipped_pathways: List[str]
     config: PathwayEmbeddingConfig = field(repr=False)
     pathway_mean_by_cluster: Optional[pd.DataFrame] = None
+    embedding_mean_by_cluster: Optional[pd.DataFrame] = None
+    pathway_embedding_correlation_by_cluster: Optional[pd.DataFrame] = None
+    pathway_embedding_p_values_by_cluster: Optional[pd.DataFrame] = None
     cluster_obs_key_used: Optional[str] = None
 
 
@@ -196,6 +199,39 @@ def mean_pathway_scores_by_cluster(
     return grouped
 
 
+def mean_embedding_by_cluster(
+    adata_rna: AnnData,
+    embedding: np.ndarray,
+    obs_key: str,
+    embedding_column_prefix: str = "emb",
+) -> Optional[pd.DataFrame]:
+    """
+    Mean embedding coordinates within each ``obs[obs_key]`` group.
+
+    Returns a DataFrame (clusters × embedding dims), or None if ``obs_key`` is absent.
+    """
+    if obs_key not in adata_rna.obs.columns:
+        return None
+
+    if embedding.shape[0] != adata_rna.n_obs:
+        raise ValueError(
+            "embedding rows ({}) != adata observations ({})".format(embedding.shape[0], adata_rna.n_obs)
+        )
+
+    labels_raw = adata_rna.obs[obs_key]
+    mask = labels_raw.notna()
+    labels = labels_raw.astype(str)
+    mask = mask & ~labels.str.lower().isin({"nan", "none", ""})
+    if not mask.any():
+        return None
+
+    emb_cols = ["{}_{:d}".format(embedding_column_prefix, j) for j in range(embedding.shape[1])]
+    emb_df = pd.DataFrame(embedding, index=adata_rna.obs_names.copy(), columns=emb_cols)
+    grouped = emb_df.loc[mask].groupby(labels.loc[mask], observed=True).mean()
+    grouped.index.name = obs_key
+    return grouped
+
+
 def correlate_pathways_with_embedding(
     embedding: np.ndarray,
     pathway_scores: pd.DataFrame,
@@ -230,6 +266,30 @@ def correlate_pathways_with_embedding(
     return (
         pd.DataFrame(rho, index=pw_names, columns=emb_cols),
         pd.DataFrame(pval, index=pw_names, columns=emb_cols),
+    )
+
+
+def correlate_cluster_pathways_with_embedding(
+    cluster_pathway_scores: pd.DataFrame,
+    cluster_embedding_means: pd.DataFrame,
+    method: Literal["spearman"] = "spearman",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Correlate cluster-level pathway means with cluster-level embedding centroids.
+
+    Inputs are expected as (clusters × pathways) and (clusters × embedding dims).
+    """
+    overlap = cluster_pathway_scores.index.intersection(cluster_embedding_means.index)
+    if len(overlap) == 0:
+        raise ValueError("No overlapping clusters between pathway means and embedding means.")
+
+    cluster_pathway_scores = cluster_pathway_scores.loc[overlap]
+    cluster_embedding_means = cluster_embedding_means.loc[overlap]
+    return correlate_pathways_with_embedding(
+        cluster_embedding_means.to_numpy(dtype=np.float64),
+        cluster_pathway_scores,
+        method=method,
+        embedding_column_prefix=str(cluster_embedding_means.columns[0]).rsplit("_", 1)[0],
     )
 
 
@@ -295,11 +355,25 @@ def run_pathway_embedding_analysis(
     )
 
     cluster_means: Optional[pd.DataFrame] = None
+    cluster_embedding_means: Optional[pd.DataFrame] = None
+    cluster_rho: Optional[pd.DataFrame] = None
+    cluster_pval: Optional[pd.DataFrame] = None
     cluster_key_used: Optional[str] = None
     if cfg.cluster_obs_key is not None:
         cluster_means = mean_pathway_scores_by_cluster(adata_rna, scores, cfg.cluster_obs_key)
         if cluster_means is not None:
             cluster_key_used = cfg.cluster_obs_key
+            cluster_embedding_means = mean_embedding_by_cluster(
+                adata_rna,
+                emb,
+                cfg.cluster_obs_key,
+            )
+            if cluster_embedding_means is not None:
+                cluster_rho, cluster_pval = correlate_cluster_pathways_with_embedding(
+                    cluster_means,
+                    cluster_embedding_means,
+                    method=cfg.correlation_method,
+                )
 
     return PathwayEmbeddingResult(
         pathway_scores=scores,
@@ -309,6 +383,9 @@ def run_pathway_embedding_analysis(
         skipped_pathways=skipped,
         config=cfg,
         pathway_mean_by_cluster=cluster_means,
+        embedding_mean_by_cluster=cluster_embedding_means,
+        pathway_embedding_correlation_by_cluster=cluster_rho,
+        pathway_embedding_p_values_by_cluster=cluster_pval,
         cluster_obs_key_used=cluster_key_used,
     )
 
@@ -342,6 +419,18 @@ def save_pathway_embedding_results(result: PathwayEmbeddingResult, out_dir: str)
         p_cluster = os.path.join(out_dir, "pathway_mean_by_cluster.csv")
         result.pathway_mean_by_cluster.to_csv(p_cluster)
         paths["pathway_mean_by_cluster"] = p_cluster
+    if result.embedding_mean_by_cluster is not None:
+        p_cluster_emb = os.path.join(out_dir, "embedding_mean_by_cluster.csv")
+        result.embedding_mean_by_cluster.to_csv(p_cluster_emb)
+        paths["embedding_mean_by_cluster"] = p_cluster_emb
+    if result.pathway_embedding_correlation_by_cluster is not None:
+        p_cluster_corr = os.path.join(out_dir, "pathway_embedding_spearman_by_cluster.csv")
+        result.pathway_embedding_correlation_by_cluster.to_csv(p_cluster_corr)
+        paths["pathway_embedding_spearman_by_cluster"] = p_cluster_corr
+    if result.pathway_embedding_p_values_by_cluster is not None:
+        p_cluster_pval = os.path.join(out_dir, "pathway_embedding_spearman_pvalues_by_cluster.csv")
+        result.pathway_embedding_p_values_by_cluster.to_csv(p_cluster_pval)
+        paths["pathway_embedding_spearman_pvalues_by_cluster"] = p_cluster_pval
 
     cfg = result.config
     cfg_dump = {

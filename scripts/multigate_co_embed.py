@@ -190,12 +190,19 @@ def run_co_embed_pathway_embedding_analysis(
                     res.pathway_mean_by_cluster.shape[0],
                     res.pathway_mean_by_cluster.shape[1],
                 )
+            cluster_link_msg = ""
+            if res.pathway_embedding_correlation_by_cluster is not None:
+                cluster_link_msg = "; cluster-centroid corr {} pathways x {} dims".format(
+                    res.pathway_embedding_correlation_by_cluster.shape[0],
+                    res.pathway_embedding_correlation_by_cluster.shape[1],
+                )
             print(
-                "[pathway_embedding_analysis] {}: {} pathways x {} dims{}.".format(
+                "[pathway_embedding_analysis] {}: {} pathways x {} dims{}{}.".format(
                     label,
                     res.correlation.shape[0],
                     res.correlation.shape[1],
                     cluster_msg,
+                    cluster_link_msg,
                 )
             )
         except Exception as exc:
@@ -1727,12 +1734,47 @@ def main():
 
         return cluster_gp_scores, fig_heatmap, fig_spatial
 
+    def cluster_pathway_embedding_heatmap(pathway_embedding_results, adata_label, top_k_pathways=30):
+        import seaborn as sns
+
+        result = pathway_embedding_results[adata_label]
+        corr = result.pathway_embedding_correlation_by_cluster
+        if corr is None or corr.empty:
+            return None, None
+
+        pathway_order = corr.abs().max(axis=1).sort_values(ascending=False).head(top_k_pathways).index
+        corr_top = corr.loc[pathway_order]
+
+        fig, ax = plt.subplots(
+            figsize=(max(8, 0.55 * corr_top.shape[1] + 3), max(8, 0.25 * corr_top.shape[0] + 2))
+        )
+        sns.heatmap(corr_top, cmap='coolwarm', center=0.0, ax=ax)
+        ax.set_title(
+            "{} pathway vs {}-centroid embedding correlation".format(
+                adata_label,
+                result.cluster_obs_key_used or "cluster",
+            )
+        )
+        ax.set_xlabel("{} centroid dims".format(result.config.embedding_key))
+        ax.set_ylabel("gene program")
+        plt.tight_layout()
+        _log_mlflow_figure(fig, "pathway_embedding_by_cluster_{}.svg".format(adata_label))
+        plt.show()
+
+        return corr_top, fig
+
     # Myc_TF_target_genes_GP, Apex1_TF_target_genes_GP
     source_rna_cluster_gp_scores, _fig_stair_heatmap_source, _fig_stair_spatial_source = staircase_heatmap(
         pathway_embedding_results, source_rna, 'source_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
     )
     target_rna_cluster_gp_scores, _fig_stair_heatmap_target, _fig_stair_spatial_target = staircase_heatmap(
         pathway_embedding_results, target_rna, 'target_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
+    )
+    source_cluster_pathway_embedding_corr, _fig_cluster_pathway_embedding_source = cluster_pathway_embedding_heatmap(
+        pathway_embedding_results, 'source_rna'
+    )
+    target_cluster_pathway_embedding_corr, _fig_cluster_pathway_embedding_target = cluster_pathway_embedding_heatmap(
+        pathway_embedding_results, 'target_rna'
     )
 
     # Cluster-by-cluster comparison: grid of panels (scatter + linear fit per cluster)
@@ -1810,7 +1852,6 @@ def main():
     #%% AJIVE analysis
     from mvlearn.decomposition import AJIVE
     import seaborn as sns
-    import pandas as pd
 
     ## spatial source inference
     teacher_spatial_source_rna_emb, teacher_spatial_source_atac_emb = run_inference(
@@ -1977,7 +2018,6 @@ def main():
     plt.plot(np.cumsum(pca.explained_variance_ratio_))
     # Plot barcharts of the first 5 principal component loadings using seaborn as different series
     import seaborn as sns
-    import pandas as pd
 
     n_pcs = 5
     loadings_df = pd.DataFrame(
