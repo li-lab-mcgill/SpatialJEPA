@@ -1269,14 +1269,6 @@ def main():
     if not os.path.exists(gtf_path):
         raise FileNotFoundError("GTF annotation file not found: {}".format(gtf_path))
 
-    combined_gp_dict = None
-    if not getattr(args, "no_combined_gp_dict", False):
-        print("\nLoading NicheCompass combined_gp_dict...")
-        combined_gp_dict = load_nichecompass_combined_gp_dict_mouse(
-            load_from_disk=True,
-            verbose=True,
-        )
-
     #%% ── Load raw aligned datasets ────────────────────────────────────────────
     print("\nLoading source and target datasets...")
     source_rna  = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned.h5ad"))
@@ -1641,6 +1633,14 @@ def main():
     ingested_rna_clusters.index = ingested_rna_clusters.index.str.replace('_rna', '')
     target_rna.obs['RNA_clusters'] = ingested_rna_clusters
 
+    combined_gp_dict = None
+    if not getattr(args, "no_combined_gp_dict", False):
+        print("\nLoading NicheCompass combined_gp_dict...")
+        combined_gp_dict = load_nichecompass_combined_gp_dict_mouse(
+            load_from_disk=True,
+            verbose=True,
+        )
+
     pathway_embedding_results = run_co_embed_pathway_embedding_analysis(
         combined_gp_dict=combined_gp_dict,
         source_rna=source_rna,
@@ -1877,99 +1877,178 @@ def main():
     import plotnine as p9
     import squidpy as sq
 
-    bandwidth = 40
-    s = 60
-    cell_type_col = "RNA_clusters"
-    spatial_key = "spatial"
-
-    adata = source_rna.copy()
-    sc.pl.embedding(adata, basis="spatial", color=["RNA_clusters"], wspace=0.4, s=60)
-
-    plot, df = li.ut.query_bandwidth(
-        coordinates=adata.obsm["spatial"],
-        start=5,         
-        end=60,           
-        interval_n=40    
-    )
-    plot + p9.scale_y_continuous(breaks=range(int(df.neighbours.min()), 
-                                        int(df.neighbours.max())+1))
-
-    li.ut.spatial_neighbors(adata=adata, bandwidth=bandwidth, spatial_key="spatial")
-    li.pl.connectivity(adata, idx=5500, size=0.01, figure_size=(6, 5), spatial_key="spatial")
-
-    sq.gr.spatial_autocorr(adata, mode='moran', use_raw=False, show_progress_bar=True)
-    svgs = adata.uns['moranI'].index[(adata.uns['moranI']['pval_norm_fdr_bh'] < 0.05) & (adata.uns['moranI']['I'] > 0.01)]
-    adata = adata[:, svgs]
-    print(f"Number of spatially variable genes: {len(svgs)}")
-
-    map_df = pd.read_csv(os.path.join(os.environ.get('DATAPATH'), 'gene_annotations', 'human_mouse_gene_orthologs.csv')) 
-    map_df = map_df.rename(columns={"Gene name": "source", "Mouse gene name": "target"})
-    map_df = map_df.drop(columns=["Gene stable ID", "Mouse gene stable ID"])
-
-    resource = li.rs.select_resource('consensus') #NOTE: there is a mouse_consensus resource and we should recreate it once we update consensus :)
-    resource = li.rs.translate_resource(resource,
-                                    map_df=map_df,
-                                    columns=['ligand', 'receptor'],
-                                    replace=True,
-                                    # Here, we will be harsher and only keep mappings that don't map to more than 1 mouse gene
-                                    one_to_many=2
-                                    )
-
-    lrdata = li.mt.inflow(adata,
-                        groupby='RNA_clusters',
-                        resource=resource,
-                        use_raw=False)
-
-    sq.gr.spatial_autocorr(lrdata, mode='moran', use_raw=False)
-    svis = lrdata.uns['moranI'].index[(lrdata.uns['moranI']['pval_norm_fdr_bh'] <= 0.05) & (lrdata.uns['moranI']['I'] > 0.01)]
-    print(f"Number of spatially variable ligand-receptor interactions: {len(svis)}")
-    lrdata = lrdata[:, svis]
-    lrdata.uns['moranI'].sort_values("I").tail(30)
-
-    ligands = lrdata.var_names.str.split("^").str[1]
-    receptors = lrdata.var_names.str.split("^").str[2]
-    fused_I = adata.uns['moranI'].loc[ligands, 'I'].values * adata.uns['moranI'].loc[receptors, 'I'].values
-
-    print(lrdata.var_names[np.flip(fused_I.argsort())])
-
-    interaction = 'R1^Mdk^Alk'
-    comp = interaction.split("^")
-
-    sc.pl.embedding(
-        lrdata,
-        basis=spatial_key,
-        color=interaction,
-        s=s,
-        ncols=2,
-    )
-
-    sc.pl.embedding(
+    def liana_spatial_analysis(
         adata,
-        basis=spatial_key,
-        color=[comp[1], comp[2]],
-        s=s,
-        use_raw=False,
-        ncols=2,
-    )
+        spatial_key="spatial",
+        cell_type_col="RNA_clusters",
+        labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60
+        ):
+        """
+        Performs LIANA+ inflow and associated spatial ligand-receptor analyses on `source_rna` AnnData object.
 
-    fig, ax = plt.subplots(figsize=(14, 5)) 
-    sc.pl.violin(lrdata, groupby=cell_type_col, keys=interaction,size=0.5,rotation=90, ax=ax)
-    plt.tight_layout()
-    plt.show()
+        Parameters:
+            source_rna: AnnData
+                Source RNA AnnData object with spatial information.
+            source_rna_emb: np.ndarray
+                Embedding array for reference for GW distance computation.
+            labels: list
+                Labels for feature_by_group (cell types).
+            interaction: str
+                Ligand-receptor interaction string to visualize, e.g., 'R1^Mdk^Alk'.
+            ncomps: int
+                Number of NMF components for factorization.
+            bandwidth: int
+                Bandwidth for spatial neighbors.
+            s: int
+                Dot size for spatial plots.
+            cell_type_col: str
+                Column in .obs with cell type/cluster labels.
+            spatial_key: str
+                Key in .obsm for spatial coordinates.
+        Returns:
+            dict of intermediate outputs (optional).
+        """
+        import squidpy as sq
+        import liana as li
+        import plotnine as p9
 
-    li.pl.feature_by_group(
-        adata=lrdata,
-        spatial_key=spatial_key,
-        feature=interaction,
-        groupby=cell_type_col,
-        percentile_scaling = (1,97),
-        labels=["R2", "R4", "R7"],
-        show_counts=False,
-        normalize=True,
-        figure_size=(10,8)
-    )
+        import ot
 
-    ## stopped at "Global Summaries"
+        sc.pl.embedding(adata, basis=spatial_key, color=[cell_type_col], wspace=0.4, s=s)
+
+        plot, df = li.ut.query_bandwidth(
+            coordinates=adata.obsm[spatial_key],
+            start=5,         
+            end=60,           
+            interval_n=40    
+        )
+        plot + p9.scale_y_continuous(breaks=range(int(df.neighbours.min()), int(df.neighbours.max())+1))
+
+        li.ut.spatial_neighbors(adata=adata, bandwidth=bandwidth, spatial_key=spatial_key)
+        li.pl.connectivity(adata, idx=5500, size=0.01, figure_size=(6, 5), spatial_key=spatial_key)
+
+        sq.gr.spatial_autocorr(adata, mode='moran', use_raw=False, show_progress_bar=True)
+        svgs = adata.uns['moranI'].index[(adata.uns['moranI']['pval_norm_fdr_bh'] < 0.05) & (adata.uns['moranI']['I'] > 0.01)]
+        adata = adata[:, svgs]
+        print(f"Number of spatially variable genes: {len(svgs)}")
+
+        map_df = pd.read_csv(os.path.join(os.environ.get('DATAPATH'), 'gene_annotations', 'human_mouse_gene_orthologs.csv')) 
+        map_df = map_df.rename(columns={"Gene name": "source", "Mouse gene name": "target"})
+        map_df = map_df.drop(columns=["Gene stable ID", "Mouse gene stable ID"])
+
+        resource = li.rs.select_resource('consensus') # NOTE: mouse_consensus could be used in future
+        resource = li.rs.translate_resource(resource,
+                                        map_df=map_df,
+                                        columns=['ligand', 'receptor'],
+                                        replace=True,
+                                        one_to_many=2
+                                        )
+
+        lrdata = li.mt.inflow(adata,
+                            groupby=cell_type_col,
+                            resource=resource,
+                            use_raw=False)
+
+        sq.gr.spatial_autocorr(lrdata, mode='moran', use_raw=False)
+        svis = lrdata.uns['moranI'].index[(lrdata.uns['moranI']['pval_norm_fdr_bh'] <= 0.05) & (lrdata.uns['moranI']['I'] > 0.01)]
+        print(f"Number of spatially variable ligand-receptor interactions: {len(svis)}")
+        lrdata = lrdata[:, svis]
+        lrdata.uns['moranI'].sort_values("I").tail(30)
+
+        ligands = lrdata.var_names.str.split("^").str[1]
+        receptors = lrdata.var_names.str.split("^").str[2]
+        fused_I = adata.uns['moranI'].loc[ligands, 'I'].values * adata.uns['moranI'].loc[receptors, 'I'].values
+
+        print(lrdata.var_names[np.flip(fused_I.argsort())])
+
+        comp = interaction.split("^")
+
+        sc.pl.embedding(
+            lrdata,
+            basis=spatial_key,
+            color=interaction,
+            s=s,
+            ncols=2,
+        )
+
+        sc.pl.embedding(
+            adata,
+            basis=spatial_key,
+            color=[comp[1], comp[2]],
+            s=s,
+            use_raw=False,
+            ncols=2,
+        )
+
+        fig, ax = plt.subplots(figsize=(14, 5)) 
+        sc.pl.violin(lrdata, groupby=cell_type_col, keys=interaction, size=0.5, rotation=90, ax=ax)
+        plt.tight_layout()
+        plt.show()
+
+        li.pl.feature_by_group(
+            adata=lrdata,
+            spatial_key=spatial_key,
+            feature=interaction,
+            groupby=cell_type_col,
+            percentile_scaling=(1,97),
+            labels=labels,
+            show_counts=False,
+            normalize=True,
+            figure_size=(10,8)
+        )
+        ## stopped at "Global Summaries"
+
+        ## NMF
+        li.multi.nmf(lrdata, n_components=ncomps, inplace=True, random_state=0, max_iter=200, verbose=True)
+        lr_loadings = li.ut.get_variable_loadings(lrdata, varm_key='NMF_H').set_index('index')
+        factor_scores = li.ut.get_factor_scores(lrdata, obsm_key='NMF_W')
+
+        X_nmf = lrdata.obsm['NMF_W']
+        keep_nmf = X_nmf.sum(axis=1) > 0
+        lrdata_nmf = lrdata[keep_nmf].copy()
+        nmf = sc.AnnData(X=lrdata_nmf.obsm['NMF_W'],
+                        obs=lrdata_nmf.obs,
+                        var=pd.DataFrame(index=lr_loadings.columns),
+                        uns=lrdata.uns,
+                        obsm=lrdata_nmf.obsm)
+        lr_loadings.head(10)
+
+        sc.pp.neighbors(nmf, use_rep='X', metric='euclidean', n_neighbors=30)
+        sc.tl.leiden(nmf, resolution=0.1)
+        sc.tl.umap(nmf, min_dist=0.5)
+        sc.pl.umap(nmf, color=[cell_type_col, 'leiden'], size=25, ncols=2)
+
+        sc.pl.embedding(nmf, basis=spatial_key, color=[cell_type_col, 'leiden'], size=s, ncols=2)
+
+        ## GW distance
+        X_nmf = nmf.X
+        X_source = adata.obsm['MultiGATE'][keep_nmf]
+        C_nmf = ot.utils.dist(X_nmf, metric='euclidean')
+        C_source = ot.utils.dist(X_source, metric='euclidean')
+        C_nmf = C_nmf / C_nmf.max()
+        C_source = C_source / C_source.max()
+        gw_distance = ot.gromov.entropic_gromov_wasserstein2(C_nmf, C_source, epsilon=1e-2)
+
+        # Return a dictionary of useful results, or could just not return if only for plotting side-effects
+        return {
+            "adata": adata,
+            "lrdata": lrdata,
+            "nmf": nmf,
+            "gw_distance": gw_distance,
+            "fused_I": fused_I,
+            "svgs": svgs,
+            "svis": svis,
+            "lr_loadings": lr_loadings,
+            "factor_scores": factor_scores
+        }
+
+    liana_results = liana_spatial_analysis(
+        source_rna,
+        labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
+        )
+
+    print(f'GW distance: {liana_results["gw_distance"]:.2f}')
+
 
     #%% embedding-to-gene modelling
     from sklearn.cross_decomposition import PLSRegression
