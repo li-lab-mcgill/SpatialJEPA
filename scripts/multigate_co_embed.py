@@ -1876,6 +1876,7 @@ def main():
     import liana as li
     import plotnine as p9
     import squidpy as sq
+    import ot
 
     def liana_spatial_analysis(
         adata,
@@ -1908,11 +1909,6 @@ def main():
         Returns:
             dict of intermediate outputs (optional).
         """
-        import squidpy as sq
-        import liana as li
-        import plotnine as p9
-
-        import ot
 
         sc.pl.embedding(adata, basis=spatial_key, color=[cell_type_col], wspace=0.4, s=s)
 
@@ -2046,8 +2042,31 @@ def main():
         source_rna,
         labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
         )
-
     print(f'GW distance: {liana_results["gw_distance"]:.2f}')
+
+    Xs = source_rna.obsm['MultiGATE']
+    #Xt = liana_results['lrdata'].obsm['NMF_W']
+    Xt = target_rna.obsm['MultiGATE']
+    print(f'Xs shape: {Xs.shape}, Xt shape: {Xt.shape}')
+
+    '''
+    ot_mapping_linear = ot.da.MappingTransport(
+        kernel="linear", mu=1e0, eta=1e-8, bias=True, max_iter=5, verbose=True
+    )
+    ot_mapping_linear.fit(Xs=Xs, Xt=Xt)
+    '''
+
+    res = ot.solve_sample(Xs, Xt)
+    G = res.plan
+    transp_Xs_linear = G @ Xt
+
+    X_nmf = liana_results['lrdata'].obsm['NMF_W']
+    C_nmf = ot.utils.dist(X_nmf, metric='euclidean')
+    C_nmf = C_nmf / C_nmf.max()
+    C_source_transp = ot.utils.dist(transp_Xs_linear, metric='euclidean')
+    C_source_transp = C_source_transp / C_source_transp.max()
+    gw_distance = ot.gromov.entropic_gromov_wasserstein2(C_nmf, C_source_transp, epsilon=1e-2)
+    print(f'GW distance: {gw_distance:.2f}')
 
 
     #%% embedding-to-gene modelling
