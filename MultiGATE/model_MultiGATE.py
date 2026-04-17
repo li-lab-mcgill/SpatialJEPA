@@ -50,6 +50,7 @@ class MGATE(nn.Module):
         weight_decay=0.0001,
         vgp_anchor_mode="spot",
         skip_gp_attention=True,
+        linear_etm_decoder=False,
     ):
         super(MGATE, self).__init__()
         self.n_layers = len(hidden_dims1) - 1
@@ -105,6 +106,13 @@ class MGATE(nn.Module):
         self.W_i = nn.Parameter(torch.empty(emb_dim1, emb_dim1))
         self.W_t = nn.Parameter(torch.empty(emb_dim2, emb_dim2))
         self.logit_scale = nn.Parameter(torch.tensor(float(temp), dtype=torch.float32))
+
+        self.linear_etm_decoder = linear_etm_decoder
+        if linear_etm_decoder:
+            etm_emb_dim = 20
+            self.alpha      = nn.Parameter(torch.empty(emb_dim1, etm_emb_dim))
+            self.rho_rna    = nn.Parameter(torch.empty(etm_emb_dim, hidden_dims1[0]))
+            self.rho_atac   = nn.Parameter(torch.empty(etm_emb_dim, hidden_dims2[0]))
 
         self.bn_rna = nn.LayerNorm(emb_dim1)
         self.bn_atac = nn.LayerNorm(emb_dim2)
@@ -176,12 +184,18 @@ class MGATE(nn.Module):
         self.H2 = H2 # output of Eq. (8) for second modality (ATAC) 
 
         # Decoder
-        for layer in range(self.n_layers - 1, -1, -1): # layer index decreases from n_layers - 1 to 0
-            H1 = self.__decoder(H1, self.W1, self.C1, layer) # Eq. (9) for first modality (RNA)
-            H2 = self.__decoder(H2, self.W2, self.C2, layer) # Eq. (9) for second modality (ATAC)
-            if self.nonlinear and layer != 0:
-                H1 = F.elu(H1)
-                H2 = F.elu(H2)
+        if not self.linear_etm_decoder:
+            for layer in range(self.n_layers - 1, -1, -1): # layer index decreases from n_layers - 1 to 0
+                H1 = self.__decoder(H1, self.W1, self.C1, layer) # Eq. (9) for first modality (RNA)
+                H2 = self.__decoder(H2, self.W2, self.C2, layer) # Eq. (9) for second modality (ATAC)
+                if self.nonlinear and layer != 0:
+                    H1 = F.elu(H1)
+                    H2 = F.elu(H2)
+        else:
+            H = 0.5 * (H1 + H2)
+            H = F.softmax(H, dim=1)
+            H1 = self.__linear_etm_decoder(H, self.alpha, self.rho_rna)
+            H2 = self.__linear_etm_decoder(H, self.alpha, self.rho_atac)
 
         if not self.skip_gp_attention:
             H = torch.cat([H1.transpose(0, 1), H2.transpose(0, 1)], dim=0)
@@ -260,6 +274,11 @@ class MGATE(nn.Module):
             return H # Eq. (10)
 
         return torch.sparse.mm(C[layer - 1], H)
+
+    def __linear_etm_decoder(self, H, alpha, rho):
+        x = torch.matmul(H, alpha)
+        x = torch.matmul(x, rho)
+        return x
 
     def graph_attention_layer(self, A, M, v0, v1):
         A = A.coalesce()
