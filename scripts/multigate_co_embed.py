@@ -2083,7 +2083,15 @@ def main():
     assert gp_scores.index.equals(source_rna.obs_names)
     assert gp_scores.columns.equals(source_rna.var_names)
 
-    source_rna.layers['gp_scores'] = gp_scores.values.astype(source_rna.X.dtype)
+    from scipy.sparse import csr_matrix
+    source_rna.layers['fusion_scores'] = \
+        csr_matrix(gp_scores.values.astype(source_rna.X.dtype)).multiply(
+        source_rna.X
+    )
+
+    source_fusion = source_rna.copy()
+    source_fusion.X = source_fusion.layers['fusion_scores'].copy()
+    del source_rna.layers['fusion_scores']
 
     ## LIANA+ inflow analysis
     liana_results = liana_spatial_analysis(
