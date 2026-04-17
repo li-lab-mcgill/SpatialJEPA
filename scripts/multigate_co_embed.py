@@ -107,7 +107,9 @@ from mlflow.tracking import MlflowClient
 import numpy as np
 import pandas as pd
 import scanpy as sc
+import scipy.sparse as sp
 import torch
+from joblib import Parallel, delayed
 
 import MultiGATE
 from MultiGATE.model_MultiGATE import MGATE
@@ -1849,29 +1851,6 @@ def main():
         _log_mlflow_figure(fig, "source_vs_target_gene_program_scores_per_cluster.svg")
         plt.show()
 
-    #%% cellphoneDB analysis
-    import squidpy as sq
-
-    source_rna.var["gene_symbol_upper"] = source_rna.var_names.str.upper()
-
-    res = sq.gr.ligrec(
-        source_rna,
-        n_perms=1000,
-        threshold=0.005, # default 0.01
-        cluster_key="RNA_clusters",
-        copy=True,
-        use_raw=False,
-        gene_symbols="gene_symbol_upper",
-        transmitter_params={"categories": "ligand"},
-        receiver_params={"categories": "receptor"},
-        n_jobs=1,
-        show_progress_bar=False,
-        numba_parallel=False,
-    )
-
-    sq.pl.ligrec(res, alpha=0.05)
-    plt.show()
-
     #%% LIANA+ inflow analysis
     import liana as li
     import plotnine as p9
@@ -2038,6 +2017,75 @@ def main():
             "factor_scores": factor_scores
         }
 
+    ## map ATAC peaks to genes
+    gpnet = source_atac.uns['gene_peak_Net'].copy()
+    gpmap = gpnet.groupby("Gene", sort=True)["Peak"].unique()
+    missing_genes = set(source_rna.var_names) - set(gpmap.index)
+    gene_names = pd.Index(gpmap.index).intersection(source_rna.var_names, sort=False)
+
+    gp_distances = pd.pivot(gpnet, index='Gene', columns='Peak', values='Distance').fillna(np.inf)
+    for gene in missing_genes:
+        gp_distances.loc[gene] = np.inf
+    gp_distances = gp_distances.loc[source_rna.var_names, source_atac.var_names]
+    gp_weights = 1 / (gp_distances + 1)
+
+    gp_pairs = gpmap.loc[gene_names].explode().reset_index().rename(columns={"index": "Gene"})
+    peak_indexer = source_atac.var_names.get_indexer(gp_pairs["Peak"])
+    missing_peak_mask = peak_indexer < 0
+    if missing_peak_mask.any():
+        missing_peaks = gp_pairs.loc[missing_peak_mask, "Peak"].unique()
+        raise KeyError(
+            "gene_peak_Net contains peaks not present in source_atac.var_names: "
+            f"{missing_peaks[:10].tolist()}"
+        )
+
+    gene_indexer = gene_names.get_indexer(gp_pairs["Gene"])
+    weight_row_indexer = source_rna.var_names.get_indexer(gp_pairs["Gene"])
+    edge_weights = gp_weights.to_numpy()[weight_row_indexer, peak_indexer].astype(
+        np.float32,
+        copy=False,
+    )
+
+    peak_to_gene = sp.coo_matrix(
+        (edge_weights, (peak_indexer, gene_indexer)),
+        shape=(source_atac.n_vars, gene_names.size),
+    ).tocsc()
+
+    atac_matrix = source_atac.X.tocsr() if sp.issparse(source_atac.X) else np.asarray(source_atac.X)
+    n_jobs = min(os.cpu_count() or 1, gene_names.size)
+    chunk_size = max(1, (gene_names.size + n_jobs - 1) // n_jobs)
+    chunk_bounds = [
+        (start, min(start + chunk_size, gene_names.size))
+        for start in range(0, gene_names.size, chunk_size)
+    ]
+
+    def _score_gene_chunk(start: int, stop: int) -> np.ndarray:
+        peak_to_gene_chunk = peak_to_gene[:, start:stop]
+        if sp.issparse(atac_matrix):
+            chunk_scores = atac_matrix @ peak_to_gene_chunk
+            return chunk_scores.toarray()
+        return np.asarray(atac_matrix @ peak_to_gene_chunk.toarray())
+
+    gp_score_chunks = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(_score_gene_chunk)(start, stop) for start, stop in chunk_bounds
+    )
+    gp_scores = pd.DataFrame(
+        np.concatenate(gp_score_chunks, axis=1),
+        index=source_rna.obs_names,
+        columns=gene_names,
+    )
+
+    for missing_gene in missing_genes:
+        gp_scores[missing_gene] = np.nan
+
+    gp_scores = gp_scores.loc[:, source_rna.var_names]
+
+    assert gp_scores.index.equals(source_rna.obs_names)
+    assert gp_scores.columns.equals(source_rna.var_names)
+
+    source_rna.layers['gp_scores'] = gp_scores.values.astype(source_rna.X.dtype)
+
+    ## LIANA+ inflow analysis
     liana_results = liana_spatial_analysis(
         source_rna,
         labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
@@ -2454,7 +2502,6 @@ def main():
     
     #%% attention matrix analysis
     from post_hoc_utils import run_gene_peak_attention_tutorial
-    import scipy.sparse as sp
 
     # Find the artifact path for the attention matrix
     with tempfile.TemporaryDirectory() as tmp_dir:
