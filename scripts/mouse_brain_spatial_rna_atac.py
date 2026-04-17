@@ -389,11 +389,11 @@ def parse_args(notebook: bool = False):
         help="If set, swap source and target.",
     )
     parser.add_argument(
-        "--no-combined-gp-dict",
+        "--combined-gp-dict",
         action="store_true",
         default=False,
         help=(
-            "If set, skip loading the NicheCompass combined_gp_dict from BAKLAVA data_utils "
+            "If set, do loading the NicheCompass combined_gp_dict from BAKLAVA data_utils "
             "(gene_programs/ CSVs under DATAPATH). Use when files are missing or to save startup time."
         ),
     )
@@ -2008,7 +2008,7 @@ def load_and_prepare_data_bundle(args):
     require_runtime_bootstrap()
 
     combined_gp_dict = None
-    if not getattr(args, "no_combined_gp_dict", False):
+    if getattr(args, "combined_gp_dict", True):
         combined_gp_dict = load_nichecompass_combined_gp_dict_mouse(verbose=True)
 
     source_rna = sc.read_h5ad(os.path.join(BASE_PATH, "source_rna_aligned.h5ad"))
