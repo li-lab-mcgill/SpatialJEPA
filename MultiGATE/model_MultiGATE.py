@@ -50,7 +50,7 @@ class MGATE(nn.Module):
         weight_decay=0.0001,
         vgp_anchor_mode="spot",
         skip_gp_attention=True,
-        linear_etm_decoder=False,
+        linear_etm_decoder=True,
     ):
         super(MGATE, self).__init__()
         self.n_layers = len(hidden_dims1) - 1
@@ -142,6 +142,10 @@ class MGATE(nn.Module):
         nn.init.xavier_uniform_(self.vgp1)
         nn.init.xavier_uniform_(self.W_i)
         nn.init.xavier_uniform_(self.W_t)
+
+        nn.init.xavier_uniform_(self.alpha)
+        nn.init.xavier_uniform_(self.rho_rna)
+        nn.init.xavier_uniform_(self.rho_atac)
 
     def forward(self, A, prune_A, GP, X1, X2):
         del prune_A
@@ -278,6 +282,7 @@ class MGATE(nn.Module):
     def __linear_etm_decoder(self, H, alpha, rho):
         x = torch.matmul(H, alpha)
         x = torch.matmul(x, rho)
+        x = F.elu(x)
         return x
 
     def graph_attention_layer(self, A, M, v0, v1):
