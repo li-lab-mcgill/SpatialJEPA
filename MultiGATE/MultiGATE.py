@@ -24,6 +24,10 @@ class MultiGATE(object):
         random_seed=2020,
         config=None,
         skip_gp_attention=True,
+        linear_etm_decoder=True,
+        etm_emb_dim=None,
+        rho_rna_mask=None,
+        rho_atac_mask=None,
     ):
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
@@ -51,6 +55,10 @@ class MultiGATE(object):
             nonlinear=nonlinear,
             vgp_anchor_mode=vgp_anchor_mode,
             skip_gp_attention=skip_gp_attention,
+            linear_etm_decoder=linear_etm_decoder,
+            etm_emb_dim=etm_emb_dim,
+            rho_rna_mask=rho_rna_mask,
+            rho_atac_mask=rho_atac_mask,
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.mgate.parameters(), lr=self.lr, weight_decay=weight_decay)
 

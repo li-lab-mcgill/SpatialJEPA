@@ -783,6 +783,33 @@ def hidden_dims_from_state_dict(state_dict, w_prefix):
     return dims
 
 
+def linear_decoder_kwargs_from_state_dict(state_dict):
+    kwargs = {}
+    alpha = state_dict.get("alpha")
+    if alpha is not None:
+        kwargs["etm_emb_dim"] = int(alpha.shape[1])
+
+    rho_is_fixed_tensor = state_dict.get("rho_is_fixed_mask")
+    rho_is_fixed = bool(int(torch.as_tensor(rho_is_fixed_tensor).item())) if rho_is_fixed_tensor is not None else False
+    if rho_is_fixed and ("rho_rna" in state_dict) and ("rho_atac" in state_dict):
+        kwargs["rho_rna_mask"] = state_dict["rho_rna"].detach().cpu().numpy()
+        kwargs["rho_atac_mask"] = state_dict["rho_atac"].detach().cpu().numpy()
+    return kwargs
+
+
+def linear_decoder_kwargs_from_mgate(mgate):
+    kwargs = {}
+    if hasattr(mgate, "alpha"):
+        kwargs["etm_emb_dim"] = int(mgate.alpha.shape[1])
+    rho_is_fixed = False
+    if hasattr(mgate, "rho_is_fixed_mask"):
+        rho_is_fixed = bool(int(mgate.rho_is_fixed_mask.detach().cpu().item()))
+    if rho_is_fixed:
+        kwargs["rho_rna_mask"] = mgate.rho_rna.detach().cpu().numpy()
+        kwargs["rho_atac_mask"] = mgate.rho_atac.detach().cpu().numpy()
+    return kwargs
+
+
 def mgate_from_state_dict(state_dict, device):
     """
     Infer the MGATE architecture entirely from a state dict, instantiate
@@ -809,6 +836,7 @@ def mgate_from_state_dict(state_dict, device):
         temp=temp,
         nonlinear=True,
         vgp_anchor_mode=vgp_anchor_mode,
+        **linear_decoder_kwargs_from_state_dict(state_dict),
     ).to(device)
     mgate.load_state_dict(state_dict, strict=False)
     mgate.eval()
@@ -844,6 +872,7 @@ def build_zero_shot_mgate(source_mgate, target_spot_num, vgp_anchor_mode, device
         temp=float(source_mgate.logit_scale.detach().cpu().item()),
         nonlinear=source_mgate.nonlinear,
         vgp_anchor_mode=vgp_anchor_mode,
+        **linear_decoder_kwargs_from_mgate(source_mgate),
     ).to(device)
 
     if vgp_anchor_mode == "feature":

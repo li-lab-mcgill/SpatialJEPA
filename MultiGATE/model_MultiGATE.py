@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,6 +53,9 @@ class MGATE(nn.Module):
         vgp_anchor_mode="spot",
         skip_gp_attention=True,
         linear_etm_decoder=True,
+        etm_emb_dim: Optional[int]=None,
+        rho_rna_mask: Optional[torch.Tensor]=None,
+        rho_atac_mask: Optional[torch.Tensor]=None,
     ):
         super(MGATE, self).__init__()
         self.n_layers = len(hidden_dims1) - 1
@@ -108,11 +113,60 @@ class MGATE(nn.Module):
         self.logit_scale = nn.Parameter(torch.tensor(float(temp), dtype=torch.float32))
 
         self.linear_etm_decoder = linear_etm_decoder
+        self.etm_emb_dim = None
+        self.register_buffer("rho_is_fixed_mask", torch.tensor(0, dtype=torch.uint8), persistent=True)
         if linear_etm_decoder:
-            etm_emb_dim = 20
-            self.alpha      = nn.Parameter(torch.empty(emb_dim1, etm_emb_dim))
-            self.rho_rna    = nn.Parameter(torch.empty(etm_emb_dim, hidden_dims1[0]))
-            self.rho_atac   = nn.Parameter(torch.empty(etm_emb_dim, hidden_dims2[0]))
+            if (rho_rna_mask is None) ^ (rho_atac_mask is None):
+                raise ValueError(
+                    "Both rho_rna_mask and rho_atac_mask must be provided together."
+                )
+
+            if rho_rna_mask is not None:
+                rho_rna_tensor = torch.as_tensor(rho_rna_mask, dtype=torch.float32)
+                rho_atac_tensor = torch.as_tensor(rho_atac_mask, dtype=torch.float32)
+
+                if rho_rna_tensor.ndim != 2 or rho_atac_tensor.ndim != 2:
+                    raise ValueError("rho masks must be rank-2 tensors of shape (n_pathways, n_features).")
+                if rho_rna_tensor.shape[1] != hidden_dims1[0]:
+                    raise ValueError(
+                        "rho_rna_mask has {} genes but model expects {} features.".format(
+                            rho_rna_tensor.shape[1],
+                            hidden_dims1[0],
+                        )
+                    )
+                if rho_atac_tensor.shape[1] != hidden_dims2[0]:
+                    raise ValueError(
+                        "rho_atac_mask has {} peaks but model expects {} features.".format(
+                            rho_atac_tensor.shape[1],
+                            hidden_dims2[0],
+                        )
+                    )
+                if rho_rna_tensor.shape[0] != rho_atac_tensor.shape[0]:
+                    raise ValueError(
+                        "rho mask pathway dimensions differ: RNA {} vs ATAC {}.".format(
+                            rho_rna_tensor.shape[0],
+                            rho_atac_tensor.shape[0],
+                        )
+                    )
+
+                inferred_etm_emb_dim = int(rho_rna_tensor.shape[0])
+                if etm_emb_dim is not None and int(etm_emb_dim) != inferred_etm_emb_dim:
+                    raise ValueError(
+                        "Provided etm_emb_dim={} does not match mask pathway count={}.".format(
+                            int(etm_emb_dim),
+                            inferred_etm_emb_dim,
+                        )
+                    )
+                self.etm_emb_dim = inferred_etm_emb_dim
+                self.alpha = nn.Parameter(torch.empty(emb_dim1, self.etm_emb_dim))
+                self.register_buffer("rho_rna", rho_rna_tensor.clone().detach(), persistent=True)
+                self.register_buffer("rho_atac", rho_atac_tensor.clone().detach(), persistent=True)
+                self.rho_is_fixed_mask.fill_(1)
+            else:
+                self.etm_emb_dim = int(etm_emb_dim) if etm_emb_dim is not None else 20
+                self.alpha = nn.Parameter(torch.empty(emb_dim1, self.etm_emb_dim))
+                self.rho_rna = nn.Parameter(torch.empty(self.etm_emb_dim, hidden_dims1[0]))
+                self.rho_atac = nn.Parameter(torch.empty(self.etm_emb_dim, hidden_dims2[0]))
 
         self.bn_rna = nn.LayerNorm(emb_dim1)
         self.bn_atac = nn.LayerNorm(emb_dim2)
@@ -143,9 +197,12 @@ class MGATE(nn.Module):
         nn.init.xavier_uniform_(self.W_i)
         nn.init.xavier_uniform_(self.W_t)
 
-        nn.init.xavier_uniform_(self.alpha)
-        nn.init.xavier_uniform_(self.rho_rna)
-        nn.init.xavier_uniform_(self.rho_atac)
+        if self.linear_etm_decoder:
+            nn.init.xavier_uniform_(self.alpha)
+            if isinstance(self.rho_rna, nn.Parameter):
+                nn.init.xavier_uniform_(self.rho_rna)
+            if isinstance(self.rho_atac, nn.Parameter):
+                nn.init.xavier_uniform_(self.rho_atac)
 
     def forward(self, A, prune_A, GP, X1, X2):
         del prune_A

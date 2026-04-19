@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pprint import pprint
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Python 3.7 compatibility for muon/mudata (they use typing.Literal in newer versions)
 if sys.version_info < (3, 8):
@@ -197,7 +197,7 @@ class DataBundle:
     source: DomainSplitBundle
     target: DomainSplitBundle
     split_metadata: Dict[str, Any] = field(default_factory=dict)
-    # NicheCompass prior gene programs (OmniPath, NicheNet, MEBOCOST, CollecTRI); optional until wired into MGATE.
+    # Optional NicheCompass prior pathways used to build fixed rho pathway masks.
     combined_gp_dict: Optional[Dict[str, Any]] = None
 
 
@@ -244,6 +244,17 @@ class GraphBundle:
                 self.target,
             )
         )
+
+
+@dataclass
+class PathwayDecoderMaskBundle:
+    pathway_names: np.ndarray
+    source_pathway_names: np.ndarray
+    target_pathway_names: np.ndarray
+    rho_rna_mask: np.ndarray
+    rho_atac_mask: np.ndarray
+    n_zero_source_pathways: int = 0
+    n_zero_target_pathways: int = 0
 
 
 @dataclass
@@ -505,6 +516,144 @@ def build_graph_inputs(adata_vars1, adata_vars2, bp_width=450, graph_type="ATAC"
     return graph_tf, gp_graph_tf, x1, x2
 
 
+def _extract_gp_gene_list(gp_entry: Any, key: str) -> List[str]:
+    if not isinstance(gp_entry, dict):
+        return []
+    genes = gp_entry.get(key, [])
+    if isinstance(genes, np.ndarray):
+        genes = genes.tolist()
+    if genes is None:
+        genes = []
+    return [str(gene).upper() for gene in genes if gene is not None and str(gene)]
+
+
+def build_pathway_decoder_masks_from_gp_dict(
+    combined_gp_dict: Dict[str, Any],
+    gene_names: pd.Index,
+    peak_names: pd.Index,
+    gene_peak_net: pd.DataFrame,
+) -> PathwayDecoderMaskBundle:
+    if not isinstance(combined_gp_dict, dict) or len(combined_gp_dict) == 0:
+        raise ValueError("combined_gp_dict must be a non-empty dictionary to build pathway decoder masks.")
+    if gene_peak_net is None:
+        raise ValueError("gene_peak_Net is required to map pathway genes to peaks.")
+    if not {"Gene", "Peak"}.issubset(set(gene_peak_net.columns)):
+        raise ValueError("gene_peak_Net must contain columns {'Gene', 'Peak'}.")
+
+    gene_names = pd.Index(gene_names).astype(str)
+    peak_names = pd.Index(peak_names).astype(str)
+
+    gene_to_idx = {gene.upper(): idx for idx, gene in enumerate(gene_names)}
+    peak_to_idx = {peak: idx for idx, peak in enumerate(peak_names)}
+
+    gp_links = gene_peak_net.loc[:, ["Gene", "Peak"]].copy()
+    gp_links["Gene"] = gp_links["Gene"].astype(str).str.upper()
+    gp_links["Peak"] = gp_links["Peak"].astype(str)
+    gp_links = gp_links[gp_links["Peak"].isin(peak_to_idx)].drop_duplicates(["Gene", "Peak"])
+
+    gene_to_peak_indices: Dict[str, List[int]] = {}
+    for gene, gene_df in gp_links.groupby("Gene", sort=False):
+        gene_to_peak_indices[gene] = [peak_to_idx[peak] for peak in gene_df["Peak"].tolist()]
+
+    n_genes = len(gene_names)
+    n_peaks = len(peak_names)
+    source_pathway_names: List[str] = []
+    target_pathway_names: List[str] = []
+    source_rna_masks: List[np.ndarray] = []
+    source_atac_masks: List[np.ndarray] = []
+    target_rna_masks: List[np.ndarray] = []
+    target_atac_masks: List[np.ndarray] = []
+    n_zero_source = 0
+    n_zero_target = 0
+
+    def _build_feature_rows(pathway_genes: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+        rna_row = np.zeros(n_genes, dtype=np.float32)
+        atac_row = np.zeros(n_peaks, dtype=np.float32)
+        for gene in pathway_genes:
+            gene_idx = gene_to_idx.get(gene)
+            if gene_idx is not None:
+                rna_row[gene_idx] = 1.0
+            for peak_idx in gene_to_peak_indices.get(gene, []):
+                atac_row[peak_idx] = 1.0
+        return rna_row, atac_row
+
+    for gp_name, gp_entry in combined_gp_dict.items():
+        gp_name_str = str(gp_name)
+        source_genes = _extract_gp_gene_list(gp_entry, "sources")
+        target_genes = _extract_gp_gene_list(gp_entry, "targets")
+
+        source_rna_row, source_atac_row = _build_feature_rows(source_genes)
+        target_rna_row, target_atac_row = _build_feature_rows(target_genes)
+
+        source_pathway_names.append("{}__source".format(gp_name_str))
+        target_pathway_names.append("{}__target".format(gp_name_str))
+        source_rna_masks.append(source_rna_row)
+        source_atac_masks.append(source_atac_row)
+        target_rna_masks.append(target_rna_row)
+        target_atac_masks.append(target_atac_row)
+
+        if (source_rna_row.sum() + source_atac_row.sum()) == 0:
+            n_zero_source += 1
+        if (target_rna_row.sum() + target_atac_row.sum()) == 0:
+            n_zero_target += 1
+
+    source_rna_mask = np.stack(source_rna_masks, axis=0)
+    source_atac_mask = np.stack(source_atac_masks, axis=0)
+    target_rna_mask = np.stack(target_rna_masks, axis=0)
+    target_atac_mask = np.stack(target_atac_masks, axis=0)
+
+    rho_rna_mask = np.concatenate([source_rna_mask, target_rna_mask], axis=0).astype(np.float32, copy=False)
+    rho_atac_mask = np.concatenate([source_atac_mask, target_atac_mask], axis=0).astype(np.float32, copy=False)
+    pathway_names = np.asarray(source_pathway_names + target_pathway_names, dtype=object)
+
+    if float(rho_rna_mask.sum() + rho_atac_mask.sum()) == 0:
+        raise ValueError(
+            "Constructed pathway decoder masks are entirely zero after feature alignment. "
+            "Check that combined_gp_dict genes overlap current RNA features and gene_peak_Net."
+        )
+
+    return PathwayDecoderMaskBundle(
+        pathway_names=pathway_names,
+        source_pathway_names=np.asarray(source_pathway_names, dtype=object),
+        target_pathway_names=np.asarray(target_pathway_names, dtype=object),
+        rho_rna_mask=rho_rna_mask,
+        rho_atac_mask=rho_atac_mask,
+        n_zero_source_pathways=int(n_zero_source),
+        n_zero_target_pathways=int(n_zero_target),
+    )
+
+
+def maybe_build_pathway_decoder_masks(data_bundle: DataBundle, graph_bundle: GraphBundle) -> Optional[PathwayDecoderMaskBundle]:
+    if data_bundle.combined_gp_dict is None:
+        return None
+    source_rna = data_bundle.source.rna
+    gene_peak_net = source_rna.uns.get("gene_peak_Net")
+    if gene_peak_net is None:
+        raise ValueError(
+            "combined_gp_dict was provided but source gene_peak_Net is missing. "
+            "Cannot build pathway-by-peak rho masks."
+        )
+
+    mask_bundle = build_pathway_decoder_masks_from_gp_dict(
+        combined_gp_dict=data_bundle.combined_gp_dict,
+        gene_names=graph_bundle.source.x1.columns,
+        peak_names=graph_bundle.source.x2.columns,
+        gene_peak_net=gene_peak_net,
+    )
+    print(
+        "[GP Masks] Built {} source + {} target pathways ({} total). "
+        "Zero-overlap rows: source={}, target={}. Using fixed rho masks and dense alpha."
+        .format(
+            len(mask_bundle.source_pathway_names),
+            len(mask_bundle.target_pathway_names),
+            len(mask_bundle.pathway_names),
+            mask_bundle.n_zero_source_pathways,
+            mask_bundle.n_zero_target_pathways,
+        )
+    )
+    return mask_bundle
+
+
 def set_multigate_embeddings(adata1, adata2, embeddings_rna, embeddings_atac, key_added="MultiGATE"):
     adata1.obsm[key_added] = embeddings_rna
     adata2.obsm[key_added] = embeddings_atac
@@ -578,6 +727,23 @@ def build_source_student_graph_tf(source_rna, spatial_graph_type, knn_neighbors=
     )
 
 
+def _extract_linear_decoder_kwargs_from_mgate(mgate) -> Dict[str, Any]:
+    if not getattr(mgate, "linear_etm_decoder", False):
+        return {}
+
+    kwargs: Dict[str, Any] = {}
+    if hasattr(mgate, "alpha"):
+        kwargs["etm_emb_dim"] = int(mgate.alpha.shape[1])
+
+    rho_is_fixed = False
+    if hasattr(mgate, "rho_is_fixed_mask"):
+        rho_is_fixed = bool(int(mgate.rho_is_fixed_mask.detach().cpu().item()))
+    if rho_is_fixed:
+        kwargs["rho_rna_mask"] = mgate.rho_rna.detach().cpu().numpy()
+        kwargs["rho_atac_mask"] = mgate.rho_atac.detach().cpu().numpy()
+    return kwargs
+
+
 def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_anchor_mode=None):
     # Rebuild MGATE with target N and load transferable weights.
     # If vgp_anchor_mode == "feature": transfer trained vgp directly.
@@ -599,6 +765,7 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_anchor_m
         random_seed=0,
         config={"device": str(source_trainer.device)},
         skip_gp_attention=source_trainer.mgate.skip_gp_attention,
+        **_extract_linear_decoder_kwargs_from_mgate(source_trainer.mgate),
     )
 
     if vgp_anchor_mode == "feature":
@@ -615,6 +782,15 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_anchor_m
         with torch.no_grad():
             target_trainer.mgate.vgp0.zero_()
             target_trainer.mgate.vgp1.zero_()
+
+    for attr_name in ("pathway_names", "source_pathway_names", "target_pathway_names"):
+        if hasattr(source_trainer.mgate, attr_name):
+            attr_value = getattr(source_trainer.mgate, attr_name)
+            setattr(
+                target_trainer.mgate,
+                attr_name,
+                attr_value.copy() if hasattr(attr_value, "copy") else attr_value,
+            )
 
     return target_trainer
 
@@ -1498,6 +1674,20 @@ def hidden_dims_from_state_dict(state_dict, w_prefix):
     return dims
 
 
+def _extract_linear_decoder_kwargs_from_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
+    alpha = state_dict.get("alpha")
+    if alpha is not None:
+        kwargs["etm_emb_dim"] = int(alpha.shape[1])
+
+    rho_is_fixed_tensor = state_dict.get("rho_is_fixed_mask")
+    rho_is_fixed = bool(int(torch.as_tensor(rho_is_fixed_tensor).item())) if rho_is_fixed_tensor is not None else False
+    if rho_is_fixed and ("rho_rna" in state_dict) and ("rho_atac" in state_dict):
+        kwargs["rho_rna_mask"] = state_dict["rho_rna"].detach().cpu().numpy()
+        kwargs["rho_atac_mask"] = state_dict["rho_atac"].detach().cpu().numpy()
+    return kwargs
+
+
 def build_stage1_trainer_from_state_dict(
     state_dict,
     spot_num,
@@ -1539,6 +1729,7 @@ def build_stage1_trainer_from_state_dict(
         weight_decay=weight_decay,
         verbose=False,
         random_seed=random_seed,
+        **_extract_linear_decoder_kwargs_from_state_dict(state_dict),
     )
     trainer.mgate.load_state_dict(state_dict, strict=False)
     trainer.mgate.eval()
@@ -1600,7 +1791,16 @@ def run_stage2_distillation(
         verbose=False,
         random_seed=2021,
         config={"device": str(source_trainer.device)},
+        **_extract_linear_decoder_kwargs_from_mgate(source_trainer.mgate),
     )
+    for attr_name in ("pathway_names", "source_pathway_names", "target_pathway_names"):
+        if hasattr(source_trainer.mgate, attr_name):
+            attr_value = getattr(source_trainer.mgate, attr_name)
+            setattr(
+                student_trainer.mgate,
+                attr_name,
+                attr_value.copy() if hasattr(attr_value, "copy") else attr_value,
+            )
 
     target_train_a_t, target_train_prune_t, target_train_gp_t, target_train_x1_t, target_train_x2_t = student_trainer._prepare_inputs(
         target_train_graph_tf,
@@ -2033,7 +2233,7 @@ def load_and_prepare_data_bundle(args):
 
     combined_gp_dict = None
     if getattr(args, "combined_gp_dict", True):
-        combined_gp_dict = load_nichecompass_combined_gp_dict_mouse(verbose=True)
+        combined_gp_dict = load_nichecompass_combined_gp_dict_mouse(verbose=True, load_from_disk=True)
 
     source_rna = sc.read_h5ad(os.path.join(BASE_PATH, "source_rna_aligned.h5ad"))
     source_atac = sc.read_h5ad(os.path.join(BASE_PATH, "source_atac_aligned.h5ad"))
@@ -2187,7 +2387,16 @@ def build_graph_bundle(data_bundle, bp_width=400, graph_type="ATAC", protein_val
     )
 
 
-def create_multigate_trainer(graph_inputs, hidden_dims, n_epochs, vgp_anchor_mode, random_seed, skip_gp_attention=True, device=None):
+def create_multigate_trainer(
+    graph_inputs,
+    hidden_dims,
+    n_epochs,
+    vgp_anchor_mode,
+    random_seed,
+    skip_gp_attention=True,
+    device=None,
+    pathway_decoder_masks: Optional[PathwayDecoderMaskBundle]=None,
+):
     trainer_kwargs = {
         "hidden_dims1": [graph_inputs.x1.shape[1]] + hidden_dims,
         "hidden_dims2": [graph_inputs.x2.shape[1]] + hidden_dims,
@@ -2203,13 +2412,26 @@ def create_multigate_trainer(graph_inputs, hidden_dims, n_epochs, vgp_anchor_mod
         "random_seed": random_seed,
         "skip_gp_attention": skip_gp_attention,
     }
+    if pathway_decoder_masks is not None:
+        trainer_kwargs["etm_emb_dim"] = int(pathway_decoder_masks.rho_rna_mask.shape[0])
+        trainer_kwargs["rho_rna_mask"] = pathway_decoder_masks.rho_rna_mask
+        trainer_kwargs["rho_atac_mask"] = pathway_decoder_masks.rho_atac_mask
     if device is not None:
         trainer_kwargs["config"] = {"device": str(device)}
-    return MultiGATETrainer(**trainer_kwargs)
+    trainer = MultiGATETrainer(**trainer_kwargs)
+    if pathway_decoder_masks is not None:
+        trainer.mgate.pathway_names = pathway_decoder_masks.pathway_names.copy()
+        trainer.mgate.source_pathway_names = pathway_decoder_masks.source_pathway_names.copy()
+        trainer.mgate.target_pathway_names = pathway_decoder_masks.target_pathway_names.copy()
+    return trainer
 
 
 def initialize_stage1_trainers_for_training(data_bundle, graph_bundle, cache_config, num_epochs):
     hidden_dims = [512, 30]
+    pathway_decoder_masks = maybe_build_pathway_decoder_masks(
+        data_bundle=data_bundle,
+        graph_bundle=graph_bundle,
+    )
     teacher_trainer = create_multigate_trainer(
         graph_bundle.source,
         hidden_dims=hidden_dims,
@@ -2217,6 +2439,7 @@ def initialize_stage1_trainers_for_training(data_bundle, graph_bundle, cache_con
         vgp_anchor_mode=cache_config.vgp_anchor_mode,
         random_seed=2020,
         skip_gp_attention=True,
+        pathway_decoder_masks=pathway_decoder_masks,
     )
     source_inputs_tensors = teacher_trainer._prepare_inputs(
         graph_bundle.source.graph_tf,
@@ -2243,6 +2466,7 @@ def initialize_stage1_trainers_for_training(data_bundle, graph_bundle, cache_con
             vgp_anchor_mode=cache_config.vgp_anchor_mode,
             random_seed=2021,
             device=teacher_trainer.device,
+            pathway_decoder_masks=pathway_decoder_masks,
         )
         source_student_inputs_tensors = student_trainer._prepare_inputs(
             source_student_graph_tf,
@@ -2258,6 +2482,7 @@ def initialize_stage1_trainers_for_training(data_bundle, graph_bundle, cache_con
             vgp_anchor_mode=cache_config.vgp_anchor_mode,
             random_seed=2022,
             device=teacher_trainer.device,
+            pathway_decoder_masks=pathway_decoder_masks,
         )
 
     primary_trainer = student_trainer if cache_config.dual_source_kd else teacher_trainer
