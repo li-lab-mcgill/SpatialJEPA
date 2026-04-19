@@ -279,6 +279,15 @@ def parse_args(notebook: bool = False):
         help="Random seed used to generate deterministic 70/20/10 train/val/test splits for both domains.",
     )
     parser.add_argument(
+        "--source-split-train-eval",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, use source train/eval split subsets (train vs val+test). "
+            "By default, source train/eval both use the full source dataset while target remains split."
+        ),
+    )
+    parser.add_argument(
         "--stage1-epochs",
         type=int,
         default=500,
@@ -805,6 +814,21 @@ def build_domain_split_bundle(rna, atac, label_key, split_seed, domain_name):
         split_obs_names=split_obs_names,
         split_seed=split_seed,
     )
+
+
+def configure_source_train_eval_bundle(source_split_bundle, use_source_split_train_eval):
+    if use_source_split_train_eval:
+        return source_split_bundle
+
+    full_obs_names = np.asarray(source_split_bundle.full.rna.obs_names)
+    full_indices = np.arange(source_split_bundle.full.rna.n_obs)
+    source_split_bundle.train = source_split_bundle.full
+    source_split_bundle.eval = source_split_bundle.full
+    source_split_bundle.split_obs_names["train"] = full_obs_names
+    source_split_bundle.split_obs_names["eval"] = full_obs_names
+    source_split_bundle.split_indices["train"] = full_indices
+    source_split_bundle.split_indices["eval"] = full_indices
+    return source_split_bundle
 
 
 def build_split_metadata(source_split_bundle, target_split_bundle):
@@ -2093,26 +2117,26 @@ def load_and_prepare_data_bundle(args):
         domain_name="Target",
     )
 
-    split_metadata = build_split_metadata(source_split_bundle, target_split_bundle)
     data_bundle = DataBundle(
         source=source_split_bundle,
         target=target_split_bundle,
-        split_metadata=split_metadata,
+        split_metadata={},
         combined_gp_dict=combined_gp_dict,
     )
 
     if args.switcharoo:
-        swapped_metadata = split_metadata.copy()
-        swapped_metadata["domains"] = {
-            "source": split_metadata["domains"]["target"],
-            "target": split_metadata["domains"]["source"],
-        }
         data_bundle = DataBundle(
             source=data_bundle.target,
             target=data_bundle.source,
-            split_metadata=swapped_metadata,
+            split_metadata={},
             combined_gp_dict=combined_gp_dict,
         )
+
+    data_bundle.source = configure_source_train_eval_bundle(
+        data_bundle.source,
+        use_source_split_train_eval=bool(args.source_split_train_eval),
+    )
+    data_bundle.split_metadata = build_split_metadata(data_bundle.source, data_bundle.target)
 
     return data_bundle
 
@@ -2812,6 +2836,17 @@ def run_stage1_training_and_log(
 
 def summarize_stage1_setup(num_epochs, data_bundle, cache_config, trainer_bundle):
     print("Training epochs for stage 1:", num_epochs)
+    source_split_mode = "train/eval splits" if data_bundle.source.train.rna.n_obs != data_bundle.source.full.rna.n_obs else "full source train+eval"
+    print(
+        "Source mode: {} (train/val/test/eval/full = {}/{}/{}/{}/{})".format(
+            source_split_mode,
+            data_bundle.source.train.rna.n_obs,
+            data_bundle.source.val.rna.n_obs,
+            data_bundle.source.test.rna.n_obs,
+            data_bundle.source.eval.rna.n_obs,
+            data_bundle.source.full.rna.n_obs,
+        )
+    )
     print(
         "Target split sizes (train/val/test/eval): {}/{}/{}/{}".format(
             data_bundle.target.train.rna.n_obs,
