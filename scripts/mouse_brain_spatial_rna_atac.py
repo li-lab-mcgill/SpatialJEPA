@@ -122,6 +122,14 @@ def load_nichecompass_combined_gp_dict_mouse(
     )
     gene_orthologs_mapping_file_path = os.path.join(ga_data_folder_path, "human_mouse_gene_orthologs.csv")
 
+    combined_gp_dict_path = os.path.join(gp_data_folder_path, "combined_gp_dict_{}.pkl".format(species))
+    if load_from_disk and os.path.exists(combined_gp_dict_path):
+        with open(combined_gp_dict_path, "rb") as f:
+            combined = pickle.load(f)
+        if verbose:
+            print("Loaded NicheCompass combined_gp_dict from disk.")
+        return combined
+
     from data_utils import build_combined_gp_dict_mouse_brain
 
     combined = build_combined_gp_dict_mouse_brain(
@@ -136,7 +144,9 @@ def load_nichecompass_combined_gp_dict_mouse(
         verbose=verbose,
     )
     if verbose:
-        print("Loaded NicheCompass combined_gp_dict with {} gene programs.".format(len(combined)))
+        print("Built NicheCompass combined_gp_dict with {} gene programs and saved to disk.".format(len(combined)))
+    with open(combined_gp_dict_path, "wb") as f:
+        pickle.dump(combined, f)
     return combined
 
 
@@ -156,6 +166,7 @@ from sklearn.preprocessing import Normalizer
 from ignite.metrics import MaximumMeanDiscrepancy as MMD
 from tqdm import tqdm
 import tempfile
+import pickle
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -532,6 +543,7 @@ def build_pathway_decoder_masks_from_gp_dict(
     gene_names: pd.Index,
     peak_names: pd.Index,
     gene_peak_net: pd.DataFrame,
+    drop_zero_overlap_rows: bool = True,
 ) -> PathwayDecoderMaskBundle:
     if not isinstance(combined_gp_dict, dict) or len(combined_gp_dict) == 0:
         raise ValueError("combined_gp_dict must be a non-empty dictionary to build pathway decoder masks.")
@@ -585,16 +597,22 @@ def build_pathway_decoder_masks_from_gp_dict(
         source_rna_row, source_atac_row = _build_feature_rows(source_genes)
         target_rna_row, target_atac_row = _build_feature_rows(target_genes)
 
-        source_pathway_names.append("{}__source".format(gp_name_str))
-        target_pathway_names.append("{}__target".format(gp_name_str))
-        source_rna_masks.append(source_rna_row)
-        source_atac_masks.append(source_atac_row)
-        target_rna_masks.append(target_rna_row)
-        target_atac_masks.append(target_atac_row)
+        zero_source = (source_rna_row.sum() + source_atac_row.sum()) == 0
+        zero_target = (target_rna_row.sum() + target_atac_row.sum()) == 0
 
-        if (source_rna_row.sum() + source_atac_row.sum()) == 0:
+        if not drop_zero_overlap_rows or not zero_source:
+            source_rna_masks.append(source_rna_row)
+            source_atac_masks.append(source_atac_row)
+            source_pathway_names.append("{}__source".format(gp_name_str))
+
+        if not drop_zero_overlap_rows or not zero_target:
+            target_rna_masks.append(target_rna_row)
+            target_atac_masks.append(target_atac_row)
+            target_pathway_names.append("{}__target".format(gp_name_str))
+
+        if zero_source:
             n_zero_source += 1
-        if (target_rna_row.sum() + target_atac_row.sum()) == 0:
+        if zero_target:
             n_zero_target += 1
 
     source_rna_mask = np.stack(source_rna_masks, axis=0)
@@ -634,21 +652,24 @@ def maybe_build_pathway_decoder_masks(data_bundle: DataBundle, graph_bundle: Gra
             "Cannot build pathway-by-peak rho masks."
         )
 
+    drop_zero_overlap_rows = getattr(graph_bundle, "drop_zero_overlap_rows", True)
     mask_bundle = build_pathway_decoder_masks_from_gp_dict(
         combined_gp_dict=data_bundle.combined_gp_dict,
         gene_names=graph_bundle.source.x1.columns,
         peak_names=graph_bundle.source.x2.columns,
         gene_peak_net=gene_peak_net,
+        drop_zero_overlap_rows=drop_zero_overlap_rows,
     )
     print(
         "[GP Masks] Built {} source + {} target pathways ({} total). "
-        "Zero-overlap rows: source={}, target={}. Using fixed rho masks and dense alpha."
+        "Zero-overlap rows: source={}, target={}. Using fixed rho masks and dense alpha. {}."
         .format(
             len(mask_bundle.source_pathway_names),
             len(mask_bundle.target_pathway_names),
             len(mask_bundle.pathway_names),
             mask_bundle.n_zero_source_pathways,
             mask_bundle.n_zero_target_pathways,
+            'DROPPING' if drop_zero_overlap_rows else 'KEEPING',
         )
     )
     return mask_bundle

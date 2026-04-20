@@ -288,8 +288,8 @@ class MGATE(nn.Module):
         clip_loss = ((loss_rna + loss_atac) / 2.0).mean()
 
         # Reconstruction losses
-        features_loss1 = torch.sqrt(torch.sum(torch.pow(X1 - X1_, 2)))#.log()
-        features_loss2 = torch.sqrt(torch.sum(torch.pow(X2 - X2_, 2)))#.log()
+        features_loss1 = torch.sqrt(torch.sum(torch.pow(X1 - X1_, 2)))
+        features_loss2 = torch.sqrt(torch.sum(torch.pow(X2 - X2_, 2)))
 
         # decorrelation loss
         rna_decorr_loss = decorr_loss_correlation(RNA_e)
