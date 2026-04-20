@@ -299,12 +299,14 @@ class MGATE(nn.Module):
             H1 = self.__linear_etm_decoder(
                 H,
                 self.alpha,
-                self._effective_rho(self.rho_rna, getattr(self, "rho_rna_mask", None)),
+                self.rho_rna,
+                #self._effective_rho(self.rho_rna, getattr(self, "rho_rna_mask", None)),
             )
             H2 = self.__linear_etm_decoder(
                 H,
                 self.alpha,
-                self._effective_rho(self.rho_atac, getattr(self, "rho_atac_mask", None)),
+                self.rho_atac,
+                #self._effective_rho(self.rho_atac, getattr(self, "rho_atac_mask", None)),
             )
 
         if not self.skip_gp_attention:
