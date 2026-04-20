@@ -168,6 +168,7 @@ class MGATE(nn.Module):
                     )
                 self.etm_emb_dim = inferred_etm_emb_dim
                 self.alpha = nn.Parameter(torch.empty(emb_dim1, self.etm_emb_dim))
+                self.topic_var = nn.Parameter(torch.ones(self.etm_emb_dim))
                 self.rho_mask_mode = rho_mask_mode
                 if rho_mask_mode == "fixed":
                     self.register_buffer("rho_rna", rho_rna_tensor.clone().detach(), persistent=True)
@@ -189,6 +190,7 @@ class MGATE(nn.Module):
                 self.alpha = nn.Parameter(torch.empty(emb_dim1, self.etm_emb_dim))
                 self.rho_rna = nn.Parameter(torch.empty(self.etm_emb_dim, hidden_dims1[0]))
                 self.rho_atac = nn.Parameter(torch.empty(self.etm_emb_dim, hidden_dims2[0]))
+                self.topic_var = nn.Parameter(torch.ones(self.etm_emb_dim))
 
         self.bn_rna = nn.LayerNorm(emb_dim1)
         self.bn_atac = nn.LayerNorm(emb_dim2)
@@ -299,12 +301,14 @@ class MGATE(nn.Module):
             H1 = self.__linear_etm_decoder(
                 H,
                 self.alpha,
+                self.topic_var,
                 self.rho_rna,
                 #self._effective_rho(self.rho_rna, getattr(self, "rho_rna_mask", None)),
             )
             H2 = self.__linear_etm_decoder(
                 H,
                 self.alpha,
+                self.topic_var,
                 self.rho_atac,
                 #self._effective_rho(self.rho_atac, getattr(self, "rho_atac_mask", None)),
             )
@@ -387,9 +391,16 @@ class MGATE(nn.Module):
 
         return torch.sparse.mm(C[layer - 1], H)
 
-    def __linear_etm_decoder(self, H, alpha, rho):
+    def __linear_etm_decoder(self, H, alpha, topic_var, rho):
+        alpha = F.normalize(alpha, p=2, dim=1)
         x = torch.matmul(H, alpha)
+
+        topic_var = F.softplus(topic_var)
+        x = x * topic_var.unsqueeze(0)
+
+        x = F.normalize(x, p=2, dim=0)
         x = torch.matmul(x, rho)
+
         x = F.elu(x)
         return x
 

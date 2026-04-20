@@ -1757,37 +1757,6 @@ def main():
     beta_rna = alpha @ rho_rna
     beta_atac = alpha @ rho_atac
 
-    alpha_rho_rna_adata = sc.AnnData(
-        np.concatenate([rho_rna.T, alpha], axis=0),
-    )
-    alpha_rho_rna_adata.obs['gene_or_topic'] = np.concatenate([['gene'] * rho_rna.shape[1], ['topic'] * alpha.shape[0]])
-
-    sc.pp.pca(alpha_rho_rna_adata, n_comps=100)
-    sc.pp.neighbors(alpha_rho_rna_adata, use_rep='X_pca', n_neighbors=30)
-    #sc.external.pp.bbknn(alpha_rho_rna_adata, batch_key='gene_or_topic', neighbors_within_batch=30)
-    sc.tl.umap(alpha_rho_rna_adata, min_dist=0.3)
-
-    # 1. Extract coordinates and groups into a lightweight dataframe
-    df = pd.DataFrame(alpha_rho_rna_adata.obsm['X_umap'], columns=['UMAP1', 'UMAP2'])
-    df['Group'] = pd.Categorical(alpha_rho_rna_adata.obs['gene_or_topic'], ordered=True, categories=['topic', 'gene'])
-
-    # 2. Plot using seaborn
-    plt.figure(figsize=(8, 6))
-    sns.scatterplot(
-        data=df, 
-        x='UMAP1', 
-        y='UMAP2', 
-        hue='Group',   # Colors by group
-        style='Group', # Assigns different markers by group
-        s=list([10] * rho_rna.shape[1]) + list([50] * alpha.shape[0]),          # Marker size
-        edgecolor='none'
-    )
-
-    # 3. Move the legend outside the plot
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.show()
-
     ## topic-topic correlation
     topic_topic_corr = np.corrcoef(alpha)
     topic_topic_corr[np.eye(topic_topic_corr.shape[0]) == 1] = 0
@@ -1796,6 +1765,7 @@ def main():
     plt.tight_layout()
     plt.show()
 
+    ## topic norms
     topic_norm = np.linalg.norm(alpha, axis=1)
     beta_rna_norm = np.linalg.norm(beta_rna, axis=1)
     beta_atac_norm = np.linalg.norm(beta_atac, axis=1)
@@ -1806,6 +1776,66 @@ def main():
     ax[0].set_title("Topic norm")
     ax[1].set_title("Beta RNA norm")
     ax[2].set_title("Beta ATAC norm")
+    plt.tight_layout()
+    plt.show()
+
+    ## topic & feature co-embedding
+    alpha_norm = alpha / np.linalg.norm(alpha, axis=1, keepdims=True)
+    rho_rna_norm = rho_rna / np.linalg.norm(rho_rna, axis=1, keepdims=True)
+    rho_atac_norm = rho_atac / np.linalg.norm(rho_atac, axis=1, keepdims=True)
+
+    alpha_rho_rna_adata = sc.AnnData(
+        np.concatenate([rho_rna_norm.T, alpha_norm], axis=0),
+    )
+    alpha_rho_rna_adata.obs_names = np.concatenate([[f'gp_{gp}' for gp in range(rho_rna.shape[1])], [f'topic_{topic}' for topic in range(alpha.shape[0])]])
+    alpha_rho_rna_adata.obs['gene_or_topic'] = np.concatenate([['gene'] * rho_rna.shape[1], ['topic'] * alpha.shape[0]])
+    alpha_rho_rna_adata.obs['max_abs_beta'] = list(np.abs(beta_rna).argmax(0)) + list(np.arange(alpha.shape[0]))
+
+    from sklearn.metrics.pairwise import euclidean_distances
+    topic_gene_dists = euclidean_distances(
+        alpha_rho_rna_adata.obsm['X_pca'],
+    )[:rho_rna.shape[1], -alpha.shape[0]:].argmin(axis=1)
+    alpha_rho_rna_adata.obs['topic_gene_dist'] = list(topic_gene_dists) + list(np.arange(alpha.shape[0]))
+
+    sc.pp.pca(alpha_rho_rna_adata, n_comps=100)
+    sc.pp.neighbors(alpha_rho_rna_adata, use_rep='X_pca', n_neighbors=30)
+    #sc.external.pp.bbknn(alpha_rho_rna_adata, batch_key='gene_or_topic', neighbors_within_batch=30)
+    sc.tl.umap(alpha_rho_rna_adata, min_dist=0.3)
+
+    # 1. Extract coordinates and groups into a lightweight dataframe
+    df = pd.DataFrame(alpha_rho_rna_adata.obsm['X_umap'], columns=['UMAP1', 'UMAP2'], index=alpha_rho_rna_adata.obs_names)
+    df = df.join(alpha_rho_rna_adata.obs[['gene_or_topic', 'max_abs_beta']])
+
+    # 2. Plot using seaborn, adding labels for topics
+    plt.figure(figsize=(8, 6))
+    scatter = sns.scatterplot(
+        data=df, 
+        x='UMAP1', 
+        y='UMAP2', 
+        hue='gene_or_topic',   # Colors by group
+        style='gene_or_topic', # Assigns different markers by group
+        palette='Set2',
+        s=list([5] * rho_rna.shape[1]) + list([60] * alpha.shape[0]),  # Marker size
+        edgecolor='none'
+    )
+
+    # Add text labels for topics
+    topic_indices = df[df['gene_or_topic'] == 'topic'].index
+    topic_labels = [f'topic_{i}' for i in range(alpha.shape[0])]
+    for idx, label in zip(topic_indices, topic_labels):
+        plt.annotate(
+            label,
+            (df.loc[idx, 'UMAP1'], df.loc[idx, 'UMAP2']),
+            textcoords="offset points",
+            xytext=(0,5),
+            ha='center',
+            fontsize=8,
+            color='black',
+            alpha=0.8
+        )
+
+    # 3. Move the legend outside the plot
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
     plt.show()
 
