@@ -222,18 +222,28 @@ class MGATE(nn.Module):
         if self.linear_etm_decoder:
             nn.init.xavier_uniform_(self.alpha)
             if isinstance(self.rho_rna, nn.Parameter):
-                nn.init.xavier_uniform_(self.rho_rna)
                 if self.rho_mask_mode == "trainable_masked":
-                    self.rho_rna.data.mul_(self.rho_rna_mask)
+                    self._masked_xavier_uniform_(self.rho_rna, self.rho_rna_mask)
+                else:
+                    nn.init.xavier_uniform_(self.rho_rna)
             if isinstance(self.rho_atac, nn.Parameter):
-                nn.init.xavier_uniform_(self.rho_atac)
                 if self.rho_mask_mode == "trainable_masked":
-                    self.rho_atac.data.mul_(self.rho_atac_mask)
+                    self._masked_xavier_uniform_(self.rho_atac, self.rho_atac_mask)
+                else:
+                    nn.init.xavier_uniform_(self.rho_atac)
 
     def _effective_rho(self, rho, rho_mask=None):
         if rho_mask is None:
             return rho
         return rho * rho_mask
+
+    def _masked_xavier_uniform_(self, tensor, mask):
+        with torch.no_grad():
+            fan_in = mask.sum(1).float().mean().clamp_min(1.0)
+            fan_out = mask.sum(0).float().mean().clamp_min(1.0)
+            bound = torch.sqrt(6.0 / (fan_in + fan_out))   # gain = 1
+            tensor.data.uniform_(-bound, bound)
+            tensor.data.mul_(mask)
 
     def forward(self, A, prune_A, GP, X1, X2):
         del prune_A
