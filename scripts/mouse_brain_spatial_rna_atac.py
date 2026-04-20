@@ -163,6 +163,7 @@ import torch
 import torch.nn.functional as F
 from anndata import AnnData
 from sklearn.preprocessing import Normalizer
+from sklearn.metrics.pairwise import cosine_similarity
 from ignite.metrics import MaximumMeanDiscrepancy as MMD
 from tqdm import tqdm
 import tempfile
@@ -2822,6 +2823,14 @@ def run_stage1_training_and_log(
         source_embeddings = None
 
         for epoch in tqdm(range(1, num_epochs + 1), desc="Stage 1 training", unit="epoch"):
+
+            mask_sim_rna = cosine_similarity(trainer.mgate.rho_rna_mask.detach().cpu().numpy(), trainer.mgate.rho_rna.detach().cpu().numpy())
+            mask_sim_atac = cosine_similarity(trainer.mgate.rho_atac_mask.detach().cpu().numpy(), trainer.mgate.rho_atac.detach().cpu().numpy())
+            mask_sim_score_rna = np.abs(np.diag(mask_sim_rna)).mean()
+            mask_sim_score_atac = np.abs(np.diag(mask_sim_atac)).mean()
+            mlflow.log_metric("source_train_mask_sim_score_rna", mask_sim_score_rna, step=epoch-1)
+            mlflow.log_metric("source_train_mask_sim_score_atac", mask_sim_score_atac, step=epoch-1)
+
             trainer.mgate.train()
             teacher_loss = trainer.run_epoch(epoch, source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t)
             mlflow.log_metric("source_train_loss", float(teacher_loss), step=epoch)
@@ -2829,7 +2838,7 @@ def run_stage1_training_and_log(
             mlflow.log_metric("source_train_loss_atac", float(trainer.loss_list_atac[-1]), step=epoch)
             mlflow.log_metric("source_train_loss_rna", float(trainer.loss_list_rna[-1]), step=epoch)
             mlflow.log_metric("source_train_loss_clip", float(trainer.loss_list_clip[-1]), step=epoch)
-            mlflow.log_metric("source_train_loss_decorr", float(trainer.loss_list_deco[-1]), step=epoch)
+            
 
             if cache_config.dual_source_kd:
                 trainer.mgate.eval()
