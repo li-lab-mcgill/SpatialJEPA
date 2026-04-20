@@ -1228,11 +1228,12 @@ def main():
     #%% ── MLflow setup ────────────────────────────────────────────────────────
     #bash /home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/scripts/start_mlflow_services.sh all
 
-    #args.run_name = '20260402_153455'
+    #args.run_name = '20260420_102406' #'20260402_153455'
     #args.stage2_run_name = '20260402_153455_stage2_20260402_165006'
     #sqlite_tracking_uri = "sqlite:////home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db"
     #postgres_tracking_uri = "http://127.0.0.1:5000"
     #args.tracking_uri = postgres_tracking_uri
+    ## args.target_model = "zero_shot" # for zero-shot co-embedding if stage2 model is not available
 
     #lsof /home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db
     #curl -i http://127.0.0.1:5000
@@ -1742,6 +1743,71 @@ def main():
         plt.tight_layout(); plt.show()
         sc.pl.umap(target_concat_adata, color=['modality', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
+
+
+    #%% analysis of linear decoder
+    assert teacher_source_mgate.linear_etm_decoder
+
+    alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
+    rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
+    rho_atac = teacher_source_mgate.rho_atac.detach().cpu().numpy()
+    rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
+    rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
+
+    beta_rna = alpha @ rho_rna
+    beta_atac = alpha @ rho_atac
+
+    alpha_rho_rna_adata = sc.AnnData(
+        np.concatenate([rho_rna.T, alpha], axis=0),
+    )
+    alpha_rho_rna_adata.obs['gene_or_topic'] = np.concatenate([['gene'] * rho_rna.shape[1], ['topic'] * alpha.shape[0]])
+
+    sc.pp.pca(alpha_rho_rna_adata, n_comps=100)
+    sc.pp.neighbors(alpha_rho_rna_adata, use_rep='X_pca', n_neighbors=30)
+    #sc.external.pp.bbknn(alpha_rho_rna_adata, batch_key='gene_or_topic', neighbors_within_batch=30)
+    sc.tl.umap(alpha_rho_rna_adata, min_dist=0.3)
+
+    # 1. Extract coordinates and groups into a lightweight dataframe
+    df = pd.DataFrame(alpha_rho_rna_adata.obsm['X_umap'], columns=['UMAP1', 'UMAP2'])
+    df['Group'] = pd.Categorical(alpha_rho_rna_adata.obs['gene_or_topic'], ordered=True, categories=['topic', 'gene'])
+
+    # 2. Plot using seaborn
+    plt.figure(figsize=(8, 6))
+    sns.scatterplot(
+        data=df, 
+        x='UMAP1', 
+        y='UMAP2', 
+        hue='Group',   # Colors by group
+        style='Group', # Assigns different markers by group
+        s=list([10] * rho_rna.shape[1]) + list([50] * alpha.shape[0]),          # Marker size
+        edgecolor='none'
+    )
+
+    # 3. Move the legend outside the plot
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.show()
+
+    ## topic-topic correlation
+    topic_topic_corr = np.corrcoef(alpha)
+    topic_topic_corr[np.eye(topic_topic_corr.shape[0]) == 1] = 0
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(topic_topic_corr, cmap='viridis')
+    plt.tight_layout()
+    plt.show()
+
+    topic_norm = np.linalg.norm(alpha, axis=1)
+    beta_rna_norm = np.linalg.norm(beta_rna, axis=1)
+    beta_atac_norm = np.linalg.norm(beta_atac, axis=1)
+    fig, ax = plt.subplots(3, 1, figsize=(6, 8))
+    ax[0].bar(np.arange(alpha.shape[0]), topic_norm)
+    ax[1].bar(np.arange(beta_rna.shape[0]), beta_rna_norm)
+    ax[2].bar(np.arange(beta_atac.shape[0]), beta_atac_norm)
+    ax[0].set_title("Topic norm")
+    ax[1].set_title("Beta RNA norm")
+    ax[2].set_title("Beta ATAC norm")
+    plt.tight_layout()
+    plt.show()
 
     #%% staircase heatmap for gene-program p-values
 
