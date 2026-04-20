@@ -4,6 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+RHO_MASK_MODE_NONE = 0
+RHO_MASK_MODE_FIXED = 1
+RHO_MASK_MODE_TRAINABLE_MASKED = 2
+
 def _load_legacy_tf_mgate():
     from .model_MultiGATE_legacy_tf import MGATE as legacy_cls
 
@@ -56,6 +60,7 @@ class MGATE(nn.Module):
         etm_emb_dim: Optional[int]=None,
         rho_rna_mask: Optional[torch.Tensor]=None,
         rho_atac_mask: Optional[torch.Tensor]=None,
+        rho_mask_mode: str="trainable_masked",
     ):
         super(MGATE, self).__init__()
         self.n_layers = len(hidden_dims1) - 1
@@ -114,8 +119,12 @@ class MGATE(nn.Module):
 
         self.linear_etm_decoder = linear_etm_decoder
         self.etm_emb_dim = None
+        self.rho_mask_mode = "none"
         self.register_buffer("rho_is_fixed_mask", torch.tensor(0, dtype=torch.uint8), persistent=True)
+        self.register_buffer("rho_mask_mode_code", torch.tensor(RHO_MASK_MODE_NONE, dtype=torch.uint8), persistent=True)
         if linear_etm_decoder:
+            if rho_mask_mode not in {"fixed", "trainable_masked"}:
+                raise ValueError("rho_mask_mode must be one of {'fixed', 'trainable_masked'}.")
             if (rho_rna_mask is None) ^ (rho_atac_mask is None):
                 raise ValueError(
                     "Both rho_rna_mask and rho_atac_mask must be provided together."
@@ -159,10 +168,23 @@ class MGATE(nn.Module):
                     )
                 self.etm_emb_dim = inferred_etm_emb_dim
                 self.alpha = nn.Parameter(torch.empty(emb_dim1, self.etm_emb_dim))
-                self.register_buffer("rho_rna", rho_rna_tensor.clone().detach(), persistent=True)
-                self.register_buffer("rho_atac", rho_atac_tensor.clone().detach(), persistent=True)
-                self.rho_is_fixed_mask.fill_(1)
+                self.rho_mask_mode = rho_mask_mode
+                if rho_mask_mode == "fixed":
+                    self.register_buffer("rho_rna", rho_rna_tensor.clone().detach(), persistent=True)
+                    self.register_buffer("rho_atac", rho_atac_tensor.clone().detach(), persistent=True)
+                    self.rho_is_fixed_mask.fill_(1)
+                    self.rho_mask_mode_code.fill_(RHO_MASK_MODE_FIXED)
+                else:
+                    self.rho_rna = nn.Parameter(torch.empty_like(rho_rna_tensor))
+                    self.rho_atac = nn.Parameter(torch.empty_like(rho_atac_tensor))
+                    self.register_buffer("rho_rna_mask", rho_rna_tensor.clone().detach(), persistent=True)
+                    self.register_buffer("rho_atac_mask", rho_atac_tensor.clone().detach(), persistent=True)
+                    self.rho_mask_mode_code.fill_(RHO_MASK_MODE_TRAINABLE_MASKED)
             else:
+                if rho_mask_mode != "fixed":
+                    raise ValueError(
+                        "rho_mask_mode='trainable_masked' requires both rho_rna_mask and rho_atac_mask."
+                    )
                 self.etm_emb_dim = int(etm_emb_dim) if etm_emb_dim is not None else 20
                 self.alpha = nn.Parameter(torch.empty(emb_dim1, self.etm_emb_dim))
                 self.rho_rna = nn.Parameter(torch.empty(self.etm_emb_dim, hidden_dims1[0]))
@@ -201,8 +223,17 @@ class MGATE(nn.Module):
             nn.init.xavier_uniform_(self.alpha)
             if isinstance(self.rho_rna, nn.Parameter):
                 nn.init.xavier_uniform_(self.rho_rna)
+                if self.rho_mask_mode == "trainable_masked":
+                    self.rho_rna.data.mul_(self.rho_rna_mask)
             if isinstance(self.rho_atac, nn.Parameter):
                 nn.init.xavier_uniform_(self.rho_atac)
+                if self.rho_mask_mode == "trainable_masked":
+                    self.rho_atac.data.mul_(self.rho_atac_mask)
+
+    def _effective_rho(self, rho, rho_mask=None):
+        if rho_mask is None:
+            return rho
+        return rho * rho_mask
 
     def forward(self, A, prune_A, GP, X1, X2):
         del prune_A
@@ -255,8 +286,16 @@ class MGATE(nn.Module):
         else:
             H = 0.5 * (H1 + H2)
             H = F.softmax(H, dim=1)
-            H1 = self.__linear_etm_decoder(H, self.alpha, self.rho_rna)
-            H2 = self.__linear_etm_decoder(H, self.alpha, self.rho_atac)
+            H1 = self.__linear_etm_decoder(
+                H,
+                self.alpha,
+                self._effective_rho(self.rho_rna, getattr(self, "rho_rna_mask", None)),
+            )
+            H2 = self.__linear_etm_decoder(
+                H,
+                self.alpha,
+                self._effective_rho(self.rho_atac, getattr(self, "rho_atac_mask", None)),
+            )
 
         if not self.skip_gp_attention:
             H = torch.cat([H1.transpose(0, 1), H2.transpose(0, 1)], dim=0)

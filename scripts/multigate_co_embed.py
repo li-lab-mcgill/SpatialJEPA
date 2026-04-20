@@ -783,30 +783,77 @@ def hidden_dims_from_state_dict(state_dict, w_prefix):
     return dims
 
 
+def rho_mask_mode_from_state_dict(state_dict):
+    rho_mask_mode_tensor = state_dict.get("rho_mask_mode_code")
+    if rho_mask_mode_tensor is not None:
+        code = int(torch.as_tensor(rho_mask_mode_tensor).item())
+        if code == 1:
+            return "fixed"
+        if code == 2:
+            return "trainable_masked"
+
+    rho_is_fixed_tensor = state_dict.get("rho_is_fixed_mask")
+    rho_is_fixed = bool(int(torch.as_tensor(rho_is_fixed_tensor).item())) if rho_is_fixed_tensor is not None else False
+    if rho_is_fixed:
+        return "fixed"
+    return None
+
+
 def linear_decoder_kwargs_from_state_dict(state_dict):
     kwargs = {}
     alpha = state_dict.get("alpha")
     if alpha is not None:
         kwargs["etm_emb_dim"] = int(alpha.shape[1])
 
-    rho_is_fixed_tensor = state_dict.get("rho_is_fixed_mask")
-    rho_is_fixed = bool(int(torch.as_tensor(rho_is_fixed_tensor).item())) if rho_is_fixed_tensor is not None else False
-    if rho_is_fixed and ("rho_rna" in state_dict) and ("rho_atac" in state_dict):
+    rho_mask_mode = rho_mask_mode_from_state_dict(state_dict)
+    if rho_mask_mode == "fixed" and ("rho_rna" in state_dict) and ("rho_atac" in state_dict):
+        kwargs["rho_mask_mode"] = "fixed"
         kwargs["rho_rna_mask"] = state_dict["rho_rna"].detach().cpu().numpy()
         kwargs["rho_atac_mask"] = state_dict["rho_atac"].detach().cpu().numpy()
+    elif (
+        rho_mask_mode == "trainable_masked"
+        and ("rho_rna_mask" in state_dict)
+        and ("rho_atac_mask" in state_dict)
+    ):
+        kwargs["rho_mask_mode"] = "trainable_masked"
+        kwargs["rho_rna_mask"] = state_dict["rho_rna_mask"].detach().cpu().numpy()
+        kwargs["rho_atac_mask"] = state_dict["rho_atac_mask"].detach().cpu().numpy()
     return kwargs
+
+
+def rho_mask_mode_from_mgate(mgate):
+    rho_mask_mode_code = getattr(mgate, "rho_mask_mode_code", None)
+    if rho_mask_mode_code is not None:
+        code = int(rho_mask_mode_code.detach().cpu().item())
+        if code == 1:
+            return "fixed"
+        if code == 2:
+            return "trainable_masked"
+
+    rho_mask_mode = getattr(mgate, "rho_mask_mode", None)
+    if rho_mask_mode in {"fixed", "trainable_masked"}:
+        return rho_mask_mode
+
+    if hasattr(mgate, "rho_is_fixed_mask"):
+        rho_is_fixed = bool(int(mgate.rho_is_fixed_mask.detach().cpu().item()))
+        if rho_is_fixed:
+            return "fixed"
+    return None
 
 
 def linear_decoder_kwargs_from_mgate(mgate):
     kwargs = {}
     if hasattr(mgate, "alpha"):
         kwargs["etm_emb_dim"] = int(mgate.alpha.shape[1])
-    rho_is_fixed = False
-    if hasattr(mgate, "rho_is_fixed_mask"):
-        rho_is_fixed = bool(int(mgate.rho_is_fixed_mask.detach().cpu().item()))
-    if rho_is_fixed:
+    rho_mask_mode = rho_mask_mode_from_mgate(mgate)
+    if rho_mask_mode == "fixed":
+        kwargs["rho_mask_mode"] = "fixed"
         kwargs["rho_rna_mask"] = mgate.rho_rna.detach().cpu().numpy()
         kwargs["rho_atac_mask"] = mgate.rho_atac.detach().cpu().numpy()
+    elif rho_mask_mode == "trainable_masked":
+        kwargs["rho_mask_mode"] = "trainable_masked"
+        kwargs["rho_rna_mask"] = mgate.rho_rna_mask.detach().cpu().numpy()
+        kwargs["rho_atac_mask"] = mgate.rho_atac_mask.detach().cpu().numpy()
     return kwargs
 
 

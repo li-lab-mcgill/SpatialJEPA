@@ -28,6 +28,7 @@ class MultiGATE(object):
         etm_emb_dim=None,
         rho_rna_mask=None,
         rho_atac_mask=None,
+        rho_mask_mode="trainable_masked",
     ):
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
@@ -59,6 +60,7 @@ class MultiGATE(object):
             etm_emb_dim=etm_emb_dim,
             rho_rna_mask=rho_rna_mask,
             rho_atac_mask=rho_atac_mask,
+            rho_mask_mode=rho_mask_mode,
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.mgate.parameters(), lr=self.lr, weight_decay=weight_decay)
 
