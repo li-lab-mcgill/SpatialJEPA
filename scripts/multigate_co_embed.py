@@ -1780,18 +1780,30 @@ def main():
 
     assert teacher_source_mgate.linear_etm_decoder
 
+    ## extract decoder parameters
     alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
     rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
     rho_atac = teacher_source_mgate.rho_atac.detach().cpu().numpy()
     rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
     rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
+
+    # alpha = F.normalize(alpha, dim=1)
+    # rho_rna = F.normalize(rho_rna, dim=1)
+    # rho_atac = F.normalize(rho_atac, dim=1)
+    # topic_var = teacher_source_mgate.topic_var.detach().cpu().numpy()
+
     beta_rna = alpha @ rho_rna
     beta_atac = alpha @ rho_atac
 
-    source_delta = softmax(source_rna_emb, axis=1)
-    source_delta_df = pd.DataFrame(source_delta, index=source_rna.obs_names)
+    ## derive theta from delta embeddings
+    source_theta = softmax(np.concatenate([source_rna_emb, source_atac_emb], axis=0), axis=1)
+    source_theta_df = pd.DataFrame(source_theta, index=np.concatenate([source_rna.obs_names, source_atac.obs_names]))
 
-    source_clust_by_topic_delta = (
+    target_theta = softmax(np.concatenate([target_rna_emb, target_atac_emb], axis=0), axis=1)
+    target_theta_df = pd.DataFrame(target_theta, index=np.concatenate([target_rna.obs_names, target_atac.obs_names]))
+
+    ## cluster delta by leiden clusters, then apply softmax to get theta
+    source_clust_by_topic_theta = (
         pd.DataFrame(source_rna_emb, index=source_rna.obs_names)
         .assign(RNA_leiden=source_concat_adata.obs.loc[
             source_concat_adata.obs['modality'].eq('rna'),
@@ -1801,23 +1813,69 @@ def main():
         .mean()
         .apply(softmax, axis=1, result_type='expand')
     )
+
+    target_clust_by_topic_theta = (
+        pd.DataFrame(target_rna_emb, index=target_rna.obs_names)
+        .assign(RNA_leiden=target_concat_adata.obs.loc[
+            target_concat_adata.obs['modality'].eq('rna'),
+            'leiden'
+            ].values)
+        .groupby('RNA_leiden')
+        .mean()
+        .apply(softmax, axis=1, result_type='expand')
+    )
     
-    topk = 3
+    ## get top topics for each cluster and plot staircase heatmap
+    topk = 5
+    fig, axs = plt.subplots(1, 2, figsize=(10, 10))
+
     topk_topics = []
-    topics = source_clust_by_topic_delta.columns.values
-    clusters = source_clust_by_topic_delta.max(1).sort_values(ascending=False).index
+    topics = source_clust_by_topic_theta.columns.values
+    clusters = source_clust_by_topic_theta.max(1).sort_values(ascending=False).index
     for cluster in clusters:
-        topk_topics_cluster = source_clust_by_topic_delta.loc[cluster].nlargest(topk).index
+        topk_topics_cluster = source_clust_by_topic_theta.loc[cluster].nlargest(topk).index
         topk_topics_cluster = topk_topics_cluster[topk_topics_cluster.isin(topics)]
         topics = topics[~np.isin(topics, topk_topics_cluster)]
         topk_topics.append(topk_topics_cluster)
+    source_topk_topics = np.concatenate(topk_topics + [pd.Index(topics)]) # could also just keep topk_topics
+    source_clust_by_topic_theta = source_clust_by_topic_theta.loc[clusters, source_topk_topics]
+    sns.heatmap(source_clust_by_topic_theta.T, cmap='viridis', ax=axs[0])
 
-    topk_topics = np.concatenate(topk_topics)
-    source_clust_by_topic_delta = source_clust_by_topic_delta.loc[clusters, topk_topics]
-    sns.heatmap(source_clust_by_topic_delta.T, cmap='viridis')
+    topk_topics = []
+    topics = target_clust_by_topic_theta.columns.values
+    clusters = target_clust_by_topic_theta.max(1).sort_values(ascending=False).index
+    for cluster in clusters:
+        topk_topics_cluster = target_clust_by_topic_theta.loc[cluster].nlargest(topk).index
+        topk_topics_cluster = topk_topics_cluster[topk_topics_cluster.isin(topics)]
+        topics = topics[~np.isin(topics, topk_topics_cluster)]
+        topk_topics.append(topk_topics_cluster)
+    target_topk_topics = np.concatenate(topk_topics + [pd.Index(topics)])
+    target_clust_by_topic_theta = target_clust_by_topic_theta.loc[clusters, target_topk_topics]
+    sns.heatmap(target_clust_by_topic_theta.T, cmap='viridis', ax=axs[1])
+    plt.tight_layout(); plt.show()
 
-    top_active_cluster = '4' #clusters[0]
-    top_active_topics = source_clust_by_topic_delta.loc[top_active_cluster].nlargest(topk).index
+    ## add alpha embeddings to source and target data
+    source_alpha_embs = source_theta @ alpha
+    target_alpha_embs = target_theta @ alpha
+    source_target_adata.obsm['alpha_embs'] = np.concatenate([source_alpha_embs, target_alpha_embs], axis=0)
+
+    ## compute mean distance between source and target for each cluster
+    source_adata = source_target_adata[source_target_adata.obs['source_or_target'].eq('source')]
+    target_adata = source_target_adata[source_target_adata.obs['source_or_target'].eq('target')]
+    mean_dists = pd.DataFrame(index=source_adata.obs['leiden'].cat.categories, columns=['multigate', 'alpha'])
+    for cluster in source_adata.obs['leiden'].cat.categories:
+        source_dat = source_adata[source_adata.obs['leiden'].eq(cluster)]
+        target_dat = target_adata[target_adata.obs['leiden'].eq(cluster)]
+        mean_dists.loc[cluster, 'multigate'] = np.mean(euclidean_distances(source_dat.X, target_dat.X)) # could replace with wasserstein distance
+        mean_dists.loc[cluster, 'alpha'] = np.mean(euclidean_distances(source_dat.obsm['alpha_embs'], target_dat.obsm['alpha_embs']))
+    mean_dists = mean_dists.sort_values(by='multigate', ascending=True)
+    mean_dists.loc['all', 'multigate'] = np.mean(euclidean_distances(source_adata.X, target_adata.X))
+    mean_dists.loc['all', 'alpha'] = np.mean(euclidean_distances(source_adata.obsm['alpha_embs'], target_adata.obsm['alpha_embs']))
+    print(mean_dists)
+
+    ## get top active topics and perform GSEA
+    top_active_cluster = mean_dists.index[0] #'5'
+    top_active_topics = source_clust_by_topic_theta.loc[top_active_cluster].nlargest(topk).index
     top_active_gsea = topic_betas_hallmark_gsea_mouse(
         beta_rna=beta_rna,
         gene_names=np.asarray(source_rna.var_names).astype(str),
@@ -1836,13 +1894,13 @@ def main():
     # Categorical.map(dict) looks up category values with their native dtype; string
     # keys in lut won't match int categories and yield NaN floats mixed with RGB
     # tuples, which breaks pandas' Index reconstruction (TypeError).
-    cluster_key = source_delta_df.obs['RNA_clusters'].astype(str)
+    cluster_key = source_theta_df.obs['RNA_clusters'].astype(str)
     unique_clusters = cluster_key.unique()
     network_pal = sns.husl_palette(len(unique_clusters), s=0.45)
     lut = dict(zip(unique_clusters, network_pal))
     row_colors = cluster_key.map(lut)
 
-    cg = sns.clustermap(source_delta_df, cmap='viridis', row_colors=row_colors)
+    cg = sns.clustermap(source_theta_df, cmap='viridis', row_colors=row_colors)
     cg.ax_heatmap.set_yticklabels([])
 
     alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
