@@ -269,6 +269,62 @@ class PathwayDecoderMaskBundle:
     n_zero_target_pathways: int = 0
 
 
+def _normalize_pathway_name_list(values):
+    if values is None:
+        return []
+    return [str(v) for v in values]
+
+
+def _extract_pathway_metadata_from_mgate(mgate):
+    has_any = any(
+        hasattr(mgate, attr_name)
+        for attr_name in (
+            "pathway_names",
+            "source_pathway_names",
+            "target_pathway_names",
+            "n_zero_source_pathways",
+            "n_zero_target_pathways",
+        )
+    )
+    if not has_any:
+        return None
+    return {
+        "pathway_names": _normalize_pathway_name_list(getattr(mgate, "pathway_names", [])),
+        "source_pathway_names": _normalize_pathway_name_list(getattr(mgate, "source_pathway_names", [])),
+        "target_pathway_names": _normalize_pathway_name_list(getattr(mgate, "target_pathway_names", [])),
+        "n_zero_source_pathways": int(getattr(mgate, "n_zero_source_pathways", 0)),
+        "n_zero_target_pathways": int(getattr(mgate, "n_zero_target_pathways", 0)),
+    }
+
+
+def _build_mgate_checkpoint_payload(mgate):
+    return {
+        "model_state_dict": mgate.state_dict(),
+        "pathway_metadata": _extract_pathway_metadata_from_mgate(mgate),
+    }
+
+
+def _unpack_mgate_checkpoint_payload(payload):
+    if isinstance(payload, dict) and "model_state_dict" in payload:
+        return payload["model_state_dict"], payload.get("pathway_metadata")
+    return payload, None
+
+
+def _apply_pathway_metadata_to_mgate(mgate, pathway_metadata):
+    if pathway_metadata is None:
+        return
+    for attr_name in ("pathway_names", "source_pathway_names", "target_pathway_names"):
+        values = pathway_metadata.get(attr_name)
+        if values is None:
+            continue
+        setattr(mgate, attr_name, np.asarray(values, dtype=object))
+    for attr_name in ("n_zero_source_pathways", "n_zero_target_pathways"):
+        value = pathway_metadata.get(attr_name)
+        if value is None:
+            continue
+        setattr(mgate, attr_name, int(value))
+
+
 @dataclass
 class Stage1CacheConfig:
     use_cache: bool
@@ -828,7 +884,13 @@ def build_zero_shot_target_trainer(source_trainer, target_spot_num, vgp_anchor_m
             target_trainer.mgate.vgp0.zero_()
             target_trainer.mgate.vgp1.zero_()
 
-    for attr_name in ("pathway_names", "source_pathway_names", "target_pathway_names"):
+    for attr_name in (
+        "pathway_names",
+        "source_pathway_names",
+        "target_pathway_names",
+        "n_zero_source_pathways",
+        "n_zero_target_pathways",
+    ):
         if hasattr(source_trainer.mgate, attr_name):
             attr_value = getattr(source_trainer.mgate, attr_name)
             setattr(
@@ -1862,7 +1924,13 @@ def run_stage2_distillation(
         config={"device": str(source_trainer.device)},
         **_extract_linear_decoder_kwargs_from_mgate(source_trainer.mgate),
     )
-    for attr_name in ("pathway_names", "source_pathway_names", "target_pathway_names"):
+    for attr_name in (
+        "pathway_names",
+        "source_pathway_names",
+        "target_pathway_names",
+        "n_zero_source_pathways",
+        "n_zero_target_pathways",
+    ):
         if hasattr(source_trainer.mgate, attr_name):
             attr_value = getattr(source_trainer.mgate, attr_name)
             setattr(
@@ -2047,11 +2115,16 @@ def run_stage2_distillation(
 
 
 def log_torch_state_dict_artifacts(tmpdir, state_dicts):
-    for artifact_name, state_dict in state_dicts.items():
-        if state_dict is None:
+    for artifact_name, payload in state_dicts.items():
+        if payload is None:
             continue
         local_path = os.path.join(tmpdir, artifact_name)
-        torch.save(state_dict, local_path)
+        state_dict, pathway_metadata = _unpack_mgate_checkpoint_payload(payload)
+        checkpoint_payload = {
+            "model_state_dict": state_dict,
+            "pathway_metadata": pathway_metadata,
+        }
+        torch.save(checkpoint_payload, local_path)
         mlflow.log_artifact(local_path, artifact_path="models")
 
 
@@ -2103,7 +2176,7 @@ def log_stage2_artifacts_for_run(
             log_torch_state_dict_artifacts(
                 tmpdir,
                 {
-                    "model_stage2.pth": stage2_trainer.mgate.state_dict(),
+                    "model_stage2.pth": _build_mgate_checkpoint_payload(stage2_trainer.mgate),
                 },
             )
             if not stage2_trainer.mgate.skip_gp_attention:
@@ -2494,6 +2567,8 @@ def create_multigate_trainer(
         trainer.mgate.pathway_names = pathway_decoder_masks.pathway_names.copy()
         trainer.mgate.source_pathway_names = pathway_decoder_masks.source_pathway_names.copy()
         trainer.mgate.target_pathway_names = pathway_decoder_masks.target_pathway_names.copy()
+        trainer.mgate.n_zero_source_pathways = int(pathway_decoder_masks.n_zero_source_pathways)
+        trainer.mgate.n_zero_target_pathways = int(pathway_decoder_masks.n_zero_target_pathways)
     return trainer
 
 
@@ -2589,7 +2664,8 @@ def load_cached_stage1_primary_trainer(data_bundle, graph_bundle, cache_config, 
             "model_stage1.pth",
             tmpdir,
         )
-        stage1_state_dict = torch.load(local_stage1_path, map_location="cpu", weights_only=False)
+        stage1_payload = torch.load(local_stage1_path, map_location="cpu", weights_only=False)
+        stage1_state_dict, stage1_pathway_metadata = _unpack_mgate_checkpoint_payload(stage1_payload)
 
     stage1_primary_trainer, hidden_dims1_loaded, hidden_dims2_loaded, inferred_vgp_anchor_mode = build_stage1_trainer_from_state_dict(
         stage1_state_dict,
@@ -2618,6 +2694,7 @@ def load_cached_stage1_primary_trainer(data_bundle, graph_bundle, cache_config, 
         stage1_primary_trainer.mgate.skip_gp_attention = (
             str(cache_config.run_params["skip_gp_attention"]).lower() == "true"
         )
+    _apply_pathway_metadata_to_mgate(stage1_primary_trainer.mgate, stage1_pathway_metadata)
     primary_model_name = cache_config.run_params.get(
         "stage1_primary_model",
         "student" if cache_config.dual_source_kd else "teacher",
@@ -3108,10 +3185,22 @@ def run_stage1_training_and_log(
             log_torch_state_dict_artifacts(
                 tmpdir,
                 {
-                    "model_stage1.pth": trainer_bundle.primary.mgate.state_dict(),
-                    "model_stage1_teacher.pth": trainer.mgate.state_dict() if cache_config.dual_source_kd else None,
-                    "model_stage1_student.pth": student_trainer.mgate.state_dict() if cache_config.dual_source_kd else None,
-                    "model_stage1_nonspatial.pth": nonspatial_trainer.mgate.state_dict() if nonspatial_trainer is not None else None,
+                    "model_stage1.pth": _build_mgate_checkpoint_payload(trainer_bundle.primary.mgate),
+                    "model_stage1_teacher.pth": (
+                        _build_mgate_checkpoint_payload(trainer.mgate)
+                        if cache_config.dual_source_kd
+                        else None
+                    ),
+                    "model_stage1_student.pth": (
+                        _build_mgate_checkpoint_payload(student_trainer.mgate)
+                        if cache_config.dual_source_kd
+                        else None
+                    ),
+                    "model_stage1_nonspatial.pth": (
+                        _build_mgate_checkpoint_payload(nonspatial_trainer.mgate)
+                        if nonspatial_trainer is not None
+                        else None
+                    ),
                 },
             )
 

@@ -890,11 +890,34 @@ def mgate_from_state_dict(state_dict, device):
     return mgate, hidden_dims1, hidden_dims2, vgp_anchor_mode
 
 
+def unpack_mgate_checkpoint_payload(payload):
+    if isinstance(payload, dict) and "model_state_dict" in payload:
+        return payload["model_state_dict"], payload.get("pathway_metadata")
+    return payload, None
+
+
+def apply_pathway_metadata_to_mgate(mgate, pathway_metadata):
+    if pathway_metadata is None:
+        return
+    for attr_name in ("pathway_names", "source_pathway_names", "target_pathway_names"):
+        values = pathway_metadata.get(attr_name)
+        if values is None:
+            continue
+        setattr(mgate, attr_name, np.asarray(values, dtype=object))
+    for attr_name in ("n_zero_source_pathways", "n_zero_target_pathways"):
+        value = pathway_metadata.get(attr_name)
+        if value is None:
+            continue
+        setattr(mgate, attr_name, int(value))
+
+
 def load_mgate(client, run_id, artifact_name, device, dst_dir):
     """Download a model .pth artifact and return a reconstructed, eval-mode MGATE."""
     local_path = download_model_artifact(client, run_id, artifact_name, dst_dir)
-    state_dict = torch.load(local_path, map_location=device, weights_only=False)
+    payload = torch.load(local_path, map_location=device, weights_only=False)
+    state_dict, pathway_metadata = unpack_mgate_checkpoint_payload(payload)
     mgate, hidden_dims1, hidden_dims2, vgp_anchor_mode = mgate_from_state_dict(state_dict, device)
+    apply_pathway_metadata_to_mgate(mgate, pathway_metadata)
     print(
         "    hidden_dims1={}, hidden_dims2={}, vgp_anchor_mode={}".format(
             hidden_dims1, hidden_dims2, vgp_anchor_mode
@@ -1673,6 +1696,10 @@ def main():
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
 
+    teacher_source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
+    source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
+    #target_concat_adata.obsm['spatial'] = np.concatenate([target_rna.obsm['spatial'], target_atac.obsm['spatial']], axis=0)
+
     source_target_adata, source_concat_adata, target_concat_adata = run_alignment_and_spatial_plot(
         model,
         source_mgate,
@@ -1749,16 +1776,67 @@ def main():
     from sklearn.metrics.pairwise import euclidean_distances
     from scipy.special import softmax
     import seaborn as sns
+    from post_hoc_utils import topic_betas_hallmark_gsea_mouse
 
     assert teacher_source_mgate.linear_etm_decoder
+
+    alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
+    rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
+    rho_atac = teacher_source_mgate.rho_atac.detach().cpu().numpy()
+    rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
+    rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
+    beta_rna = alpha @ rho_rna
+    beta_atac = alpha @ rho_atac
 
     source_delta = softmax(source_rna_emb, axis=1)
     source_delta_df = pd.DataFrame(source_delta, index=source_rna.obs_names)
 
+    source_clust_by_topic_delta = (
+        pd.DataFrame(source_rna_emb, index=source_rna.obs_names)
+        .assign(RNA_leiden=source_concat_adata.obs.loc[
+            source_concat_adata.obs['modality'].eq('rna'),
+            'leiden'
+            ].values)
+        .groupby('RNA_leiden')
+        .mean()
+        .apply(softmax, axis=1, result_type='expand')
+    )
+    
+    topk = 3
+    topk_topics = []
+    topics = source_clust_by_topic_delta.columns.values
+    clusters = source_clust_by_topic_delta.max(1).sort_values(ascending=False).index
+    for cluster in clusters:
+        topk_topics_cluster = source_clust_by_topic_delta.loc[cluster].nlargest(topk).index
+        topk_topics_cluster = topk_topics_cluster[topk_topics_cluster.isin(topics)]
+        topics = topics[~np.isin(topics, topk_topics_cluster)]
+        topk_topics.append(topk_topics_cluster)
+
+    topk_topics = np.concatenate(topk_topics)
+    source_clust_by_topic_delta = source_clust_by_topic_delta.loc[clusters, topk_topics]
+    sns.heatmap(source_clust_by_topic_delta.T, cmap='viridis')
+
+    top_active_cluster = '4' #clusters[0]
+    top_active_topics = source_clust_by_topic_delta.loc[top_active_cluster].nlargest(topk).index
+    top_active_gsea = topic_betas_hallmark_gsea_mouse(
+        beta_rna=beta_rna,
+        gene_names=np.asarray(source_rna.var_names).astype(str),
+        topic_indices=top_active_topics,
+        datapath=os.environ["DATAPATH"],
+    )
+    top_active_genes = top_active_gsea["top_active_genes"]
+    top_active_rna_betas = top_active_gsea["ranked_gene_indices"]
+    print("\nHallmark GSEA (mouse) — top terms per active topic:")
+    print(
+        top_active_gsea["top_terms_per_row"].loc[
+            top_active_gsea["top_terms_per_row"]['padj'].le(0.05)
+        ]
+    )
+
     # Categorical.map(dict) looks up category values with their native dtype; string
     # keys in lut won't match int categories and yield NaN floats mixed with RGB
     # tuples, which breaks pandas' Index reconstruction (TypeError).
-    cluster_key = source_rna.obs['RNA_clusters'].astype(str)
+    cluster_key = source_delta_df.obs['RNA_clusters'].astype(str)
     unique_clusters = cluster_key.unique()
     network_pal = sns.husl_palette(len(unique_clusters), s=0.45)
     lut = dict(zip(unique_clusters, network_pal))
