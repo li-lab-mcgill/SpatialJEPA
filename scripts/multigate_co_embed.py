@@ -1228,7 +1228,7 @@ def main():
     #%% ── MLflow setup ────────────────────────────────────────────────────────
     #bash /home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/scripts/start_mlflow_services.sh all
 
-    #args.run_name = '20260420_102406' #'20260402_153455'
+    #args.run_name = '20260420_163412' #'20260402_153455'
     #args.stage2_run_name = '20260402_153455_stage2_20260402_165006'
     #sqlite_tracking_uri = "sqlite:////home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db"
     #postgres_tracking_uri = "http://127.0.0.1:5000"
@@ -1746,7 +1746,26 @@ def main():
 
 
     #%% analysis of linear decoder
+    from sklearn.metrics.pairwise import euclidean_distances
+    from scipy.special import softmax
+
     assert teacher_source_mgate.linear_etm_decoder
+
+    source_delta = softmax(source_rna_emb, axis=1)
+    source_delta_df = pd.DataFrame(source_delta, index=source_rna.obs_names)
+
+    import seaborn as sns
+    # Categorical.map(dict) looks up category values with their native dtype; string
+    # keys in lut won't match int categories and yield NaN floats mixed with RGB
+    # tuples, which breaks pandas' Index reconstruction (TypeError).
+    cluster_key = source_rna.obs['RNA_clusters'].astype(str)
+    unique_clusters = cluster_key.unique()
+    network_pal = sns.husl_palette(len(unique_clusters), s=0.45)
+    lut = dict(zip(unique_clusters, network_pal))
+    row_colors = cluster_key.map(lut)
+
+    cg = sns.clustermap(source_delta_df, cmap='viridis', row_colors=row_colors, col_cluster=False)
+    cg.ax_heatmap.set_yticklabels([])
 
     alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
     rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
@@ -1791,16 +1810,15 @@ def main():
     alpha_rho_rna_adata.obs['gene_or_topic'] = np.concatenate([['gene'] * rho_rna.shape[1], ['topic'] * alpha.shape[0]])
     alpha_rho_rna_adata.obs['max_abs_beta'] = list(np.abs(beta_rna).argmax(0)) + list(np.arange(alpha.shape[0]))
 
-    from sklearn.metrics.pairwise import euclidean_distances
-    topic_gene_dists = euclidean_distances(
-        alpha_rho_rna_adata.obsm['X_pca'],
-    )[:rho_rna.shape[1], -alpha.shape[0]:].argmin(axis=1)
-    alpha_rho_rna_adata.obs['topic_gene_dist'] = list(topic_gene_dists) + list(np.arange(alpha.shape[0]))
-
     sc.pp.pca(alpha_rho_rna_adata, n_comps=100)
     sc.pp.neighbors(alpha_rho_rna_adata, use_rep='X_pca', n_neighbors=30)
     #sc.external.pp.bbknn(alpha_rho_rna_adata, batch_key='gene_or_topic', neighbors_within_batch=30)
     sc.tl.umap(alpha_rho_rna_adata, min_dist=0.3)
+
+    topic_gene_dists = euclidean_distances(
+        alpha_rho_rna_adata.obsm['X_pca'],
+    )[:rho_rna.shape[1], -alpha.shape[0]:].argmin(axis=1)
+    alpha_rho_rna_adata.obs['topic_gene_dist'] = list(topic_gene_dists) + list(np.arange(alpha.shape[0]))
 
     # 1. Extract coordinates and groups into a lightweight dataframe
     df = pd.DataFrame(alpha_rho_rna_adata.obsm['X_umap'], columns=['UMAP1', 'UMAP2'], index=alpha_rho_rna_adata.obs_names)
@@ -1838,6 +1856,12 @@ def main():
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
     plt.show()
+
+    sc.pl.umap(
+        alpha_rho_rna_adata,
+        color=['gene_or_topic', 'topic_gene_dist', 'max_abs_beta'],
+        color_map='Set2',
+        ncols=3, wspace=0.2, size=25)
 
     #%% staircase heatmap for gene-program p-values
 
