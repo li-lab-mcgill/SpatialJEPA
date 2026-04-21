@@ -1251,7 +1251,7 @@ def main():
     #%% ── MLflow setup ────────────────────────────────────────────────────────
     #bash /home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/scripts/start_mlflow_services.sh all
 
-    #args.run_name = '20260420_215210' #'20260402_153455'
+    #args.run_name = '20260421_102505' #'20260402_153455'
     #args.stage2_run_name = '20260402_153455_stage2_20260402_165006'
     #sqlite_tracking_uri = "sqlite:////home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db"
     #postgres_tracking_uri = "http://127.0.0.1:5000"
@@ -1787,6 +1787,10 @@ def main():
     rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
     rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
 
+    pathway_names = teacher_source_mgate.pathway_names
+    source_pathway_names = [pw for pw in pathway_names if pw.endswith('source')]
+    target_pathway_names = [pw for pw in pathway_names if pw.endswith('target')]
+
     # alpha = F.normalize(alpha, dim=1)
     # rho_rna = F.normalize(rho_rna, dim=1)
     # rho_atac = F.normalize(rho_atac, dim=1)
@@ -1858,6 +1862,44 @@ def main():
     source_alpha_embs = source_theta @ alpha
     target_alpha_embs = target_theta @ alpha
     source_target_adata.obsm['alpha_embs'] = np.concatenate([source_alpha_embs, target_alpha_embs], axis=0)
+
+    import liana as li
+    
+    pathways_adata = sc.AnnData(
+        source_alpha_embs,
+        obs=source_target_adata[source_target_adata.obs['source_or_target'].eq('source')].obs,
+        var=pd.DataFrame(
+            data=np.vstack([
+                [pw.split('__')[0] for pw in pathway_names],
+                ['sender' if pw.endswith('source') else 'receiver' for pw in pathway_names],
+            ]).T,
+            index=pathway_names,
+            columns=['basename', 'sender_or_receiver']),
+        obsm={'spatial': source_target_adata[source_target_adata.obs['source_or_target'].eq('source')].obsm['spatial']},
+        )
+    pathways_adata.var['paired'] = pathways_adata.var['basename'].isin(pathways_adata.var['basename'].value_counts().index[pathways_adata.var['basename'].value_counts().eq(2)])
+
+    li.ut.spatial_neighbors(pathways_adata, bandwidth=100)
+    paired_pathways_adata = pathways_adata[:,pathways_adata.var['paired']].copy()
+    sender_pathways_adata = paired_pathways_adata[:,paired_pathways_adata.var['sender_or_receiver'].eq('sender')]
+    receiver_pathways_adata = paired_pathways_adata[:,paired_pathways_adata.var['sender_or_receiver'].eq('receiver')]
+    assert np.all(sender_pathways_adata.var['basename'].values == receiver_pathways_adata.var['basename'].values)
+
+    S = sender_pathways_adata.X.copy()
+    R = receiver_pathways_adata.X.copy()
+    W = pathways_adata.obsp['spatial_connectivities']
+
+    S = softmax(S, axis=0)
+    R = softmax(R, axis=0)
+
+    M = S.T @ W @ R
+    plt.matshow(M)
+
+    sc.pp.pca(pathways_adata, n_comps=50)
+    sc.external.pp.bbknn(pathways_adata, batch_key='source_or_target', use_rep='X_pca', neighbors_within_batch=10)
+    sc.tl.umap(pathways_adata, min_dist=0.3)
+    sc.pl.umap(pathways_adata, color=['source_or_target'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
 
     ## compute mean distance between source and target for each cluster
     source_adata = source_target_adata[source_target_adata.obs['source_or_target'].eq('source')]
