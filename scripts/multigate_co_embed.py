@@ -2184,6 +2184,16 @@ def main():
     import seaborn as sns
     import pandas as pd
 
+    pathway_embedding_results_cp = pathway_embedding_results.copy()
+
+    ## remove terms from correlation matrix, e.g. TF targets
+    terms_blacklist = None #['TF_target', 'combined']
+    if terms_blacklist is not None:
+        pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster = \
+            pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster.loc[
+                ~pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster.index.str.contains('|'.join(terms_blacklist))
+            ]
+
     # 1) Get source corr matrix and pathway order
     source_corr, _, pathway_order_source = cluster_pathway_embedding_heatmap(
         pathway_embedding_results, "source_rna", top_k_pathways=2
@@ -2208,20 +2218,32 @@ def main():
     overlap = (overlap - overlap.min()) / (overlap.max() - overlap.min())
     overlap_df = pd.DataFrame(overlap, index=target_corr.index, columns=target_corr.columns)
 
+    '''
+    ## rename "emb" to "topic"
+    source_corr_ord.columns = source_corr_ord.columns.str.replace('emb', 'topic')
+    target_corr.columns = target_corr.columns.str.replace('emb', 'topic')
+    overlap_df.columns = overlap_df.columns.str.replace('emb', 'topic')
+
+    ## compare with alpha
+    alpha_df_ord = alpha_df.copy()
+    alpha_df_ord.columns = alpha_df_ord.columns.str.split('__').str[0]
+    alpha_df_ord = alpha_df_ord.groupby(alpha_df_ord.columns, axis=1).mean()
+    alpha_df_ord = alpha_df_ord.loc[overlap_df.columns, overlap_df.index]
+    plt.figure(figsize=(10, 12))
+    sns.heatmap(alpha_df_ord.T, cmap='coolwarm'); plt.tight_layout(); plt.show()
+    '''
+
     # 5) One combined figure
     fig, axes = plt.subplots(1, 3, figsize=(24, 10), constrained_layout=True, sharey=True, sharex=True)
-
     sns.heatmap(source_corr_ord, cmap="coolwarm", center=0.0, ax=axes[0], cbar=True)
-    axes[0].set_title("Source data")
-
     sns.heatmap(target_corr, cmap="coolwarm", center=0.0, ax=axes[1], cbar=True)
-    axes[1].set_title("Target data")
-
     sns.heatmap(overlap_df, cmap="coolwarm", ax=axes[2], cbar=True)
+    axes[0].set_title("Source data")
+    axes[1].set_title("Target data")
     axes[2].set_title("Source-target overlap")
-
     _log_mlflow_figure(fig, "pathway_embedding_triptych.svg")
     plt.show()
+
 
     # Cluster-by-cluster comparison: grid of panels (scatter + linear fit per cluster)
     from scipy.stats import pearsonr
