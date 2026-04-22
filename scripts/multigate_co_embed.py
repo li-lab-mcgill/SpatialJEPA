@@ -1784,8 +1784,36 @@ def main():
     alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
     rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
     rho_atac = teacher_source_mgate.rho_atac.detach().cpu().numpy()
+
     rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
     rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
+    rho_rna_overlap = ((np.abs(rho_rna) == np.abs(rho_rna).max(1, keepdims=True)) * rho_rna_mask).any(1).mean()
+    rho_atac_overlap = ((np.abs(rho_atac) == np.abs(rho_atac).max(1, keepdims=True)) * rho_atac_mask).any(1).mean()
+    print(f"RNA overlap: {rho_rna_overlap}, ATAC overlap: {rho_atac_overlap}")
+
+    rho_rna_mask_gain = (np.abs(rho_rna) * rho_rna_mask).sum(1) / rho_rna_mask.sum(1) / np.abs(rho_rna).mean(1)
+    rho_atac_mask_gain = (np.abs(rho_atac) * rho_atac_mask).sum(1) / rho_atac_mask.sum(1) / np.abs(rho_atac).mean(1)
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5), sharex=True)
+    ax[0].hist(rho_rna_mask_gain, bins=50)
+    ax[1].hist(rho_atac_mask_gain, bins=50)
+    plt.tight_layout(); plt.show()
+
+    topk=25
+    topk_genes = []
+    for topic in range(alpha.shape[0]):
+        topk_genes_topic = pd.Series(alpha[topic]).nlargest(topk).index
+        topk_genes.append(topk_genes_topic)
+    topk_genes = np.concatenate(topk_genes)
+    top_alpha = alpha[:,topk_genes]
+    plt.figure(figsize=(10, 10))
+    plt.matshow(top_alpha, aspect='auto'); plt.colorbar()
+    plt.tight_layout(); plt.show()
+
+    alpha_df = pd.DataFrame(alpha, index=[f'topic_{i}' for i in range(30)])
+    pd.concat([
+        alpha_df.abs().max(1),
+        alpha_df.abs().median(1)
+    ], axis=1).sort_values(0).plot(kind='bar')
 
     pathway_names = teacher_source_mgate.pathway_names
     source_pathway_names = [pw for pw in pathway_names if pw.endswith('source')]
@@ -1879,21 +1907,27 @@ def main():
         )
     pathways_adata.var['paired'] = pathways_adata.var['basename'].isin(pathways_adata.var['basename'].value_counts().index[pathways_adata.var['basename'].value_counts().eq(2)])
 
-    li.ut.spatial_neighbors(pathways_adata, bandwidth=100)
+    li.ut.spatial_neighbors(pathways_adata, bandwidth=1000, set_diag=False)
     paired_pathways_adata = pathways_adata[:,pathways_adata.var['paired']].copy()
     sender_pathways_adata = paired_pathways_adata[:,paired_pathways_adata.var['sender_or_receiver'].eq('sender')]
     receiver_pathways_adata = paired_pathways_adata[:,paired_pathways_adata.var['sender_or_receiver'].eq('receiver')]
     assert np.all(sender_pathways_adata.var['basename'].values == receiver_pathways_adata.var['basename'].values)
 
+    X = pathways_adata.X.copy()
+    W = pathways_adata.obsp['spatial_connectivities']
+    plt.matshow(X.T @ W @ X, aspect='auto'); plt.colorbar()
+    plt.tight_layout(); plt.show()
+
     S = sender_pathways_adata.X.copy()
     R = receiver_pathways_adata.X.copy()
     W = pathways_adata.obsp['spatial_connectivities']
+    plt.scatter(S.sum(axis=0), R.sum(axis=0)); plt.colorbar()
 
-    S = softmax(S, axis=0)
-    R = softmax(R, axis=0)
+    #S = softmax(S, axis=0)
+    #R = softmax(R, axis=0)
 
     M = S.T @ W @ R
-    plt.matshow(M)
+    plt.matshow(M); plt.colorbar()
 
     sc.pp.pca(pathways_adata, n_comps=50)
     sc.external.pp.bbknn(pathways_adata, batch_key='source_or_target', use_rep='X_pca', neighbors_within_batch=10)
