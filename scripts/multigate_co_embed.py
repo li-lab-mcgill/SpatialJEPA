@@ -2184,11 +2184,11 @@ def main():
     import seaborn as sns
     import pandas as pd
 
-    pathway_embedding_results_cp = pathway_embedding_results.copy()
 
     ## remove terms from correlation matrix, e.g. TF targets
     terms_blacklist = None #['TF_target', 'combined']
     if terms_blacklist is not None:
+        pathway_embedding_results_cp = pathway_embedding_results.copy()
         pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster = \
             pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster.loc[
                 ~pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster.index.str.contains('|'.join(terms_blacklist))
@@ -2244,6 +2244,11 @@ def main():
     _log_mlflow_figure(fig, "pathway_embedding_triptych.svg")
     plt.show()
 
+    ## compare with p-values
+    corr_pvals = pathway_embedding_results['source_rna'].pathway_embedding_p_values_by_cluster.copy()
+    corr_pvals = corr_pvals.loc[overlap_df.index, overlap_df.columns]
+    corr_pvals_bin = corr_pvals < 0.05
+    sns.heatmap(corr_pvals_bin, center=0.0, cbar=False); plt.show()
 
     # Cluster-by-cluster comparison: grid of panels (scatter + linear fit per cluster)
     from scipy.stats import pearsonr
@@ -2325,6 +2330,7 @@ def main():
 
     def liana_spatial_analysis(
         adata,
+        resource=None,
         spatial_key="spatial",
         cell_type_col="RNA_clusters",
         labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60
@@ -2366,7 +2372,7 @@ def main():
         plot + p9.scale_y_continuous(breaks=range(int(df.neighbours.min()), int(df.neighbours.max())+1))
 
         li.ut.spatial_neighbors(adata=adata, bandwidth=bandwidth, spatial_key=spatial_key)
-        li.pl.connectivity(adata, idx=5500, size=0.01, figure_size=(6, 5), spatial_key=spatial_key)
+        li.pl.connectivity(adata, idx=5500, size=1, figure_size=(6, 5), spatial_key=spatial_key)
 
         sq.gr.spatial_autocorr(adata, mode='moran', use_raw=False, show_progress_bar=True)
         svgs = adata.uns['moranI'].index[(adata.uns['moranI']['pval_norm_fdr_bh'] < 0.05) & (adata.uns['moranI']['I'] > 0.01)]
@@ -2377,13 +2383,15 @@ def main():
         map_df = map_df.rename(columns={"Gene name": "source", "Mouse gene name": "target"})
         map_df = map_df.drop(columns=["Gene stable ID", "Mouse gene stable ID"])
 
-        resource = li.rs.select_resource('consensus') # NOTE: mouse_consensus could be used in future
-        resource = li.rs.translate_resource(resource,
-                                        map_df=map_df,
-                                        columns=['ligand', 'receptor'],
-                                        replace=True,
-                                        one_to_many=2
-                                        )
+        if resource is None:
+            resource = li.rs.select_resource('consensus') # NOTE: mouse_consensus could be used in future
+            resource = li.rs.translate_resource(
+                resource,
+                map_df=map_df,
+                columns=['ligand', 'receptor'],
+                replace=True,
+                one_to_many=2,
+            )
 
         lrdata = li.mt.inflow(adata,
                             groupby=cell_type_col,
@@ -2396,11 +2404,13 @@ def main():
         lrdata = lrdata[:, svis]
         lrdata.uns['moranI'].sort_values("I").tail(30)
 
-        ligands = lrdata.var_names.str.split("^").str[1]
-        receptors = lrdata.var_names.str.split("^").str[2]
-        fused_I = adata.uns['moranI'].loc[ligands, 'I'].values * adata.uns['moranI'].loc[receptors, 'I'].values
-
-        print(lrdata.var_names[np.flip(fused_I.argsort())])
+        try:
+            ligands = lrdata.var_names.str.split("^").str[1]
+            receptors = lrdata.var_names.str.split("^").str[2]
+            fused_I = adata.uns['moranI'].loc[ligands, 'I'].values * adata.uns['moranI'].loc[receptors, 'I'].values
+            print(lrdata.var_names[np.flip(fused_I.argsort())])
+        except:
+            fused_I = None
 
         comp = interaction.split("^")
 
@@ -2435,7 +2445,7 @@ def main():
             labels=labels,
             show_counts=False,
             normalize=True,
-            figure_size=(10,8)
+            figure_size=(10,8),
         )
         ## stopped at "Global Summaries"
 
@@ -2559,12 +2569,38 @@ def main():
     source_fusion.X = source_fusion.layers['fusion_scores'].copy()
     del source_rna.layers['fusion_scores']
 
+    ## format combined_gp_dict to adapt to LIANA+
+    basenames = [gp.split('__')[0] for gp in source_mgate.pathway_names]
+    combined_gp_df = pd.DataFrame()
+    for gp in basenames:
+        gp_dict = combined_gp_dict[gp]
+        sources_df = pd.DataFrame(np.stack([gp_dict['sources'], gp_dict['sources_categories']], axis=1), columns=['ligand', 'source_category'])
+        targets_df = pd.DataFrame(np.stack([gp_dict['targets'], gp_dict['targets_categories']], axis=1), columns=['receptor', 'target_category'])
+        all_pairs_df = sources_df.merge(targets_df, how='cross')
+        combined_gp_df = pd.concat([combined_gp_df, all_pairs_df])
+   
+    enforce_ligand_receptor = True
+    if enforce_ligand_receptor:
+        combined_gp_df = combined_gp_df.loc[
+            (combined_gp_df['source_category'] == 'ligand') & (combined_gp_df['target_category'] == 'receptor')
+        ]
+
+    resource = combined_gp_df.drop(columns=['source_category', 'target_category']).drop_duplicates()
+
     ## LIANA+ inflow analysis
-    liana_results = liana_spatial_analysis(
+    source_liana_results = liana_spatial_analysis(
         source_rna,
+        resource=resource,
         labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
         )
-    print(f'GW distance: {liana_results["gw_distance"]:.2f}')
+    print(f'GW distance: {source_liana_results["gw_distance"]:.2f}')
+
+    target_liana_results = liana_spatial_analysis(
+        target_rna,
+        resource=resource,
+        labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
+        )
+    print(f'GW distance: {target_liana_results["gw_distance"]:.2f}')
 
     Xs = source_rna.obsm['MultiGATE']
     #Xt = liana_results['lrdata'].obsm['NMF_W']
