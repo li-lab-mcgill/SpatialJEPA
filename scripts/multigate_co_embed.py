@@ -1504,7 +1504,7 @@ def main():
         spatial_graph_type=spatial_graph_type,
         gtf_path=gtf_path,
     )
-
+    '''
     if split_metadata is not None:
         source_rna, source_atac = subset_domain_to_saved_split(
             source_rna,
@@ -1535,7 +1535,7 @@ def main():
             seed=legacy_target_subsample_seed,
         )
         print("  {} cells after pairing/subsampling".format(target_rna.n_obs))
-
+    '''
     source_graph_tf, source_gp_tf, source_x1, source_x2 = build_graph_inputs(
         source_rna, source_atac, bp_width=bp_width, graph_type=graph_type
     )
@@ -1809,15 +1809,16 @@ def main():
     plt.matshow(top_alpha, aspect='auto'); plt.colorbar()
     plt.tight_layout(); plt.show()
 
-    alpha_df = pd.DataFrame(alpha, index=[f'topic_{i}' for i in range(30)])
+    pathway_names = teacher_source_mgate.pathway_names
+    source_pathway_names = [pw for pw in pathway_names if pw.endswith('source')]
+    target_pathway_names = [pw for pw in pathway_names if pw.endswith('target')]
+
+    alpha_df = pd.DataFrame(alpha, index=[f'topic_{i}' for i in range(30)], columns=pathway_names)
     pd.concat([
         alpha_df.abs().max(1),
         alpha_df.abs().median(1)
     ], axis=1).sort_values(0).plot(kind='bar')
 
-    pathway_names = teacher_source_mgate.pathway_names
-    source_pathway_names = [pw for pw in pathway_names if pw.endswith('source')]
-    target_pathway_names = [pw for pw in pathway_names if pw.endswith('target')]
 
     # alpha = F.normalize(alpha, dim=1)
     # rho_rna = F.normalize(rho_rna, dim=1)
@@ -2144,7 +2145,7 @@ def main():
 
         return cluster_gp_scores, fig_heatmap, fig_spatial
 
-    def cluster_pathway_embedding_heatmap(pathway_embedding_results, adata_label, top_k_pathways=30):
+    def cluster_pathway_embedding_heatmap(pathway_embedding_results, adata_label, top_k_pathways=3, row_ind=None, col_ind=None, pathway_order=None):
         import seaborn as sns
 
         result = pathway_embedding_results[adata_label]
@@ -2152,26 +2153,23 @@ def main():
         if corr is None or corr.empty:
             return None, None
 
-        pathway_order = corr.abs().max(axis=1).sort_values(ascending=False).head(top_k_pathways).index
-        corr_top = corr.loc[pathway_order]
+        if pathway_order is None:
+            #pathway_order = corr.abs().max(axis=1).sort_values(ascending=False).head(top_k_pathways).index
+            pathway_order = pd.Series(corr.apply(lambda x: corr.index[np.argsort(x)[:top_k_pathways]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values
+            corr_top = corr.loc[pathway_order]
+            cg = sns.clustermap(corr_top, cmap='coolwarm', center=0.0)
+            _log_mlflow_figure(cg.figure, "pathway_embedding_by_cluster_{}.svg".format(adata_label))
+        else:
+            fig, ax = plt.subplots(figsize=(8, 8))
+            corr_top = corr.loc[pathway_order]
+            corr_top = corr_top.iloc[row_ind, col_ind]
+            sns.heatmap(corr_top, cmap='coolwarm', center=0.0, ax=ax)
+            _log_mlflow_figure(fig, "pathway_embedding_by_cluster_{}.svg".format(adata_label))
+            cg=None
 
-        fig, ax = plt.subplots(
-            figsize=(max(8, 0.55 * corr_top.shape[1] + 3), max(8, 0.25 * corr_top.shape[0] + 2))
-        )
-        sns.heatmap(corr_top, cmap='coolwarm', center=0.0, ax=ax)
-        ax.set_title(
-            "{} pathway vs {}-centroid embedding correlation".format(
-                adata_label,
-                result.cluster_obs_key_used or "cluster",
-            )
-        )
-        ax.set_xlabel("{} centroid dims".format(result.config.embedding_key))
-        ax.set_ylabel("gene program")
-        plt.tight_layout()
-        _log_mlflow_figure(fig, "pathway_embedding_by_cluster_{}.svg".format(adata_label))
         plt.show()
 
-        return corr_top, fig
+        return corr_top, cg, pathway_order
 
     # Myc_TF_target_genes_GP, Apex1_TF_target_genes_GP
     source_rna_cluster_gp_scores, _fig_stair_heatmap_source, _fig_stair_spatial_source = staircase_heatmap(
@@ -2180,12 +2178,50 @@ def main():
     target_rna_cluster_gp_scores, _fig_stair_heatmap_target, _fig_stair_spatial_target = staircase_heatmap(
         pathway_embedding_results, target_rna, 'target_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
     )
-    source_cluster_pathway_embedding_corr, _fig_cluster_pathway_embedding_source = cluster_pathway_embedding_heatmap(
-        pathway_embedding_results, 'source_rna'
+
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import pandas as pd
+
+    # 1) Get source corr matrix and pathway order
+    source_corr, _, pathway_order_source = cluster_pathway_embedding_heatmap(
+        pathway_embedding_results, "source_rna", top_k_pathways=2
     )
-    target_cluster_pathway_embedding_corr, _fig_cluster_pathway_embedding_target = cluster_pathway_embedding_heatmap(
-        pathway_embedding_results, 'target_rna'
-    )
+    source_corr = source_corr.loc[pathway_order_source]
+
+    # 2) Temporary clustermap only to extract row/col ordering
+    cg = sns.clustermap(source_corr, cmap="coolwarm", center=0.0)
+    row_ind = cg.dendrogram_row.reordered_ind
+    col_ind = cg.dendrogram_col.reordered_ind
+    plt.close(cg.figure)
+
+    # Reorder source
+    source_corr_ord = source_corr.iloc[row_ind, col_ind]
+
+    # 3) Build target using same pathway + same row/col order
+    target_corr = pathway_embedding_results["target_rna"].pathway_embedding_correlation_by_cluster
+    target_corr = target_corr.loc[pathway_order_source].iloc[row_ind, col_ind]
+
+    # 4) Overlap
+    overlap = softmax(source_corr_ord * target_corr / 5.0)
+    overlap = (overlap - overlap.min()) / (overlap.max() - overlap.min())
+    overlap_df = pd.DataFrame(overlap, index=target_corr.index, columns=target_corr.columns)
+
+    # 5) One combined figure
+    fig, axes = plt.subplots(1, 3, figsize=(24, 10), constrained_layout=True, sharey=True, sharex=True)
+
+    sns.heatmap(source_corr_ord, cmap="coolwarm", center=0.0, ax=axes[0], cbar=True)
+    axes[0].set_title("Source data")
+
+    sns.heatmap(target_corr, cmap="coolwarm", center=0.0, ax=axes[1], cbar=True)
+    axes[1].set_title("Target data")
+
+    sns.heatmap(overlap_df, cmap="coolwarm", ax=axes[2], cbar=True)
+    axes[2].set_title("Source-target overlap")
+
+    _log_mlflow_figure(fig, "pathway_embedding_triptych.svg")
+    plt.show()
 
     # Cluster-by-cluster comparison: grid of panels (scatter + linear fit per cluster)
     from scipy.stats import pearsonr
