@@ -1427,6 +1427,7 @@ def main():
         "stage1":         "model_stage1.pth",
         "stage1_teacher": "model_stage1_teacher.pth",
         "stage1_student": "model_stage1_student.pth",
+        'stage1_nonspatial': "model_stage1_nonspatial.pth",
     }
     source_artifact_name = source_artifact_map[args.source_model]
     #teacher_source_artifact_name = source_artifact_map["stage1_teacher"]
@@ -1446,6 +1447,9 @@ def main():
         if dual_source_kd:
             teacher_source_mgate, _, _, _ = load_mgate(
                 client, run_id, source_artifact_map["stage1_teacher"], device, tmpdir
+            )
+            nonspatial_source_mgate, _, _, _ = load_mgate(
+                client, run_id, source_artifact_map["stage1_nonspatial"], device, tmpdir
             )
         else:
             teacher_source_mgate = source_mgate
@@ -1606,9 +1610,17 @@ def main():
     set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
     print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
+    ## nonspatial source inference
+    nonspatial_source_rna_emb, nonspatial_source_atac_emb = run_inference(
+        nonspatial_source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+    )
+    set_multigate_embeddings(source_rna, source_atac, nonspatial_source_rna_emb, nonspatial_source_atac_emb, key_added="MultiGATE_nonspatial")
+    print("  Nonspatial source embeddings: shape {}".format(nonspatial_source_rna_emb.shape))
+
     # Plot source/target concat UMAPs with the same helper as training script.
     teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher")
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
+    nonspatial_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_nonspatial")
 
     ## compute UMAPs
     compute_concat_umap(
@@ -1620,6 +1632,13 @@ def main():
     )
     compute_concat_umap(
         source_concat_adata,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    compute_concat_umap(
+        nonspatial_source_concat_adata,
         n_neighbors=10,
         resolution=1.5,
         deterministic=True,
@@ -1638,6 +1657,13 @@ def main():
     fig, axs = plt.subplots(1, len(source_umap_colors), figsize=(18, 5))
     for i, color in enumerate(source_umap_colors):
         sc.pl.umap(source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+    plt.tight_layout(); plt.show()
+
+    # plot nonspatial source UMAPs
+    nonspatial_source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
+    fig, axs = plt.subplots(1, len(nonspatial_source_umap_colors), figsize=(18, 5))
+    for i, color in enumerate(nonspatial_source_umap_colors):
+        sc.pl.umap(nonspatial_source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
     plt.tight_layout(); plt.show()
 
     if args.target_model:
