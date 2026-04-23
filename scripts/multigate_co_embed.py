@@ -110,6 +110,7 @@ import scanpy as sc
 import scipy.sparse as sp
 import torch
 from joblib import Parallel, delayed
+import seaborn as sns
 
 import MultiGATE
 from MultiGATE.model_MultiGATE import MGATE
@@ -1622,25 +1623,29 @@ def main():
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     nonspatial_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_nonspatial")
 
+    ## set leiden resolution
+    leiden_resolution = 0.5
+    leiden_neighbors = 100
+
     ## compute UMAPs
     compute_concat_umap(
         teacher_source_concat_adata,
-        n_neighbors=10,
-        resolution=0.5,
+        n_neighbors=leiden_neighbors,
+        resolution=leiden_resolution,
         deterministic=True,
         random_state=deterministic_seed,
     )
     compute_concat_umap(
         source_concat_adata,
-        n_neighbors=10,
-        resolution=0.5,
+        n_neighbors=leiden_neighbors,
+        resolution=leiden_resolution,
         deterministic=True,
         random_state=deterministic_seed,
     )
     compute_concat_umap(
         nonspatial_source_concat_adata,
-        n_neighbors=10,
-        resolution=0.5,
+        n_neighbors=leiden_neighbors,
+        resolution=leiden_resolution,
         deterministic=True,
         random_state=deterministic_seed,
     )
@@ -1805,7 +1810,6 @@ def main():
     #%% analysis of linear decoder
     from sklearn.metrics.pairwise import euclidean_distances
     from scipy.special import softmax
-    import seaborn as sns
     from post_hoc_utils import topic_betas_hallmark_gsea_mouse
 
     assert teacher_source_mgate.linear_etm_decoder
@@ -2524,6 +2528,7 @@ def main():
             adata = adata[chosen].copy()
             stratified_subsample_applied = True
 
+        '''
         ## GW distance
         X_nmf = nmf.X
         if stratified_subsample_applied:
@@ -2541,13 +2546,13 @@ def main():
         del C_nmf, C_source
         torch.cuda.empty_cache()
         gc.collect()
+        '''
 
         # Return a dictionary of useful results, or could just not return if only for plotting side-effects
         return {
             "adata": adata,
             "lrdata": lrdata,
             "nmf": nmf,
-            "gw_distance": gw_distance,
             "fused_I": fused_I,
             "svgs": svgs,
             "svis": svis,
@@ -2656,7 +2661,6 @@ def main():
         resource=resource,
         labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
         )
-    print(f'GW distance: {source_liana_results["gw_distance"]:.2f}')
 
     target_liana_results = liana_spatial_analysis(
         target_rna,
@@ -2664,12 +2668,12 @@ def main():
         resource=resource,
         labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
         )
-    print(f'GW distance: {target_liana_results["gw_distance"]:.2f}')
 
     ## compare ARI between NMF leiden and source, target and nonspatial-source leiden
-    nmf = source_liana_results['nmf'].copy()
+    from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
-    from sklearn.metrics import adjusted_rand_score
+    ## source ARI
+    nmf = source_liana_results['nmf'].copy()
     source_leiden = source_concat_adata[
             source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
             source_concat_adata.obs['modality'].eq('rna')
@@ -2678,12 +2682,19 @@ def main():
     source_leiden = source_leiden.loc[nmf.obs_names]
     nmf_leiden = nmf.obs['leiden']
     assert source_leiden.index.equals(nmf_leiden.index)
-    print(f'Adjusted Rand Score: {adjusted_rand_score(source_leiden, nmf_leiden):.2f}')
+    source_ari = adjusted_rand_score(source_leiden, nmf_leiden)
+    source_nmi = normalized_mutual_info_score(source_leiden, nmf_leiden)
+    print(f'Adjusted Rand Score: {source_ari:.2f}')
+    print(f'Normalized Mutual Information Score: {source_nmi:.2f}')
 
+    ## target ARI
+    nmf = target_liana_results['nmf'].copy()
     target_leiden = target_concat_adata[
-            target_concat_adata.obs['source_obs_names'].str.split("_").str[0].isin(nmf.obs_names) &
+            #target_concat_adata.obs['source_obs_names'].str.split("_").str[0].isin(nmf.obs_names) &
+            target_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
             target_concat_adata.obs['modality'].eq('rna')
-            ].obs.set_index('source_obs_names')['leiden']
+            #].obs.set_index('source_obs_names')['leiden']
+            ].obs['leiden']
     target_leiden.index = target_leiden.index.str.split("_").str[0]
     overlap = target_leiden.index.intersection(nmf.obs_names)
 
@@ -2706,8 +2717,13 @@ def main():
     nmf_leiden = nmf.obs['leiden'].loc[overlap]
     target_leiden = target_leiden.loc[nmf_leiden.index]
     assert target_leiden.index.equals(nmf_leiden.index)
-    print(f'Adjusted Rand Score: {adjusted_rand_score(target_leiden, nmf_leiden):.2f}')
+    target_ari = adjusted_rand_score(target_leiden, nmf_leiden)
+    target_nmi = normalized_mutual_info_score(target_leiden, nmf_leiden)
+    print(f'Adjusted Rand Score: {target_ari:.2f}')
+    print(f'Normalized Mutual Information Score: {target_nmi:.2f}')
 
+    ## nonspatial source ARI
+    nmf = source_liana_results['nmf'].copy()
     nonspatial_source_leiden = nonspatial_source_concat_adata[
             nonspatial_source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
             nonspatial_source_concat_adata.obs['modality'].eq('rna')
@@ -2716,7 +2732,42 @@ def main():
     nonspatial_source_leiden = nonspatial_source_leiden.loc[nmf.obs_names]
     nmf_leiden = nmf.obs['leiden']
     assert nonspatial_source_leiden.index.equals(nmf_leiden.index)
-    print(f'Adjusted Rand Score: {adjusted_rand_score(nonspatial_source_leiden, nmf_leiden):.2f}')
+    nonspatial_source_ari = adjusted_rand_score(nonspatial_source_leiden, nmf_leiden)
+    nonspatial_source_nmi = normalized_mutual_info_score(nonspatial_source_leiden, nmf_leiden)
+    print(f'Adjusted Rand Score: {nonspatial_source_ari:.2f}')
+    print(f'Normalized Mutual Information Score: {nonspatial_source_nmi:.2f}')
+
+    ## ingested nonspatial source ARI
+    ingested_nonspatial_source_concat_adata = sc.tl.ingest(nonspatial_source_concat_adata, source_concat_adata, embedding_method='umap', obs='leiden', inplace=False)
+    nmf = source_liana_results['nmf'].copy()
+    nonspatial_source_leiden = ingested_nonspatial_source_concat_adata[
+            ingested_nonspatial_source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
+            ingested_nonspatial_source_concat_adata.obs['modality'].eq('rna')
+            ].obs['leiden']
+    nonspatial_source_leiden.index = nonspatial_source_leiden.index.str.split("_").str[0]
+    nonspatial_source_leiden = nonspatial_source_leiden.loc[nmf.obs_names]
+    nmf_leiden = nmf.obs['leiden']
+    assert nonspatial_source_leiden.index.equals(nmf_leiden.index)
+    ingested_nonspatial_source_ari = adjusted_rand_score(nonspatial_source_leiden, nmf_leiden)
+    ingested_nonspatial_source_nmi = normalized_mutual_info_score(nonspatial_source_leiden, nmf_leiden)
+    print(f'Adjusted Rand Score: {ingested_nonspatial_source_ari:.2f}')
+    print(f'Normalized Mutual Information Score: {ingested_nonspatial_source_nmi:.2f}')
+
+    ## compare ARI and NMI between source, target and nonspatial-source
+    ari_nmi_df = pd.DataFrame({
+        'ARI': [source_ari, target_ari, nonspatial_source_ari, ingested_nonspatial_source_ari],
+        'NMI': [source_nmi, target_nmi, nonspatial_source_nmi, ingested_nonspatial_source_nmi]
+    }, index=['Source', 'Target', 'Nsp Source', 'Nsp Source (ingst.)'])
+    ari_nmi_df.plot(kind='bar', rot=30, cmap='Set2', figsize=(4, 5))
+
+    ## plot UMAP of source, target, nonspatial-source and ingested nonspatial-source
+    fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+    sc.pl.umap(source_concat_adata, color='leiden', size=25, ax=axs[0, 0], show=False)
+    sc.pl.umap(target_concat_adata, color='leiden', size=25, ax=axs[0, 1], show=False)
+    sc.pl.umap(nonspatial_source_concat_adata, color='leiden', size=25, ax=axs[1, 0], show=False)
+    sc.pl.umap(ingested_nonspatial_source_concat_adata, color='leiden', size=25, ax=axs[1, 1], show=False)
+    plt.tight_layout()
+    plt.show()
 
     #%% embedding-to-gene modelling
     from sklearn.cross_decomposition import PLSRegression
