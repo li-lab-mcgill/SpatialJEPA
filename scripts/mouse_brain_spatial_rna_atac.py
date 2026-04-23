@@ -21,9 +21,9 @@ from dotenv import dotenv_values, load_dotenv
 ENV_FILE_PATH = "/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env"
 DEFAULT_SOURCE_LABEL_KEY = "RNA_clusters"
 DEFAULT_TARGET_LABEL_KEY = "arc_gex_kmeans_5_clusters_Cluster"
-SPLIT_RATIO_TRAIN = 0.7
-SPLIT_RATIO_VAL = 0.2
-SPLIT_RATIO_TEST = 0.1
+SPLIT_RATIO_TRAIN = 0.5
+SPLIT_RATIO_VAL = 0.3
+SPLIT_RATIO_TEST = 0.2
 SPLIT_ARTIFACT_PATH = os.path.join("splits", "domain_splits.json")
 SPLIT_SCHEMA_VERSION = 1
 

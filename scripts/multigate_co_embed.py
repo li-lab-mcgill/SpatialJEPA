@@ -1626,21 +1626,21 @@ def main():
     compute_concat_umap(
         teacher_source_concat_adata,
         n_neighbors=10,
-        resolution=1.5,
+        resolution=0.5,
         deterministic=True,
         random_state=deterministic_seed,
     )
     compute_concat_umap(
         source_concat_adata,
         n_neighbors=10,
-        resolution=1.5,
+        resolution=0.5,
         deterministic=True,
         random_state=deterministic_seed,
     )
     compute_concat_umap(
         nonspatial_source_concat_adata,
         n_neighbors=10,
-        resolution=1.5,
+        resolution=0.5,
         deterministic=True,
         random_state=deterministic_seed,
     )
@@ -1718,12 +1718,15 @@ def main():
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
+    ## concatenate modalities
     teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher")
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
 
+    ## add spatial coordinates
     teacher_source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
     source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
+    nonspatial_source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
     #target_concat_adata.obsm['spatial'] = np.concatenate([target_rna.obsm['spatial'], target_atac.obsm['spatial']], axis=0)
 
     source_target_adata, source_concat_adata, target_concat_adata = run_alignment_and_spatial_plot(
@@ -1737,6 +1740,7 @@ def main():
         deterministic_seed,
     )
 
+    ## transfer spatial coordinates to target data
     target_rna.obsm['spatial'] = source_target_adata[
         source_target_adata.obs['modality'].eq('rna') &
         source_target_adata.obs['source_or_target'].eq('target')
@@ -1746,8 +1750,8 @@ def main():
 
     ## ingest source embeddings into target data
     if model is source_mgate:
-        #sc.tl.ingest(teacher_source_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters')
         sc.tl.ingest(target_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters')
+        #sc.tl.ingest(teacher_source_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters')
         ## confirm that the ingested representations are the same as the original embeddings
         #assert (teacher_source_concat_adata.obsm['rep'] == teacher_source_concat_adata.X).all()
         assert (target_concat_adata.obsm['rep'] == target_concat_adata.X).all()
@@ -2353,9 +2357,12 @@ def main():
     import plotnine as p9
     import squidpy as sq
     import ot
+    import gc
+    from sklearn.model_selection import StratifiedShuffleSplit
 
     def liana_spatial_analysis(
         adata,
+        subsample_n=5000,
         resource=None,
         spatial_key="spatial",
         cell_type_col="RNA_clusters",
@@ -2419,10 +2426,12 @@ def main():
                 one_to_many=2,
             )
 
-        lrdata = li.mt.inflow(adata,
-                            groupby=cell_type_col,
-                            resource=resource,
-                            use_raw=False)
+        lrdata = li.mt.inflow(
+            adata,
+            groupby=cell_type_col,
+            resource=resource,
+            use_raw=False,
+        )
 
         sq.gr.spatial_autocorr(lrdata, mode='moran', use_raw=False)
         svis = lrdata.uns['moranI'].index[(lrdata.uns['moranI']['pval_norm_fdr_bh'] <= 0.05) & (lrdata.uns['moranI']['I'] > 0.01)]
@@ -2497,14 +2506,41 @@ def main():
 
         sc.pl.embedding(nmf, basis=spatial_key, color=[cell_type_col, 'leiden'], size=s, ncols=2)
 
+        stratified_subsample_applied = False
+        if subsample_n is not None and subsample_n < nmf.n_obs:
+            y = nmf.obs[cell_type_col].astype(str).to_numpy()
+            try:
+                sss = StratifiedShuffleSplit(
+                    n_splits=1, train_size=subsample_n, random_state=0
+                )
+                train_idx, _ = next(sss.split(np.zeros((nmf.n_obs, 1)), y))
+            except ValueError:
+                # Too few cells per class (or similar) for stratified split.
+                train_idx = np.random.default_rng(0).choice(
+                    nmf.n_obs, size=subsample_n, replace=False
+                )
+            chosen = nmf.obs_names[train_idx].tolist()
+            nmf = nmf[chosen].copy()
+            adata = adata[chosen].copy()
+            stratified_subsample_applied = True
+
         ## GW distance
         X_nmf = nmf.X
-        X_source = adata.obsm['MultiGATE'][keep_nmf]
+        if stratified_subsample_applied:
+            X_source = np.asarray(adata.obsm["MultiGATE"])
+        else:
+            X_source = adata.obsm["MultiGATE"][keep_nmf]
         C_nmf = ot.utils.dist(X_nmf, metric='euclidean')
         C_source = ot.utils.dist(X_source, metric='euclidean')
-        C_nmf = C_nmf / C_nmf.max()
-        C_source = C_source / C_source.max()
-        gw_distance = ot.gromov.entropic_gromov_wasserstein2(C_nmf, C_source, epsilon=1e-2)
+        C_nmf = torch.from_numpy(C_nmf / C_nmf.max()).to('cuda:2', dtype=torch.float64)
+        C_source = torch.from_numpy(C_source / C_source.max()).to('cuda:2', dtype=torch.float64)
+        gw_distance = ot.gromov.entropic_gromov_wasserstein2(C_nmf, C_source, eps=1e-2)
+        #gw_distance = ot.gaussian.gaussian_gromov_wasserstein_distance(C_nmf, C_source, log=True)[0]
+        gw_distance = 0.5 * gw_distance.sqrt().item()
+
+        del C_nmf, C_source
+        torch.cuda.empty_cache()
+        gc.collect()
 
         # Return a dictionary of useful results, or could just not return if only for plotting side-effects
         return {
@@ -2616,6 +2652,7 @@ def main():
     ## LIANA+ inflow analysis
     source_liana_results = liana_spatial_analysis(
         source_rna,
+        subsample_n=5000,
         resource=resource,
         labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
         )
@@ -2623,35 +2660,63 @@ def main():
 
     target_liana_results = liana_spatial_analysis(
         target_rna,
+        subsample_n=5000,
         resource=resource,
         labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
         )
     print(f'GW distance: {target_liana_results["gw_distance"]:.2f}')
 
-    Xs = source_rna.obsm['MultiGATE']
-    #Xt = liana_results['lrdata'].obsm['NMF_W']
-    Xt = target_rna.obsm['MultiGATE']
-    print(f'Xs shape: {Xs.shape}, Xt shape: {Xt.shape}')
+    ## compare ARI between NMF leiden and source, target and nonspatial-source leiden
+    nmf = source_liana_results['nmf'].copy()
 
-    '''
-    ot_mapping_linear = ot.da.MappingTransport(
-        kernel="linear", mu=1e0, eta=1e-8, bias=True, max_iter=5, verbose=True
-    )
-    ot_mapping_linear.fit(Xs=Xs, Xt=Xt)
-    '''
+    from sklearn.metrics import adjusted_rand_score
+    source_leiden = source_concat_adata[
+            source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
+            source_concat_adata.obs['modality'].eq('rna')
+            ].obs['leiden']
+    source_leiden.index = source_leiden.index.str.split("_").str[0]
+    source_leiden = source_leiden.loc[nmf.obs_names]
+    nmf_leiden = nmf.obs['leiden']
+    assert source_leiden.index.equals(nmf_leiden.index)
+    print(f'Adjusted Rand Score: {adjusted_rand_score(source_leiden, nmf_leiden):.2f}')
 
-    res = ot.solve_sample(Xs, Xt)
-    G = res.plan
-    transp_Xs_linear = G @ Xt
+    target_leiden = target_concat_adata[
+            target_concat_adata.obs['source_obs_names'].str.split("_").str[0].isin(nmf.obs_names) &
+            target_concat_adata.obs['modality'].eq('rna')
+            ].obs.set_index('source_obs_names')['leiden']
+    target_leiden.index = target_leiden.index.str.split("_").str[0]
+    overlap = target_leiden.index.intersection(nmf.obs_names)
 
-    X_nmf = liana_results['lrdata'].obsm['NMF_W']
-    C_nmf = ot.utils.dist(X_nmf, metric='euclidean')
-    C_nmf = C_nmf / C_nmf.max()
-    C_source_transp = ot.utils.dist(transp_Xs_linear, metric='euclidean')
-    C_source_transp = C_source_transp / C_source_transp.max()
-    gw_distance = ot.gromov.entropic_gromov_wasserstein2(C_nmf, C_source_transp, epsilon=1e-2)
-    print(f'GW distance: {gw_distance:.2f}')
+    # Drop duplicate indices in target_leiden via majority voting
+    # Find duplicated indices
+    duplicated = target_leiden.index[target_leiden.index.duplicated(keep=False)]
+    if len(duplicated) > 0:
+        # For each duplicated index, assign label by majority vote
+        maj_labels = (
+            target_leiden[duplicated]
+            .groupby(level=0)
+            .agg(lambda x: x.value_counts().idxmax())
+        )
+        # Remove all duplicates
+        target_leiden = target_leiden[~target_leiden.index.duplicated(keep=False)]
+        # Add back the majority-vote labels
+        target_leiden = pd.concat([target_leiden, maj_labels]).sort_index()
 
+    target_leiden = target_leiden.loc[overlap]
+    nmf_leiden = nmf.obs['leiden'].loc[overlap]
+    target_leiden = target_leiden.loc[nmf_leiden.index]
+    assert target_leiden.index.equals(nmf_leiden.index)
+    print(f'Adjusted Rand Score: {adjusted_rand_score(target_leiden, nmf_leiden):.2f}')
+
+    nonspatial_source_leiden = nonspatial_source_concat_adata[
+            nonspatial_source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
+            nonspatial_source_concat_adata.obs['modality'].eq('rna')
+            ].obs['leiden']
+    nonspatial_source_leiden.index = nonspatial_source_leiden.index.str.split("_").str[0]
+    nonspatial_source_leiden = nonspatial_source_leiden.loc[nmf.obs_names]
+    nmf_leiden = nmf.obs['leiden']
+    assert nonspatial_source_leiden.index.equals(nmf_leiden.index)
+    print(f'Adjusted Rand Score: {adjusted_rand_score(nonspatial_source_leiden, nmf_leiden):.2f}')
 
     #%% embedding-to-gene modelling
     from sklearn.cross_decomposition import PLSRegression
