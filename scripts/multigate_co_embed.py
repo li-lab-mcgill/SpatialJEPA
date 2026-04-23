@@ -2669,6 +2669,26 @@ def main():
         labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
         )
 
+    ## LIANA-MultiGATE heatmaps
+    from scipy.stats import rankdata
+    adata = source_liana_results['adata'].copy()
+    nmf = source_liana_results['nmf'].copy()
+    x1 = adata.obsm['MultiGATE']
+    x2 = nmf.X
+    x1 = rankdata(x1, axis=0)
+    x2 = rankdata(x2, axis=0)
+    #x1 = np.argsort(x1, axis=0)
+    #x2 = np.argsort(x2, axis=0)
+    corrs = np.corrcoef(x1, x2, rowvar=False)
+    corrs = corrs[x1.shape[1]:, :x1.shape[1]]
+    corrs_df = pd.DataFrame(corrs, index=nmf.var_names.str.replace('Factor', 'NMF'))
+    topk=3
+    corrs_order = pd.Series(corrs_df.apply(lambda x: corrs_df.index[np.argsort(x)[:topk]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values.tolist()
+    corr_top = corrs_df.loc[corrs_order]
+    cg = sns.clustermap(corr_top, cmap='coolwarm', center=0.0, vmax=0.4, figsize=(9.5, 5))
+    cg.ax_heatmap.set_xlabel('MultiGATE dimensions')
+    plt.show()
+
     ## compare ARI between NMF leiden and source, target and nonspatial-source leiden
     from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
