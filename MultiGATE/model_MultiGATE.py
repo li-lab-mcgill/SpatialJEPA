@@ -56,7 +56,7 @@ class MGATE(nn.Module):
         weight_decay=0.0001,
         vgp_anchor_mode="spot",
         skip_gp_attention=True,
-        linear_etm_decoder=True,
+        linear_etm_decoder=False,
         etm_emb_dim: Optional[int]=None,
         rho_rna_mask: Optional[torch.Tensor]=None,
         rho_atac_mask: Optional[torch.Tensor]=None,

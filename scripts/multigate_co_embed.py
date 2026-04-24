@@ -1625,7 +1625,7 @@ def main():
 
     ## set leiden resolution
     leiden_resolution = 0.5
-    leiden_neighbors = 100
+    leiden_neighbors = 10
 
     ## compute UMAPs
     compute_concat_umap(
