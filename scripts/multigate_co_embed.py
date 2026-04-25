@@ -1815,13 +1815,19 @@ def main():
         plt.tight_layout(); plt.show()
 
     #%% FASTopic
+
+    # source_rna.write_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
+    # source_atac.write_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
+
     from fastopics_utils import fit_fastopic
 
     rna_counts = source_rna.layers['counts'].copy()
     atac_counts = source_atac.layers['counts'].copy()
-    top_words, doc_topic_dist = fit_fastopic(rna_counts, source_rna.var_names)
-    print(top_words)
-    print(doc_topic_dist)
+    fixed_embeddings = source_rna.obsm["MultiGATE"].copy()
+
+    top_genes, cell_topic_dist = fit_fastopic(rna_counts, source_rna.var_names, fixed_embeddings)
+    print(top_genes)
+    print(cell_topic_dist)
 
     #%% analysis of linear decoder
     from sklearn.metrics.pairwise import euclidean_distances
