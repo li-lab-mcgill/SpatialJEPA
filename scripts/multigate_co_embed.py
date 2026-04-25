@@ -1252,7 +1252,7 @@ def main():
     #%% ── MLflow setup ────────────────────────────────────────────────────────
     #bash /home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/scripts/start_mlflow_services.sh all
 
-    #args.run_name = '20260421_102505' #'20260402_153455'
+    #args.run_name = '20260402_153455' #'20260402_153455'
     #args.stage2_run_name = '20260402_153455_stage2_20260402_165006'
     #sqlite_tracking_uri = "sqlite:////home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db"
     #postgres_tracking_uri = "http://127.0.0.1:5000"
@@ -1698,7 +1698,7 @@ def main():
             sc.pl.umap(target_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
         plt.tight_layout(); plt.show()
 
-    #%% Inference, all same model
+    #%% Inference, all same model (except nonspatial source inference)
 
     model = source_mgate
 
@@ -1723,10 +1723,18 @@ def main():
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
+    ## nonspatial source inference
+    nonspatial_source_rna_emb, nonspatial_source_atac_emb = run_inference(
+        nonspatial_source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+    )
+    set_multigate_embeddings(source_rna, source_atac, nonspatial_source_rna_emb, nonspatial_source_atac_emb, key_added="MultiGATE_nonspatial")
+    print("  Nonspatial source embeddings: shape {}".format(nonspatial_source_rna_emb.shape))
+
     ## concatenate modalities
     teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher")
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
+    nonspatial_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_nonspatial")
 
     ## add spatial coordinates
     teacher_source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
