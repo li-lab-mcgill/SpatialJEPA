@@ -1814,6 +1814,14 @@ def main():
         sc.pl.umap(target_concat_adata, color=['modality', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
 
+    #%% FASTopic
+    from fastopics_utils import fit_fastopic
+
+    rna_counts = source_rna.layers['counts'].copy()
+    atac_counts = source_atac.layers['counts'].copy()
+    top_words, doc_topic_dist = fit_fastopic(rna_counts, source_rna.var_names)
+    print(top_words)
+    print(doc_topic_dist)
 
     #%% analysis of linear decoder
     from sklearn.metrics.pairwise import euclidean_distances
