@@ -3,7 +3,7 @@ from fastopic import FASTopic
 import scipy.sparse as sp
 import numpy as np
 
-__all__ = ["NumericPreprocess"]
+__all__ = ["NumericPreprocess", "fit_fastopic"]
 
 class NumericPreprocess:
     def __init__(self, X_csr, gene_names):
@@ -21,32 +21,55 @@ class NumericPreprocess:
             "vocab": vocab            # List[str]
         }
 
-def fit_fastopic(X, genes, num_topics=50):
-    # 1) Get numeric matrix and gene names
-    X = rna_counts              # cells × genes
-    genes = source_rna.var_names  # iterable of gene names
+class PresetOnlyDocEmbedder:
+    def encode(self, docs):
+        raise RuntimeError("preset_doc_embeddings must be provided for FASTopic.")
 
-    # 2) Wrap in NumericPreprocess
+def fit_fastopic(X, genes, fixed_embeddings, num_topics=50):
+    # 1) Wrap numeric matrix and gene names.
     preprocess = NumericPreprocess(X, genes)
+    fixed_embeddings = np.asarray(fixed_embeddings, dtype=np.float32)
 
-    # 3) Build dummy docs (ignored by our preprocess)
-    n_cells = X.shape[0]
+    if preprocess.X_csr.shape[0] != fixed_embeddings.shape[0]:
+        raise ValueError(
+            "X and fixed_embeddings must have the same number of cells: "
+            f"{preprocess.X_csr.shape[0]} != {fixed_embeddings.shape[0]}"
+        )
+    if preprocess.X_csr.shape[1] != len(preprocess.vocab):
+        raise ValueError(
+            "X and genes must have the same number of genes: "
+            f"{preprocess.X_csr.shape[1]} != {len(preprocess.vocab)}"
+        )
+
+    # 2) Build dummy docs (ignored by our preprocess).
+    n_cells = preprocess.X_csr.shape[0]
     dummy_docs = ["x"] * n_cells   # any constant string
 
-    # 4) Instantiate FASTopic
-    num_topics = 50
+    # 3) Instantiate FASTopic with a no-op embedder to avoid text model downloads.
     model = FASTopic(num_topics, preprocess=preprocess,
+                    doc_embed_model=PresetOnlyDocEmbedder(),
                     low_memory=True, low_memory_batch_size=2000)
 
-    # 5) Fit model; this will call NumericPreprocess.preprocess(dummy_docs),
-    # use your X as train_bow, and ignore the text content of dummy_docs.
-    top_words, doc_topic_dist = model.fit_transform(dummy_docs)
+    # 4) Fit using counts as bag-of-genes and fixed embeddings as document embeddings.
+    top_words, doc_topic_dist = model.fit_transform(
+        dummy_docs,
+        preset_doc_embeddings=fixed_embeddings,
+    )
     return top_words, doc_topic_dist
 
 if __name__ == "__main__":
     import scanpy as sc
-    source_rna = sc.read_h5ad("/home/mcb/users/dmannk/BAKLAVA_base/data/Spatial_ATAC_RNA/mouse/spatial_omics/spatial_atac_rna_seq_mouse_brain.h5ad")
-    rna_counts = source_rna.layers["counts"]
-    top_words, doc_topic_dist = fit_fastopic(rna_counts, source_rna.var_names)
-    print(top_words)
-    print(doc_topic_dist)
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    
+    source_rna = sc.read_h5ad("/Users/dmannk/BAKLAVA_base/data/aligned_data/source_rna_aligned_with_latents.h5ad")
+    
+    fixed_embeddings = source_rna.obsm["MultiGATE"].copy()
+    rna_counts = source_rna.layers["counts"].copy()
+
+    top_genes, cell_topic_dist = fit_fastopic(rna_counts, source_rna.var_names, fixed_embeddings)
+    print(top_genes)
+    print(cell_topic_dist)
+
+    sns.clustermap(cell_topic_dist, vmax=0.1)
+    plt.show()
