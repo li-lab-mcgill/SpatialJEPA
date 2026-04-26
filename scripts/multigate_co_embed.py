@@ -1892,24 +1892,33 @@ def main():
     print(top_terms_per_topic)
 
     ## plot leading edge genes for each topic
-    topic_to_plot = "topic_30"
-    best = (
-        gsea_long[gsea_long["topic"] == topic_to_plot]
-        .sort_values("padj")
-        .iloc[0]["pathway"]
-    )
-    leading_edge_df = (
-        topic_gene_weight_mat.loc[topic_to_plot]
-        .rename("topic_gene_weight")
-        .to_frame()
-    )
-    fig_leading_edge, leading_edge_genes = dc.pl.leading_edge(
-        leading_edge_df,
-        net=net,
-        stat="topic_gene_weight",
-        name=best,
-    )
-    plt.tight_layout(); plt.show()
+    hits_per_topic = gsea_padj.le(0.05).sum(1).sort_values(ascending=False)
+    significant_pathways_per_topic = gsea_padj.apply(lambda row: row[row.le(0.05)].index.tolist(), axis=1).to_dict()
+    significant_pathways_per_topic = {k: v for k, v in significant_pathways_per_topic.items() if len(v) > 0}
+    
+    for topic_to_plot, pathways in significant_pathways_per_topic.items():
+        leading_edge_df = (
+            topic_gene_weight_mat.loc[topic_to_plot]
+            .rename("topic_gene_weight")
+            .to_frame()
+        )
+        for pathway in pathways:
+            leading_edge_fig, leading_edge_genes = dc.pl.leading_edge(
+                leading_edge_df,
+                net=net,
+                stat="topic_gene_weight",
+                name=pathway,
+                return_fig=True,
+            )
+            nes = gsea_scores.loc[topic_to_plot, pathway]
+            padj = gsea_padj.loc[topic_to_plot, pathway]
+            for ax in leading_edge_fig.axes:
+                ax.set_title("")
+            leading_edge_fig.suptitle(
+                f"{topic_to_plot} | {pathway}\nNES={nes:.2f}, adj. p={padj:.2e}",
+                y=1.02,
+            )
+            leading_edge_fig.show()
 
 
     #%% analysis of linear decoder
