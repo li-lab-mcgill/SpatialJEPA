@@ -1829,27 +1829,241 @@ def main():
     target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_fastopic.h5ad"))
 
     ## extract fastopic results
-    cell_topic_dist = source_rna.obsm['fastopic_cell_topic_dist'].copy()
-    topic_global_weights = source_rna.uns['fastopic_global_weights'].copy()
-    topic_by_genes = source_rna.varm['fastopic_genes_topic_weights'].T.copy()
+    def _extract_fastopic_topic_gene_weights(adata, net):
+        """Build the topic-by-gene weight matrix from FASTopic obsm/uns/varm keys.
 
-    topic_by_genes_df = pd.DataFrame(topic_by_genes, columns=source_rna.var_names, index=[f'topic_{i}' for i in range(len(topic_by_genes))])
-    topic_by_genes_sorted = topic_by_genes_df.T.apply(lambda x: x.sort_values(ascending=False), axis=0, result_type='reduce').to_dict()
+        Returns
+        -------
+        topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
+            Topics ordered by descending global weight, cleaned of inf/NaN columns.
+        sorted_topics : np.ndarray
+            Topic indices in descending global-weight order.
+        net : pd.DataFrame
+            Hallmark net filtered to genes present in topic_gene_weight_mat.
+        """
+        topic_global_weights = adata.uns['fastopic_global_weights'].copy()
+        topic_by_genes = adata.varm['fastopic_genes_topic_weights'].T.copy()
+        topic_by_genes_df = pd.DataFrame(
+            topic_by_genes,
+            columns=adata.var_names,
+            index=[f'topic_{i}' for i in range(len(topic_by_genes))],
+        )
+        sorted_topics = np.flip(np.argsort(topic_global_weights))
 
-    sorted_topics = np.flip(np.argsort(topic_global_weights))
-    top_topic_by_genes = {f'topic_{i}': topic_by_genes_sorted[f'topic_{i}'] for i in sorted_topics}
+        plt.figure(figsize=(12, 5))
+        plt.plot(topic_by_genes_df.index[sorted_topics], topic_global_weights[sorted_topics], marker='o')
+        plt.xticks(rotation=45); plt.tight_layout(); plt.show()
 
-    plt.figure(figsize=(12, 5))
-    plt.plot(topic_by_genes_df.index[sorted_topics], topic_global_weights[sorted_topics], marker='o')
-    plt.xticks(rotation=45); plt.tight_layout(); plt.show()
+        topic_gene_weight_mat = topic_by_genes_df.loc[[f"topic_{i}" for i in sorted_topics]].copy()
+        topic_gene_weight_mat = topic_gene_weight_mat.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="any")
 
-    ## perform gene-set enrichment for each latent topic.
-    ## Rows are topics and columns are genes; values are topic-gene weights used as
-    ## the ranking statistic for GSEA, not cell-by-gene expression/counts.
+        net_filtered = net[net["target"].isin(topic_gene_weight_mat.columns)].copy()
+        if net_filtered.empty:
+            raise ValueError("No Hallmark mouse genes overlap with topic-gene weight columns.")
+
+        return topic_gene_weight_mat, sorted_topics, net_filtered
+
+    def run_topic_gsea(topic_gene_weight_mat, net, tmin=3, times=1000, seed=42, padj_thresh=0.05):
+        """Run decoupler GSEA over a topic-by-gene weight matrix.
+
+        Each row (topic) is treated as an independent ranked gene list; topic-gene
+        weights serve as the ranking statistic, not expression counts.
+
+        Returns
+        -------
+        dict with keys:
+            gsea_scores, gsea_padj, gsea_long, gsea_long_filt, top_terms_per_topic
+        """
+        import decoupler as dc
+
+        gsea_scores, gsea_padj = dc.mt.gsea(
+            topic_gene_weight_mat,
+            net,
+            tmin=tmin,
+            times=times,
+            seed=seed,
+            verbose=True,
+        )
+        gsea_long = (
+            gsea_scores.stack()
+            .rename("nes")
+            .to_frame()
+            .join(gsea_padj.stack().rename("padj"))
+            .reset_index()
+            .rename(columns={"level_0": "topic", "level_1": "pathway"})
+            .sort_values(["topic", "padj", "nes"], ascending=[True, True, False])
+        )
+        top_terms_per_topic = gsea_long.groupby("topic", group_keys=False).head(10)
+        print(top_terms_per_topic)
+
+        significant_pathways_per_topic = (
+            gsea_padj.apply(lambda row: row[row.le(padj_thresh)].index.tolist(), axis=1)
+            .to_dict()
+        )
+        significant_pathways_per_topic = {
+            k: v for k, v in significant_pathways_per_topic.items() if len(v) > 0
+        }
+        for topic_to_plot, pathways in significant_pathways_per_topic.items():
+            leading_edge_df = (
+                topic_gene_weight_mat.loc[topic_to_plot]
+                .rename("topic_gene_weight")
+                .to_frame()
+            )
+            for pathway in pathways:
+                leading_edge_fig, _ = dc.pl.leading_edge(
+                    leading_edge_df,
+                    net=net,
+                    stat="topic_gene_weight",
+                    name=pathway,
+                    return_fig=True,
+                )
+                nes = gsea_scores.loc[topic_to_plot, pathway]
+                padj = gsea_padj.loc[topic_to_plot, pathway]
+                for ax in leading_edge_fig.axes:
+                    ax.set_title("")
+                leading_edge_fig.suptitle(
+                    f"{topic_to_plot} | {pathway}\nNES={nes:.2f}, adj. p={padj:.2e}",
+                    y=1.02,
+                )
+                leading_edge_fig.show()
+
+        return dict(
+            gsea_scores=gsea_scores,
+            gsea_padj=gsea_padj,
+            gsea_long=gsea_long,
+            gsea_long_filt=gsea_long[gsea_long["padj"].le(padj_thresh)],
+            top_terms_per_topic=top_terms_per_topic,
+        )
+
+    def run_topic_ora(topic_gene_weight_mat, net, ora_tmin=3, padj_thresh=0.05):
+        """Run hypergeometric ORA for each topic using a triangle-threshold gene cutoff.
+
+        Top genes per topic are selected by a global triangle threshold applied to the
+        flattened topic-gene weight distribution.  Background is the scored gene universe
+        (columns of topic_gene_weight_mat).
+
+        Returns
+        -------
+        dict with keys:
+            knee_value, top_genes_per_topic, ora_long, ora_long_filt, top_ora_terms_per_topic
+        """
+        from skimage.filters import threshold_triangle
+        from statsmodels.stats.multitest import multipletests
+        import scipy.stats
+
+        global_topic_gene_weights = (
+            topic_gene_weight_mat.melt()["value"]
+            .dropna()
+            .sort_values(ascending=False)
+            .reset_index(drop=True)
+        )
+        knee_value = threshold_triangle(global_topic_gene_weights.values)
+        knee_index = int(np.argmin(np.abs(global_topic_gene_weights.values - knee_value)))
+
+        plt.figure(figsize=(3, 3))
+        global_topic_gene_weights.plot()
+        plt.scatter(knee_index, knee_value, color='red', label=f"knee={knee_value:.2e}")
+        plt.legend(); plt.tight_layout(); plt.show()
+        plt.close()
+
+        top_genes_per_topic = {
+            topic: (
+                topic_gene_weight_mat.loc[topic][topic_gene_weight_mat.loc[topic].ge(knee_value)]
+                .sort_values(ascending=False)
+                .index.astype(str)
+                .tolist()
+            )
+            for topic in topic_gene_weight_mat.index
+        }
+
+        ora_net = net[net["target"].isin(topic_gene_weight_mat.columns)].copy()
+        ora_net = ora_net[
+            ora_net["source"].isin(
+                ora_net.groupby("source")["target"].nunique()[lambda s: s.ge(ora_tmin)].index
+            )
+        ].copy()
+
+        background_genes = set(topic_gene_weight_mat.columns.astype(str))
+        background_n = len(background_genes)
+        ora_results = []
+
+        for topic, top_genes in top_genes_per_topic.items():
+            top_gene_set = set(top_genes)
+            query_n = len(top_gene_set)
+            for pathway, pathway_df in ora_net.groupby("source"):
+                pathway_genes = set(pathway_df["target"].astype(str)) & background_genes
+                pathway_n = len(pathway_genes)
+                if pathway_n < ora_tmin:
+                    continue
+                overlap_genes = sorted(top_gene_set & pathway_genes)
+                overlap_n = len(overlap_genes)
+                pval = scipy.stats.hypergeom.sf(overlap_n - 1, background_n, pathway_n, query_n)
+                ora_results.append(dict(
+                    topic=topic,
+                    pathway=pathway,
+                    overlap_n=overlap_n,
+                    query_n=query_n,
+                    pathway_n=pathway_n,
+                    background_n=background_n,
+                    overlap_genes=",".join(overlap_genes),
+                    pval=pval,
+                ))
+
+        ora_long = pd.DataFrame(ora_results)
+        if ora_long.empty:
+            print("No ORA results produced. Consider lowering ora_tmin.")
+            return dict(
+                knee_value=knee_value,
+                top_genes_per_topic=top_genes_per_topic,
+                ora_long=ora_long,
+                ora_long_filt=ora_long,
+                top_ora_terms_per_topic=ora_long,
+            )
+
+        ora_long["padj"] = multipletests(ora_long["pval"], method="fdr_bh")[1]
+        ora_long = ora_long.sort_values(["topic", "padj", "overlap_n"], ascending=[True, True, False])
+        ora_long_filt = ora_long[ora_long["padj"].le(padj_thresh)]
+        top_ora_terms_per_topic = ora_long.groupby("topic", group_keys=False).head(10)
+        print(top_ora_terms_per_topic)
+
+        return dict(
+            knee_value=knee_value,
+            top_genes_per_topic=top_genes_per_topic,
+            ora_long=ora_long,
+            ora_long_filt=ora_long_filt,
+            top_ora_terms_per_topic=top_ora_terms_per_topic,
+        )
+
+    def run_gsea_ora_overlap(gsea_long_filt, ora_long_filt):
+        """Compute per-topic Jaccard similarity between significant GSEA and ORA pathways.
+
+        Returns
+        -------
+        gsea_ora_jaccard : pd.Series
+            Per-topic Jaccard index, sorted descending.
+        """
+        gsea_hits_per_topic = (
+            gsea_long_filt.groupby("topic", group_keys=False)["pathway"].apply(np.unique)
+        )
+        ora_hits_per_topic = (
+            ora_long_filt.groupby("topic", group_keys=False)["pathway"].apply(np.unique)
+        )
+        topics_union = set(gsea_hits_per_topic.index) | set(ora_hits_per_topic.index)
+        gsea_ora_jaccard = {}
+        for topic in topics_union:
+            gsea_paths = set(gsea_hits_per_topic.get(topic, []))
+            ora_paths = set(ora_hits_per_topic.get(topic, []))
+            union_n = len(gsea_paths | ora_paths)
+            gsea_ora_jaccard[topic] = (
+                len(gsea_paths & ora_paths) / union_n if union_n > 0 else 0.0
+            )
+        gsea_ora_jaccard = pd.Series(gsea_ora_jaccard).sort_values(ascending=False)
+        print("GSEA vs. ORA Jaccard similarity:")
+        print(gsea_ora_jaccard)
+        return gsea_ora_jaccard
+
+    ## build shared Hallmark mouse net once
     import decoupler as dc
-
-    topic_gene_weight_mat = topic_by_genes_df.loc[[f"topic_{i}" for i in sorted_topics]].copy()
-    topic_gene_weight_mat = topic_gene_weight_mat.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="any")
 
     hallmark_human = dc.op.hallmark(organism="human")
     map_path = os.path.join(os.environ["DATAPATH"], "gene_annotations", "human_mouse_gene_orthologs.csv")
@@ -1861,175 +2075,32 @@ def main():
         .dropna()
         .drop_duplicates()
     )
-
-    net = (
+    hallmark_mouse_net = (
         hallmark_human.rename(columns={"target": "target_human"})
         .merge(map_df, on="target_human", how="inner")[["source", "target"]]
         .drop_duplicates()
     )
-    net = net[net["target"].isin(topic_gene_weight_mat.columns)].copy()
-    if net.empty:
-        raise ValueError("No Hallmark mouse genes overlap with topic-gene weight columns.")
 
-    gsea_scores, gsea_padj = dc.mt.gsea(
-        topic_gene_weight_mat,
-        net,
-        tmin=3,
-        times=1000,
-        seed=42,
-        verbose=True,
+    ## run for source_rna
+    source_topic_mat, source_sorted_topics, source_net = _extract_fastopic_topic_gene_weights(
+        source_rna, hallmark_mouse_net,
     )
-    gsea_long = (
-        gsea_scores.stack()
-        .rename("nes")
-        .to_frame()
-        .join(gsea_padj.stack().rename("padj"))
-        .reset_index()
-        .rename(columns={"level_0": "topic", "level_1": "pathway"})
-        .sort_values(["topic", "padj", "nes"], ascending=[True, True, False])
+    source_gsea = run_topic_gsea(source_topic_mat, source_net)
+    source_ora  = run_topic_ora(source_topic_mat, source_net)
+
+    ## run for target_rna
+    target_topic_mat, target_sorted_topics, target_net = _extract_fastopic_topic_gene_weights(
+        target_rna, hallmark_mouse_net,
     )
-    top_terms_per_topic = gsea_long.groupby("topic", group_keys=False).head(10)
-    print(top_terms_per_topic)
-
-    ## plot leading edge genes for each topic
-    hits_per_topic = gsea_padj.le(0.05).sum(1).sort_values(ascending=False)
-    significant_pathways_per_topic = gsea_padj.apply(lambda row: row[row.le(0.05)].index.tolist(), axis=1).to_dict()
-    significant_pathways_per_topic = {k: v for k, v in significant_pathways_per_topic.items() if len(v) > 0}
-    
-    for topic_to_plot, pathways in significant_pathways_per_topic.items():
-        leading_edge_df = (
-            topic_gene_weight_mat.loc[topic_to_plot]
-            .rename("topic_gene_weight")
-            .to_frame()
-        )
-        for pathway in pathways:
-            leading_edge_fig, leading_edge_genes = dc.pl.leading_edge(
-                leading_edge_df,
-                net=net,
-                stat="topic_gene_weight",
-                name=pathway,
-                return_fig=True,
-            )
-            nes = gsea_scores.loc[topic_to_plot, pathway]
-            padj = gsea_padj.loc[topic_to_plot, pathway]
-            for ax in leading_edge_fig.axes:
-                ax.set_title("")
-            leading_edge_fig.suptitle(
-                f"{topic_to_plot} | {pathway}\nNES={nes:.2f}, adj. p={padj:.2e}",
-                y=1.02,
-            )
-            leading_edge_fig.show()
-
-    gsea_long_filt = gsea_long[gsea_long["padj"].le(0.05)]
-
-    ## Over-Representation Analysis for top genes per topic
-    from skimage.filters import threshold_triangle
-    import scipy.stats
-
-    global_topic_gene_weights = (
-        topic_gene_weight_mat.melt()["value"]
-        .dropna()
-        .sort_values(ascending=False)
-        .reset_index(drop=True)
-    )
-    knee_value = threshold_triangle(global_topic_gene_weights.values)
-    knee_index = np.argmin(np.abs(global_topic_gene_weights.values - knee_value))
-    global_topic_gene_weights.plot()
-    plt.scatter(knee_index, knee_value, color='red')
-    plt.tight_layout(); plt.show()
-
-    ora_tmin = 3
-
-    top_genes_per_topic = {
-        topic: (
-            topic_gene_weight_mat.loc[topic][topic_gene_weight_mat.loc[topic].ge(knee_value)]
-            .sort_values(ascending=False)
-            .index
-            .astype(str)
-            .tolist()
-        )
-        for topic in topic_gene_weight_mat.index
-    }
-
-    # Keep only gene sets with enough overlap in the scored 4,000-gene universe.
-    ora_net = net[net["target"].isin(topic_gene_weight_mat.columns)].copy()
-    ora_pathway_overlap = (
-        ora_net.groupby("source")["target"]
-        .nunique()
-        .sort_values(ascending=False)
-    )
-    ora_net = ora_net[
-        ora_net["source"].isin(ora_pathway_overlap[ora_pathway_overlap.ge(ora_tmin)].index)
-    ].copy()
-
-    ora_results = []
-    background_genes = set(topic_gene_weight_mat.columns.astype(str))
-    background_n = len(background_genes)
-
-    for topic, top_genes in top_genes_per_topic.items():
-        top_gene_set = set(top_genes)
-        query_n = len(top_gene_set)
-
-        for pathway, pathway_df in ora_net.groupby("source"):
-            pathway_genes = set(pathway_df["target"].astype(str))
-            pathway_genes = pathway_genes & background_genes
-
-            pathway_n = len(pathway_genes)
-            overlap_genes = sorted(top_gene_set & pathway_genes)
-            overlap_n = len(overlap_genes)
-
-            if pathway_n < ora_tmin:
-                continue
-
-            # Hypergeometric over-representation:
-            # probability of observing >= overlap_n pathway genes in top-10 genes
-            # given pathway_n pathway genes in background_n total genes.
-            pval = scipy.stats.hypergeom.sf(
-                overlap_n - 1,
-                background_n,
-                pathway_n,
-                query_n,
-            )
-
-            ora_results.append({
-                "topic": topic,
-                "pathway": pathway,
-                "overlap_n": overlap_n,
-                "query_n": query_n,
-                "pathway_n": pathway_n,
-                "background_n": background_n,
-                "overlap_genes": ",".join(overlap_genes),
-                "pval": pval,
-            })
-
-    ora_long = pd.DataFrame(ora_results)
-
-    if not ora_long.empty:
-        from statsmodels.stats.multitest import multipletests
-
-        ora_long["padj"] = multipletests(ora_long["pval"], method="fdr_bh")[1]
-        ora_long = ora_long.sort_values(
-            ["padj", "overlap_n"],
-            ascending=[True, False],
-        )
-        ora_long_filt = ora_long[ora_long["padj"].le(0.05)]
-        top_ora_terms_per_topic = ora_long.groupby("topic", group_keys=False).head(10)
-        print(top_ora_terms_per_topic)
-    else:
-        print("No ORA results produced. Consider lowering ora_tmin or increasing ora_top_n.")
+    target_gsea = run_topic_gsea(target_topic_mat, target_net)
+    target_ora  = run_topic_ora(target_topic_mat, target_net)
 
     ## compute jaccard similarity between GSEA and ORA results
-    gsea_hits_per_topic = gsea_long_filt.groupby("topic", group_keys=False)['pathway'].apply(np.unique)
-    ora_hits_per_topic = ora_long_filt.groupby("topic", group_keys=False)['pathway'].apply(np.unique)
-    topics_union = set(gsea_hits_per_topic.keys()) | set(ora_hits_per_topic.keys())
-    gsea_ora_jaccard = {}
-    for topic in topics_union:
-        gsea_genes = gsea_hits_per_topic.get(topic, [])
-        ora_genes = ora_hits_per_topic.get(topic, [])
-        gsea_ora_jaccard[topic] = len(set(gsea_genes) & set(ora_genes)) / len(set(gsea_genes) | set(ora_genes))
-    gsea_ora_jaccard = pd.Series(gsea_ora_jaccard).sort_values(ascending=False)
-    print('GSEA vs. ORA Jaccard similarity:')
-    print(gsea_ora_jaccard)
+    source_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], source_ora["ora_long_filt"])
+    target_jaccard = run_gsea_ora_overlap(target_gsea["gsea_long_filt"], target_ora["ora_long_filt"])
+
+    gsea_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], target_gsea["gsea_long_filt"])
+    ora_jaccard = run_gsea_ora_overlap(source_ora["ora_long_filt"], target_ora["ora_long_filt"])
 
 
     #%% analysis of linear decoder
