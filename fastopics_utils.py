@@ -3,6 +3,7 @@ from fastopic import FASTopic
 
 import scipy.sparse as sp
 import numpy as np
+import os
 
 __all__ = ["NumericPreprocess", "fit_fastopic"]
 
@@ -49,7 +50,7 @@ def fit_fastopic(X, genes, fixed_embeddings, num_topics=50):
     # 3) Instantiate FASTopic with a no-op embedder to avoid text model downloads.
     model = FASTopic(num_topics, preprocess=preprocess,
                     doc_embed_model=PresetOnlyDocEmbedder(),
-                    low_memory=True, low_memory_batch_size=2000,
+                    low_memory=False, low_memory_batch_size=2000,
                     verbose=True)
 
     # 4) Fit using counts as bag-of-genes and fixed embeddings as document embeddings.
@@ -72,16 +73,30 @@ def run_fastopic(adata):
     fixed_embeddings = adata.obsm["MultiGATE"].copy()
     rna_counts = adata.layers["counts"].copy()
     fastopic_model, top_genes, cell_topic_dist = fit_fastopic(rna_counts, adata.var_names, fixed_embeddings)
-    export_adata_with_fastopic(fastopic_model, cell_topic_dist, adata)
     return fastopic_model, cell_topic_dist
 
-def visualize_fastopic_model(fastopic_model):
+def visualize_fastopic_model(fastopic_model, domain_name):
+    outpath = os.path.join(os.getenv('OUTPATH'), "fastopic_visualizations", domain_name)
+    os.makedirs(outpath, exist_ok=True)
+
+    def _save_plotly_figure(fig, out_png_path):
+        try:
+            fig.write_image(out_png_path)
+        except Exception as exc:
+            out_html_path = os.path.splitext(out_png_path)[0] + ".html"
+            print(f"[WARN] Could not export PNG ({out_png_path}): {exc}")
+            print(f"[WARN] Falling back to HTML export: {out_html_path}")
+            fig.write_html(out_html_path)
+
     fig = fastopic_model.visualize_topic(top_n=4)
-    fig.show()
+    _save_plotly_figure(fig, os.path.join(outpath, "fastopic_topic_visualization.png"))
+
     fig = fastopic_model.visualize_topic_hierarchy()
-    fig.show()
+    _save_plotly_figure(fig, os.path.join(outpath, "fastopic_topic_hierarchy_visualization.png"))
+
     fig = fastopic_model.visualize_topic_weights(top_n=20, height=500)
-    fig.show()
+    _save_plotly_figure(fig, os.path.join(outpath, "fastopic_topic_weights_visualization.png"))
+
     return
 
 #%%
@@ -94,16 +109,27 @@ if __name__ == "__main__":
     
     source_rna = ad.read_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", "source_rna_aligned_with_latents.h5ad"))
     source_atac = ad.read_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", "source_atac_aligned_with_latents.h5ad"))
+
+    target_rna = ad.read_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", "target_rna_aligned_with_latents.h5ad"))
+    target_atac = ad.read_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", "target_atac_aligned_with_latents.h5ad"))
     
     #%% fit FASTopic model
     source_rna_fastopic_model, source_rna_cell_topic_dist = run_fastopic(source_rna)
     source_atac_fastopic_model, source_atac_cell_topic_dist = run_fastopic(source_atac)
 
-    #%% visualize FASTopic model
-    visualize_fastopic_model(source_rna_fastopic_model)
-    visualize_fastopic_model(source_atac_fastopic_model)
+    target_rna_fastopic_model, target_rna_cell_topic_dist = run_fastopic(target_rna)
+    target_atac_fastopic_model, target_atac_cell_topic_dist = run_fastopic(target_atac)
 
+    #%% visualize FASTopic model
+    visualize_fastopic_model(source_rna_fastopic_model, "source_rna")
+    visualize_fastopic_model(source_atac_fastopic_model, "source_atac")
+
+    visualize_fastopic_model(target_rna_fastopic_model, "target_rna")
+    visualize_fastopic_model(target_atac_fastopic_model, "target_atac")
+    
     #%% Extract export variables from FASTopic model
     export_adata_with_fastopic(source_rna_fastopic_model, source_rna_cell_topic_dist, source_rna, "source_rna_aligned_with_fastopic.h5ad")
     export_adata_with_fastopic(source_atac_fastopic_model, source_atac_cell_topic_dist, source_atac, "source_atac_aligned_with_fastopic.h5ad")
-    
+
+    export_adata_with_fastopic(target_rna_fastopic_model, target_rna_cell_topic_dist, target_rna, "target_rna_aligned_with_fastopic.h5ad")
+    export_adata_with_fastopic(target_atac_fastopic_model, target_atac_cell_topic_dist, target_atac, "target_atac_aligned_with_fastopic.h5ad")
