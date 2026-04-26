@@ -1920,6 +1920,117 @@ def main():
             )
             leading_edge_fig.show()
 
+    gsea_long_filt = gsea_long[gsea_long["padj"].le(0.05)]
+
+    ## Over-Representation Analysis for top genes per topic
+    from skimage.filters import threshold_triangle
+    import scipy.stats
+
+    global_topic_gene_weights = (
+        topic_gene_weight_mat.melt()["value"]
+        .dropna()
+        .sort_values(ascending=False)
+        .reset_index(drop=True)
+    )
+    knee_value = threshold_triangle(global_topic_gene_weights.values)
+    knee_index = np.argmin(np.abs(global_topic_gene_weights.values - knee_value))
+    global_topic_gene_weights.plot()
+    plt.scatter(knee_index, knee_value, color='red')
+    plt.tight_layout(); plt.show()
+
+    ora_tmin = 3
+
+    top_genes_per_topic = {
+        topic: (
+            topic_gene_weight_mat.loc[topic][topic_gene_weight_mat.loc[topic].ge(knee_value)]
+            .sort_values(ascending=False)
+            .index
+            .astype(str)
+            .tolist()
+        )
+        for topic in topic_gene_weight_mat.index
+    }
+
+    # Keep only gene sets with enough overlap in the scored 4,000-gene universe.
+    ora_net = net[net["target"].isin(topic_gene_weight_mat.columns)].copy()
+    ora_pathway_overlap = (
+        ora_net.groupby("source")["target"]
+        .nunique()
+        .sort_values(ascending=False)
+    )
+    ora_net = ora_net[
+        ora_net["source"].isin(ora_pathway_overlap[ora_pathway_overlap.ge(ora_tmin)].index)
+    ].copy()
+
+    ora_results = []
+    background_genes = set(topic_gene_weight_mat.columns.astype(str))
+    background_n = len(background_genes)
+
+    for topic, top_genes in top_genes_per_topic.items():
+        top_gene_set = set(top_genes)
+        query_n = len(top_gene_set)
+
+        for pathway, pathway_df in ora_net.groupby("source"):
+            pathway_genes = set(pathway_df["target"].astype(str))
+            pathway_genes = pathway_genes & background_genes
+
+            pathway_n = len(pathway_genes)
+            overlap_genes = sorted(top_gene_set & pathway_genes)
+            overlap_n = len(overlap_genes)
+
+            if pathway_n < ora_tmin:
+                continue
+
+            # Hypergeometric over-representation:
+            # probability of observing >= overlap_n pathway genes in top-10 genes
+            # given pathway_n pathway genes in background_n total genes.
+            pval = scipy.stats.hypergeom.sf(
+                overlap_n - 1,
+                background_n,
+                pathway_n,
+                query_n,
+            )
+
+            ora_results.append({
+                "topic": topic,
+                "pathway": pathway,
+                "overlap_n": overlap_n,
+                "query_n": query_n,
+                "pathway_n": pathway_n,
+                "background_n": background_n,
+                "overlap_genes": ",".join(overlap_genes),
+                "pval": pval,
+            })
+
+    ora_long = pd.DataFrame(ora_results)
+
+    if not ora_long.empty:
+        from statsmodels.stats.multitest import multipletests
+
+        ora_long["padj"] = multipletests(ora_long["pval"], method="fdr_bh")[1]
+        ora_long = ora_long.sort_values(
+            ["padj", "overlap_n"],
+            ascending=[True, False],
+        )
+        ora_long_filt = ora_long[ora_long["padj"].le(0.05)]
+        top_ora_terms_per_topic = ora_long.groupby("topic", group_keys=False).head(10)
+        print(top_ora_terms_per_topic)
+    else:
+        print("No ORA results produced. Consider lowering ora_tmin or increasing ora_top_n.")
+
+    ## compute jaccard similarity between GSEA and ORA results
+    gsea_hits_per_topic = gsea_long_filt.groupby("topic", group_keys=False)['pathway'].apply(np.unique)
+    ora_hits_per_topic = ora_long_filt.groupby("topic", group_keys=False)['pathway'].apply(np.unique)
+    topics_union = set(gsea_hits_per_topic.keys()) | set(ora_hits_per_topic.keys())
+    gsea_ora_jaccard = {}
+    for topic in topics_union:
+        gsea_genes = gsea_hits_per_topic.get(topic, [])
+        ora_genes = ora_hits_per_topic.get(topic, [])
+        gsea_ora_jaccard[topic] = len(set(gsea_genes) & set(ora_genes)) / len(set(gsea_genes) | set(ora_genes))
+    gsea_ora_jaccard = pd.Series(gsea_ora_jaccard).sort_values(ascending=False)
+    print('GSEA vs. ORA Jaccard similarity:')
+    print(gsea_ora_jaccard)
+
 
     #%% analysis of linear decoder
     from sklearn.metrics.pairwise import euclidean_distances
