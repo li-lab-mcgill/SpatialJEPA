@@ -59,6 +59,31 @@ def fit_fastopic(X, genes, fixed_embeddings, num_topics=50):
     )
     return model, top_words, doc_topic_dist
 
+def export_adata_with_fastopic(fastopic_model, cell_topic_dist, adata, filename):
+    topic_by_genes = fastopic_model.get_beta()
+    topic_weights = fastopic_model.get_topic_weights()
+    adata.obsm['fastopic_cell_topic_dist'] = cell_topic_dist
+    adata.varm['fastopic_genes_topic_weights'] = topic_by_genes.T
+    adata.uns['fastopic_global_weights'] = topic_weights
+    adata.write_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", filename))
+    return
+
+def run_fastopic(adata):
+    fixed_embeddings = adata.obsm["MultiGATE"].copy()
+    rna_counts = adata.layers["counts"].copy()
+    fastopic_model, top_genes, cell_topic_dist = fit_fastopic(rna_counts, adata.var_names, fixed_embeddings)
+    export_adata_with_fastopic(fastopic_model, cell_topic_dist, adata)
+    return fastopic_model, cell_topic_dist
+
+def visualize_fastopic_model(fastopic_model):
+    fig = fastopic_model.visualize_topic(top_n=4)
+    fig.show()
+    fig = fastopic_model.visualize_topic_hierarchy()
+    fig.show()
+    fig = fastopic_model.visualize_topic_weights(top_n=20, height=500)
+    fig.show()
+    return
+
 #%%
 if __name__ == "__main__":
 #%%
@@ -68,23 +93,17 @@ if __name__ == "__main__":
     load_dotenv('/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env')
     
     source_rna = ad.read_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", "source_rna_aligned_with_latents.h5ad"))
+    source_atac = ad.read_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", "source_atac_aligned_with_latents.h5ad"))
     
-    fixed_embeddings = source_rna.obsm["MultiGATE"].copy()
-    rna_counts = source_rna.layers["counts"].copy()
-
     #%% fit FASTopic model
-    fastopic_model, top_genes, cell_topic_dist = fit_fastopic(rna_counts, source_rna.var_names, fixed_embeddings)
-    
+    source_rna_fastopic_model, source_rna_cell_topic_dist = run_fastopic(source_rna)
+    source_atac_fastopic_model, source_atac_cell_topic_dist = run_fastopic(source_atac)
+
     #%% visualize FASTopic model
+    visualize_fastopic_model(source_rna_fastopic_model)
+    visualize_fastopic_model(source_atac_fastopic_model)
 
-    ## Visualize topic-word distributions
-    fig = fastopic_model.visualize_topic(top_n=4)
-    fig.show()
-
-    ## Visualize topic hierarchy
-    fig = fastopic_model.visualize_topic_hierarchy()
-    fig.show()
-
-    ## Visualize topic weights
-    fig = fastopic_model.visualize_topic_weights(top_n=20, height=500)
-    fig.show()
+    #%% Extract export variables from FASTopic model
+    export_adata_with_fastopic(source_rna_fastopic_model, source_rna_cell_topic_dist, source_rna, "source_rna_aligned_with_fastopic.h5ad")
+    export_adata_with_fastopic(source_atac_fastopic_model, source_atac_cell_topic_dist, source_atac, "source_atac_aligned_with_fastopic.h5ad")
+    
