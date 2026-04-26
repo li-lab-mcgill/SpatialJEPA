@@ -1814,20 +1814,103 @@ def main():
         sc.pl.umap(target_concat_adata, color=['modality', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
 
-    #%% FASTopic
+    #%% Save adata for FASTopic analysis
 
-    # source_rna.write_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
-    # source_atac.write_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
+    ## write to disk
+    #source_rna.write_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
+    #source_atac.write_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
+    #target_rna.write_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
+    #target_atac.write_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
 
-    from fastopics_utils import fit_fastopic
+    ## load from disk, after FASTopic analysis
+    source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_with_fastopic.h5ad"))
+    source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned_with_fastopic.h5ad"))
+    target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_fastopic.h5ad"))
+    target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_fastopic.h5ad"))
 
-    rna_counts = source_rna.layers['counts'].copy()
-    atac_counts = source_atac.layers['counts'].copy()
-    fixed_embeddings = source_rna.obsm["MultiGATE"].copy()
+    ## extract fastopic results
+    cell_topic_dist = source_rna.obsm['fastopic_cell_topic_dist'].copy()
+    topic_global_weights = source_rna.uns['fastopic_global_weights'].copy()
+    topic_by_genes = source_rna.varm['fastopic_genes_topic_weights'].T.copy()
 
-    top_genes, cell_topic_dist = fit_fastopic(rna_counts, source_rna.var_names, fixed_embeddings)
-    print(top_genes)
-    print(cell_topic_dist)
+    topic_by_genes_df = pd.DataFrame(topic_by_genes, columns=source_rna.var_names, index=[f'topic_{i}' for i in range(len(topic_by_genes))])
+    topic_by_genes_sorted = topic_by_genes_df.T.apply(lambda x: x.sort_values(ascending=False), axis=0, result_type='reduce').to_dict()
+
+    sorted_topics = np.flip(np.argsort(topic_global_weights))
+    top_topic_by_genes = {f'topic_{i}': topic_by_genes_sorted[f'topic_{i}'] for i in sorted_topics}
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(topic_by_genes_df.index[sorted_topics], topic_global_weights[sorted_topics], marker='o')
+    plt.xticks(rotation=45); plt.tight_layout(); plt.show()
+
+    ## perform gene-set enrichment for each latent topic.
+    ## Rows are topics and columns are genes; values are topic-gene weights used as
+    ## the ranking statistic for GSEA, not cell-by-gene expression/counts.
+    import decoupler as dc
+
+    topic_gene_weight_mat = topic_by_genes_df.loc[[f"topic_{i}" for i in sorted_topics]].copy()
+    topic_gene_weight_mat = topic_gene_weight_mat.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="any")
+
+    hallmark_human = dc.op.hallmark(organism="human")
+    map_path = os.path.join(os.environ["DATAPATH"], "gene_annotations", "human_mouse_gene_orthologs.csv")
+    map_df = (
+        pd.read_csv(map_path)
+        .rename(columns={"Gene name": "target_human", "Mouse gene name": "target"})[
+            ["target_human", "target"]
+        ]
+        .dropna()
+        .drop_duplicates()
+    )
+
+    net = (
+        hallmark_human.rename(columns={"target": "target_human"})
+        .merge(map_df, on="target_human", how="inner")[["source", "target"]]
+        .drop_duplicates()
+    )
+    net = net[net["target"].isin(topic_gene_weight_mat.columns)].copy()
+    if net.empty:
+        raise ValueError("No Hallmark mouse genes overlap with topic-gene weight columns.")
+
+    gsea_scores, gsea_padj = dc.mt.gsea(
+        topic_gene_weight_mat,
+        net,
+        tmin=3,
+        times=1000,
+        seed=42,
+        verbose=True,
+    )
+    gsea_long = (
+        gsea_scores.stack()
+        .rename("nes")
+        .to_frame()
+        .join(gsea_padj.stack().rename("padj"))
+        .reset_index()
+        .rename(columns={"level_0": "topic", "level_1": "pathway"})
+        .sort_values(["topic", "padj", "nes"], ascending=[True, True, False])
+    )
+    top_terms_per_topic = gsea_long.groupby("topic", group_keys=False).head(10)
+    print(top_terms_per_topic)
+
+    ## plot leading edge genes for each topic
+    topic_to_plot = "topic_30"
+    best = (
+        gsea_long[gsea_long["topic"] == topic_to_plot]
+        .sort_values("padj")
+        .iloc[0]["pathway"]
+    )
+    leading_edge_df = (
+        topic_gene_weight_mat.loc[topic_to_plot]
+        .rename("topic_gene_weight")
+        .to_frame()
+    )
+    fig_leading_edge, leading_edge_genes = dc.pl.leading_edge(
+        leading_edge_df,
+        net=net,
+        stat="topic_gene_weight",
+        name=best,
+    )
+    plt.tight_layout(); plt.show()
+
 
     #%% analysis of linear decoder
     from sklearn.metrics.pairwise import euclidean_distances
