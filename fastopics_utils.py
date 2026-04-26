@@ -1,3 +1,4 @@
+#%%
 from fastopic import FASTopic
 
 import scipy.sparse as sp
@@ -48,28 +49,42 @@ def fit_fastopic(X, genes, fixed_embeddings, num_topics=50):
     # 3) Instantiate FASTopic with a no-op embedder to avoid text model downloads.
     model = FASTopic(num_topics, preprocess=preprocess,
                     doc_embed_model=PresetOnlyDocEmbedder(),
-                    low_memory=True, low_memory_batch_size=2000)
+                    low_memory=True, low_memory_batch_size=2000,
+                    verbose=True)
 
     # 4) Fit using counts as bag-of-genes and fixed embeddings as document embeddings.
     top_words, doc_topic_dist = model.fit_transform(
         dummy_docs,
         preset_doc_embeddings=fixed_embeddings,
     )
-    return top_words, doc_topic_dist
+    return model, top_words, doc_topic_dist
 
+#%%
 if __name__ == "__main__":
-    import scanpy as sc
-    import seaborn as sns
-    import matplotlib.pyplot as plt
+#%%
+    import anndata as ad
+    import os
+    from dotenv import load_dotenv
+    load_dotenv('/home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/.env')
     
-    source_rna = sc.read_h5ad("/Users/dmannk/BAKLAVA_base/data/aligned_data/source_rna_aligned_with_latents.h5ad")
+    source_rna = ad.read_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", "source_rna_aligned_with_latents.h5ad"))
     
     fixed_embeddings = source_rna.obsm["MultiGATE"].copy()
     rna_counts = source_rna.layers["counts"].copy()
 
-    top_genes, cell_topic_dist = fit_fastopic(rna_counts, source_rna.var_names, fixed_embeddings)
-    print(top_genes)
-    print(cell_topic_dist)
+    #%% fit FASTopic model
+    fastopic_model, top_genes, cell_topic_dist = fit_fastopic(rna_counts, source_rna.var_names, fixed_embeddings)
+    
+    #%% visualize FASTopic model
 
-    sns.clustermap(cell_topic_dist, vmax=0.1)
-    plt.show()
+    ## Visualize topic-word distributions
+    fig = fastopic_model.visualize_topic(top_n=4)
+    fig.show()
+
+    ## Visualize topic hierarchy
+    fig = fastopic_model.visualize_topic_hierarchy()
+    fig.show()
+
+    ## Visualize topic weights
+    fig = fastopic_model.visualize_topic_weights(top_n=20, height=500)
+    fig.show()
