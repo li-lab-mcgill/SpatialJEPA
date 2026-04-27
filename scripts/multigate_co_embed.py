@@ -1730,16 +1730,54 @@ def main():
     set_multigate_embeddings(source_rna, source_atac, nonspatial_source_rna_emb, nonspatial_source_atac_emb, key_added="MultiGATE_nonspatial")
     print("  Nonspatial source embeddings: shape {}".format(nonspatial_source_rna_emb.shape))
 
+    #%% OT from target to source
+    import ot
+
+    X = torch.tensor(target_rna.obsm['MultiGATE'], device='cuda')
+    Y = torch.tensor(source_rna.obsm['MultiGATE'], device='cuda')
+    res = ot.solve_sample(X, Y, metric='euclidean', reg=0.001)
+    X_to_Y = res.plan @ Y * len(Y)
+    target_rna.obsm['MultiGATE_source_aligned'] = X_to_Y.detach().cpu().numpy()
+    del X, Y, res, X_to_Y
+
+    X = torch.tensor(target_atac.obsm['MultiGATE'], device='cuda')
+    Y = torch.tensor(source_atac.obsm['MultiGATE'], device='cuda')
+    res = ot.solve_sample(X, Y, metric='euclidean', reg=0.001)
+    X_to_Y = res.plan @ Y * len(Y)
+    target_atac.obsm['MultiGATE_source_aligned'] = X_to_Y.detach().cpu().numpy()
+    del X, Y, res, X_to_Y
+
+    target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE_source_aligned")
+
+    compute_concat_umap(
+        target_concat_adata,
+        n_neighbors=10,
+        resolution=0.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
+
+    # plot target UMAPs
+    target_umap_colors = ['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster']
+    fig, axs = plt.subplots(1, len(target_umap_colors), figsize=(18, 5))
+    for i, color in enumerate(target_umap_colors):
+        sc.pl.umap(target_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+    plt.tight_layout(); plt.show()
+
+    #%% Analysis on concatenated data
+
     ## concatenate modalities
     teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher")
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
     nonspatial_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_nonspatial")
 
-    ## add spatial coordinates
-    teacher_source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
-    source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
-    nonspatial_source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
+    ## add spatial coordinates to concatenated source data
+    spatial_coords = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
+    teacher_source_concat_adata.obsm['spatial'] = spatial_coords
+    source_concat_adata.obsm['spatial'] = spatial_coords
+    nonspatial_source_concat_adata.obsm['spatial'] = spatial_coords
     #target_concat_adata.obsm['spatial'] = np.concatenate([target_rna.obsm['spatial'], target_atac.obsm['spatial']], axis=0)
 
     source_target_adata, source_concat_adata, target_concat_adata = run_alignment_and_spatial_plot(
