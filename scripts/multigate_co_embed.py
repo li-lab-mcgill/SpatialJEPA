@@ -1732,20 +1732,24 @@ def main():
 
     #%% OT from target to source
     import ot
+    import gc
 
     X = torch.tensor(target_rna.obsm['MultiGATE'], device='cuda')
     Y = torch.tensor(source_rna.obsm['MultiGATE'], device='cuda')
     res = ot.solve_sample(X, Y, metric='euclidean', reg=0.001)
-    X_to_Y = res.plan @ Y * len(Y)
+    X_to_Y = res.plan @ Y * len(X)
     target_rna.obsm['MultiGATE_source_aligned'] = X_to_Y.detach().cpu().numpy()
     del X, Y, res, X_to_Y
 
     X = torch.tensor(target_atac.obsm['MultiGATE'], device='cuda')
     Y = torch.tensor(source_atac.obsm['MultiGATE'], device='cuda')
     res = ot.solve_sample(X, Y, metric='euclidean', reg=0.001)
-    X_to_Y = res.plan @ Y * len(Y)
+    X_to_Y = res.plan @ Y * len(X)
     target_atac.obsm['MultiGATE_source_aligned'] = X_to_Y.detach().cpu().numpy()
     del X, Y, res, X_to_Y
+
+    torch.cuda.empty_cache()
+    gc.collect()
 
     target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE_source_aligned")
 
@@ -1764,6 +1768,32 @@ def main():
     for i, color in enumerate(target_umap_colors):
         sc.pl.umap(target_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
     plt.tight_layout(); plt.show()
+
+    ## concatenate source and target data
+    source_rna.obsm['MultiGATE_source_aligned'] = source_rna.obsm['MultiGATE']
+    source_atac.obsm['MultiGATE_source_aligned'] = source_atac.obsm['MultiGATE']
+    source_target_rna = sc.concat([source_rna, target_rna], axis=0)
+    source_target_atac = sc.concat([source_atac, target_atac], axis=0)
+    source_target_adata = build_concat_adata_for_umap(source_target_rna, source_target_atac, embedding_key="MultiGATE_source_aligned")
+
+    source_or_target = np.concatenate([
+        np.full(source_rna.n_obs, 'source'),
+        np.full(target_rna.n_obs, 'target'),
+        np.full(source_atac.n_obs, 'source'),
+        np.full(target_atac.n_obs, 'target'),
+        ])
+    source_target_adata.obs['source_or_target'] = source_or_target
+    
+    compute_concat_umap(
+        source_target_adata,
+        n_neighbors=10,
+        resolution=0.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+
+    sc.pl.umap(source_target_adata, color=['modality', 'leiden', 'source_or_target'], ncols=3, wspace=0.2, size=25)
+
 
     #%% Analysis on concatenated data
 
@@ -1855,6 +1885,8 @@ def main():
     #%% Save adata for FASTopic analysis
 
     ## write to disk
+    # for keys in (source_rna.obsm.keys(), source_atac.obsm.keys(), target_rna.obsm.keys(), target_atac.obsm.keys()):
+    #     assert 'MultiGATE_source_aligned' in keys, f"MultiGATE_source_aligned not found in {keys}"
     #source_rna.write_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
     #source_atac.write_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
     #target_rna.write_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
