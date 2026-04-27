@@ -1884,7 +1884,7 @@ def main():
 
     #%% Save adata for FASTopic analysis
 
-    ## write to disk
+    ## [COMMENTED OUT] write to disk
     # for keys in (source_rna.obsm.keys(), source_atac.obsm.keys(), target_rna.obsm.keys(), target_atac.obsm.keys()):
     #     assert 'MultiGATE_source_aligned' in keys, f"MultiGATE_source_aligned not found in {keys}"
     #source_rna.write_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
@@ -1911,7 +1911,7 @@ def main():
         net : pd.DataFrame
             Hallmark net filtered to genes present in topic_gene_weight_mat.
         """
-        topic_global_weights = adata.uns['fastopic_global_weights'].copy()
+        topic_global_weights = adata.uns['fastopic']['global_weights'].copy()
         topic_by_genes = adata.varm['fastopic_genes_topic_weights'].T.copy()
         topic_by_genes_df = pd.DataFrame(
             topic_by_genes,
@@ -2169,9 +2169,13 @@ def main():
     source_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], source_ora["ora_long_filt"])
     target_jaccard = run_gsea_ora_overlap(target_gsea["gsea_long_filt"], target_ora["ora_long_filt"])
 
-    gsea_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], target_gsea["gsea_long_filt"])
-    ora_jaccard = run_gsea_ora_overlap(source_ora["ora_long_filt"], target_ora["ora_long_filt"])
+    #gsea_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], target_gsea["gsea_long_filt"])
+    #ora_jaccard = run_gsea_ora_overlap(source_ora["ora_long_filt"], target_ora["ora_long_filt"])
 
+    shared_gsea_paths = set(source_gsea["gsea_long_filt"]['pathway']) & set(target_gsea["gsea_long_filt"]['pathway'])
+    shared_ora_paths = set(source_ora["ora_long_filt"]['pathway']) & set(target_ora["ora_long_filt"]['pathway'])
+    shared_paths = shared_gsea_paths & shared_ora_paths
+    print("Shared GSEA and ORA pathways across source and target:\n", shared_paths)
 
     #%% analysis of linear decoder
     from sklearn.metrics.pairwise import euclidean_distances
