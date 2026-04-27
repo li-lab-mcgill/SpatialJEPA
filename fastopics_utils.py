@@ -1,6 +1,8 @@
 #%%
 from fastopic import FASTopic
 
+import torch
+import gc
 import scipy.sparse as sp
 import numpy as np
 import os
@@ -26,6 +28,15 @@ class NumericPreprocess:
 class PresetOnlyDocEmbedder:
     def encode(self, docs):
         raise RuntimeError("preset_doc_embeddings must be provided for FASTopic.")
+
+def send_to_cpu(model):
+    model.model = model.model.to("cpu")
+    model.device = "cpu"
+    if hasattr(model, "train_doc_embeddings"):
+        model.train_doc_embeddings = model.train_doc_embeddings.cpu()
+    torch.cuda.empty_cache()
+    gc.collect()
+    return model
 
 def fit_fastopic(X, genes, fixed_embeddings, num_topics=50):
     # 1) Wrap numeric matrix and gene names.
@@ -60,10 +71,13 @@ def fit_fastopic(X, genes, fixed_embeddings, num_topics=50):
         preset_doc_embeddings=fixed_embeddings,
         epochs=1000,
     )
+
+    model = send_to_cpu(model)
+
     return model, top_words, doc_topic_dist
 
 def run_fastopic(adata):
-    fixed_embeddings = adata.obsm["MultiGATE"].copy()
+    fixed_embeddings = adata.obsm["MultiGATE_source_aligned"].copy()
     rna_counts = adata.layers["counts"].copy()
     fastopic_model, top_genes, cell_topic_dist = fit_fastopic(rna_counts, adata.var_names, fixed_embeddings)
     return fastopic_model, cell_topic_dist
