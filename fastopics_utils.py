@@ -51,29 +51,44 @@ def fit_fastopic(X, genes, fixed_embeddings, num_topics=50):
     model = FASTopic(num_topics, preprocess=preprocess,
                     doc_embed_model=PresetOnlyDocEmbedder(),
                     low_memory=False, low_memory_batch_size=2000,
+                    device="cuda",
                     verbose=True)
 
     # 4) Fit using counts as bag-of-genes and fixed embeddings as document embeddings.
     top_words, doc_topic_dist = model.fit_transform(
         dummy_docs,
         preset_doc_embeddings=fixed_embeddings,
+        epochs=1000,
     )
     return model, top_words, doc_topic_dist
-
-def export_adata_with_fastopic(fastopic_model, cell_topic_dist, adata, filename):
-    topic_by_genes = fastopic_model.get_beta()
-    topic_weights = fastopic_model.get_topic_weights()
-    adata.obsm['fastopic_cell_topic_dist'] = cell_topic_dist
-    adata.varm['fastopic_genes_topic_weights'] = topic_by_genes.T
-    adata.uns['fastopic_global_weights'] = topic_weights
-    adata.write_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", filename))
-    return
 
 def run_fastopic(adata):
     fixed_embeddings = adata.obsm["MultiGATE"].copy()
     rna_counts = adata.layers["counts"].copy()
     fastopic_model, top_genes, cell_topic_dist = fit_fastopic(rna_counts, adata.var_names, fixed_embeddings)
     return fastopic_model, cell_topic_dist
+
+def export_adata_with_fastopic(fastopic_model, cell_topic_dist, adata, filename):
+    topic_by_genes = fastopic_model.get_beta()
+    topic_weights = fastopic_model.get_topic_weights()
+    topic_embeddings = fastopic_model.topic_embeddings
+    gene_embeddings = fastopic_model.word_embeddings
+    beta = fastopic_model.get_beta()
+
+    uns = {
+        'global_weights': topic_weights,
+        'topic_embeddings': topic_embeddings,
+        'beta': beta
+    }
+
+    adata.obsm['fastopic_cell_topic_dist'] = cell_topic_dist
+    adata.varm['fastopic_genes_topic_weights'] = topic_by_genes.T
+    adata.varm['fastopic_gene_embeddings'] = gene_embeddings
+
+    adata.uns['fastopic'] = uns
+
+    adata.write_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", filename))
+    return
 
 def visualize_fastopic_model(fastopic_model, domain_name):
     outpath = os.path.join(os.getenv('OUTPATH'), "fastopic_visualizations", domain_name)
