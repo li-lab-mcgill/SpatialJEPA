@@ -79,7 +79,7 @@ def fit_fastopic(X, genes, fixed_embeddings, num_topics=50):
 def run_fastopic(adata):
     fixed_embeddings = adata.obsm["MultiGATE_source_aligned"].copy()
     rna_counts = adata.layers["counts"].copy()
-    fastopic_model, top_genes, cell_topic_dist = fit_fastopic(rna_counts, adata.var_names, fixed_embeddings)
+    fastopic_model, top_genes, cell_topic_dist = fit_fastopic(rna_counts, adata.var_names, fixed_embeddings, num_topics=20)
     return fastopic_model, cell_topic_dist
 
 def export_adata_with_fastopic(fastopic_model, cell_topic_dist, adata, filename):
