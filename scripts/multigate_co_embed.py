@@ -1962,8 +1962,21 @@ def main():
 
         return source_adata, target_adata
 
-    source_adata, target_adata = extract_fastopic_embeddings(source_rna, target_rna, modality='rna')
-    source_adata, target_adata = extract_fastopic_embeddings(source_atac, target_atac, modality='atac')
+    ## extract topic embeddings from source and target data
+    feature_topic_adatas = {}
+    feature_topic_adatas['source_rna'], feature_topic_adatas['target_rna'] = extract_fastopic_embeddings(source_rna, target_rna, modality='rna')
+    feature_topic_adatas['source_atac'], feature_topic_adatas['target_atac'] = extract_fastopic_embeddings(source_atac, target_atac, modality='atac')
+
+    ## compare topic embeddings across datasets and modalities
+    topic_embeddings = []
+    for dat in feature_topic_adatas.values():
+        embs = dat[dat.obs['gene_or_topic'].eq('topic')].X.copy()
+        topic_embeddings.append(embs)
+    topic_embeddings = np.concatenate(topic_embeddings, axis=0)
+    corr_matrix = np.corrcoef(topic_embeddings)
+    plt.figure(figsize=(12, 12))
+    sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0)
+    plt.tight_layout(); plt.show()
 
     #%% gene-set enrichment analysis
 
