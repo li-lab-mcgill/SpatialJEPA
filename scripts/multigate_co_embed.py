@@ -1898,6 +1898,59 @@ def main():
     target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_fastopic.h5ad"))
     target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_fastopic.h5ad"))
 
+    ## extract gene and topic embeddings from source and target data
+    source_gene_embeddings = source_rna.varm['fastopic_gene_embeddings'].copy()
+    target_gene_embeddings = target_rna.varm['fastopic_gene_embeddings'].copy()
+    source_topic_embeddings = source_rna.uns['fastopic']['topic_embeddings'].copy()
+    target_topic_embeddings = target_rna.uns['fastopic']['topic_embeddings'].copy()
+
+    ## form sinlge adata object
+    source_target_gene_embeddings = np.concatenate([source_gene_embeddings, target_gene_embeddings], axis=0)
+    source_target_topic_embeddings = np.concatenate([source_topic_embeddings, target_topic_embeddings], axis=0)
+    
+    gene_or_topic = np.concatenate([np.full(source_target_gene_embeddings.shape[0], 'gene'), np.full(source_target_topic_embeddings.shape[0], 'topic')])
+    source_or_target = np.concatenate([
+        np.full(source_gene_embeddings.shape[0], 'source'),
+        np.full(target_gene_embeddings.shape[0], 'target'),
+        np.full(source_topic_embeddings.shape[0], 'source'),
+        np.full(target_topic_embeddings.shape[0], 'target'),
+    ])
+
+    gene_topic_adata = sc.AnnData(
+        X = np.concatenate([source_target_gene_embeddings, source_target_topic_embeddings], axis=0),
+        obs = pd.DataFrame(
+            data = {'gene_or_topic': gene_or_topic, 'source_or_target': source_or_target},
+        )
+    )
+    gene_topic_adata.obs['combination'] = gene_topic_adata.obs['source_or_target'].astype(str) + '_' + gene_topic_adata.obs['gene_or_topic'].astype(str)
+
+    ## perform clustering and UMAP embedding on full gene and topic embeddings
+    sc.pp.neighbors(gene_topic_adata, use_rep='X', n_neighbors=10)
+    sc.tl.leiden(gene_topic_adata)
+    sc.tl.umap(gene_topic_adata, min_dist=0.3)
+    sc.pl.umap(gene_topic_adata, color=['source_or_target', 'gene_or_topic', 'leiden'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+
+    ## split adata object into source and target
+    source_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('source')]
+    target_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('target')]
+    
+    ## perform clustering and UMAP embedding on source and target gene embeddings
+    sc.pp.neighbors(source_adata, use_rep='X', n_neighbors=10)
+    sc.tl.leiden(source_adata)
+    sc.tl.umap(source_adata, min_dist=0.3)
+    sc.pl.umap(source_adata, color=['gene_or_topic', 'leiden'], ncols=2, wspace=0.2, \
+        size=source_adata.obs['gene_or_topic'].map({'gene':10, 'topic':150}))
+
+    ## perform clustering and UMAP embedding on source and target topic embeddings
+    sc.pp.neighbors(target_adata, use_rep='X', n_neighbors=10)
+    sc.tl.leiden(target_adata)
+    sc.tl.umap(target_adata, min_dist=0.3)
+    sc.pl.umap(target_adata, color=['gene_or_topic', 'leiden'], ncols=2, wspace=0.2, \
+        size=target_adata.obs['gene_or_topic'].map({'gene':10, 'topic':150}))
+
+    #%% gene-set enrichment analysis
+
     ## extract fastopic results
     def _extract_fastopic_topic_gene_weights(adata, net):
         """Build the topic-by-gene weight matrix from FASTopic obsm/uns/varm keys.
@@ -2176,55 +2229,6 @@ def main():
     shared_ora_paths = set(source_ora["ora_long_filt"]['pathway']) & set(target_ora["ora_long_filt"]['pathway'])
     shared_paths = shared_gsea_paths & shared_ora_paths
     print("Shared GSEA and ORA pathways across source and target:\n", shared_paths)
-
-    ## extract gene and topic embeddings from source and target data
-    source_gene_embeddings = source_rna.varm['fastopic_gene_embeddings'].copy()
-    target_gene_embeddings = target_rna.varm['fastopic_gene_embeddings'].copy()
-    source_topic_embeddings = source_rna.uns['fastopic']['topic_embeddings'].copy()
-    target_topic_embeddings = target_rna.uns['fastopic']['topic_embeddings'].copy()
-
-    ## form inslge adata object
-    source_target_gene_embeddings = np.concatenate([source_gene_embeddings, target_gene_embeddings], axis=0)
-    source_target_topic_embeddings = np.concatenate([source_topic_embeddings, target_topic_embeddings], axis=0)
-    
-    gene_or_topic = np.concatenate([np.full(source_target_gene_embeddings.shape[0], 'gene'), np.full(source_target_topic_embeddings.shape[0], 'topic')])
-    source_or_target = np.concatenate([
-        np.full(source_gene_embeddings.shape[0], 'source'),
-        np.full(target_gene_embeddings.shape[0], 'target'),
-        np.full(source_topic_embeddings.shape[0], 'source'),
-        np.full(target_topic_embeddings.shape[0], 'target'),
-    ])
-
-    gene_topic_adata = sc.AnnData(
-        X = np.concatenate([source_target_gene_embeddings, source_target_topic_embeddings], axis=0),
-        obs = pd.DataFrame(
-            data = {'gene_or_topic': gene_or_topic, 'source_or_target': source_or_target},
-        )
-    )
-    gene_topic_adata.obs['combination'] = gene_topic_adata.obs['source_or_target'].astype(str) + '_' + gene_topic_adata.obs['gene_or_topic'].astype(str)
-
-    ## perform clustering and UMAP embedding on full gene and topic embeddings
-    sc.pp.neighbors(gene_topic_adata, use_rep='X', n_neighbors=10)
-    sc.tl.leiden(gene_topic_adata)
-    sc.tl.umap(gene_topic_adata, min_dist=0.3)
-    sc.pl.umap(gene_topic_adata, color=['source_or_target', 'gene_or_topic', 'leiden'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
-
-    ## split adata object into source and target
-    source_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('source')]
-    target_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('target')]
-    
-    ## perform clustering and UMAP embedding on source and target gene embeddings
-    sc.pp.neighbors(source_adata, use_rep='X', n_neighbors=50)
-    sc.tl.leiden(source_adata)
-    sc.tl.umap(source_adata, min_dist=0.1)
-    sc.pl.umap(source_adata, color=['gene_or_topic', 'leiden'], ncols=2, wspace=0.2, size=25)
-
-    ## perform clustering and UMAP embedding on source and target topic embeddings
-    sc.pp.neighbors(target_adata, use_rep='X', n_neighbors=10)
-    sc.tl.leiden(target_adata)
-    sc.tl.umap(target_adata, min_dist=0.3)
-    sc.pl.umap(target_adata, color=['gene_or_topic', 'leiden'], ncols=2, wspace=0.2, size=25)
 
 
 
