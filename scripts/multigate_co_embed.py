@@ -1898,13 +1898,18 @@ def main():
     target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_fastopic.h5ad"))
     target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_fastopic.h5ad"))
 
-    def extract_fastopic_embeddings(source_adata, target_adata, modality):
+    def extract_fastopic_embeddings(source_adata, target_adata, modality, do_procrustes=False):
 
         ## extract gene and topic embeddings from source and target data
         source_gene_embeddings = source_adata.varm['fastopic_gene_embeddings'].copy()
         target_gene_embeddings = target_adata.varm['fastopic_gene_embeddings'].copy()
         source_topic_embeddings = source_adata.uns['fastopic']['topic_embeddings'].copy()
         target_topic_embeddings = target_adata.uns['fastopic']['topic_embeddings'].copy()
+
+        if do_procrustes:
+            from scipy.spatial import procrustes
+            source_gene_embeddings, target_gene_embeddings, disparity = procrustes(source_gene_embeddings, target_gene_embeddings)
+            source_topic_embeddings, target_topic_embeddings, disparity = procrustes(source_topic_embeddings, target_topic_embeddings)
 
         ## form sinlge adata object
         source_target_gene_embeddings = np.concatenate([source_gene_embeddings, target_gene_embeddings], axis=0)
