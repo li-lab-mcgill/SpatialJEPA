@@ -1884,6 +1884,8 @@ def main():
 
     #%% Save adata for FASTopic analysis
 
+    import decoupler as dc
+
     ## [COMMENTED OUT] write to disk
     # for keys in (source_rna.obsm.keys(), source_atac.obsm.keys(), target_rna.obsm.keys(), target_atac.obsm.keys()):
     #     assert 'MultiGATE_source_aligned' in keys, f"MultiGATE_source_aligned not found in {keys}"
@@ -1897,6 +1899,41 @@ def main():
     source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned_with_fastopic.h5ad"))
     target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_fastopic.h5ad"))
     target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_fastopic.h5ad"))
+
+    ## extract fastopic results
+    def _extract_fastopic_topic_gene_weights(adata, net):
+        """Build the topic-by-gene weight matrix from FASTopic obsm/uns/varm keys.
+
+        Returns
+        -------
+        topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
+            Topics ordered by descending global weight, cleaned of inf/NaN columns.
+        sorted_topics : np.ndarray
+            Topic indices in descending global-weight order.
+        net : pd.DataFrame
+            Hallmark net filtered to genes present in topic_gene_weight_mat.
+        """
+        topic_global_weights = adata.uns['fastopic']['global_weights'].copy()
+        topic_by_genes = adata.varm['fastopic_genes_topic_weights'].T.copy()
+        topic_by_genes_df = pd.DataFrame(
+            topic_by_genes,
+            columns=adata.var_names,
+            index=[f'topic_{i}' for i in range(len(topic_by_genes))],
+        )
+        sorted_topics = np.flip(np.argsort(topic_global_weights))
+
+        plt.figure(figsize=(12, 5))
+        plt.plot(topic_by_genes_df.index[sorted_topics], topic_global_weights[sorted_topics], marker='o')
+        plt.xticks(rotation=45); plt.tight_layout(); plt.show()
+
+        topic_gene_weight_mat = topic_by_genes_df.loc[[f"topic_{i}" for i in sorted_topics]].copy()
+        topic_gene_weight_mat = topic_gene_weight_mat.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="any")
+
+        net_filtered = net[net["target"].isin(topic_gene_weight_mat.columns)].copy()
+        if net_filtered.empty:
+            raise ValueError("No Hallmark mouse genes overlap with topic-gene weight columns.")
+
+        return topic_gene_weight_mat, sorted_topics, net_filtered
 
     def extract_fastopic_embeddings(source_adata, target_adata, modality, do_procrustes=False):
 
@@ -1967,13 +2004,54 @@ def main():
     feature_topic_adatas['source_rna'], feature_topic_adatas['target_rna'] = extract_fastopic_embeddings(source_rna, target_rna, modality='rna')
     feature_topic_adatas['source_atac'], feature_topic_adatas['target_atac'] = extract_fastopic_embeddings(source_atac, target_atac, modality='atac')
 
-    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['source_rna'], feature_topic_adatas['source_atac']], axis=0)
+    ## concat a subset of the feature topic adatas for visualization
+    '''
+    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['target_rna'], feature_topic_adatas['target_atac']], axis=0)
     sc.pp.neighbors(concat_feature_topic_adatas, use_rep='X', n_neighbors=10)
     sc.tl.leiden(concat_feature_topic_adatas)
     sc.tl.umap(concat_feature_topic_adatas, min_dist=0.3)
-    sc.pl.umap(concat_feature_topic_adatas, color=['gene_or_topic', 'source_or_target', 'leiden'], ncols=3, wspace=0.2,
-        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':5, 'peak':5, 'topic':150}))
+    umap_axes = sc.pl.umap(
+        concat_feature_topic_adatas,
+        color=['gene_or_topic', 'leiden'],
+        ncols=3,
+        wspace=0.2,
+        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':250}),
+        show=False,
+    )
+    topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
+    topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
+    n_topics = int(feature_topic_adatas['target_rna'].obs['gene_or_topic'].eq('topic').sum())
+    topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
+    for ax in np.atleast_1d(umap_axes):
+        for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
+            ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
     plt.tight_layout(); plt.show()
+    
+    '''
+    ## ingest ATAC embeddings into RNA UMAP
+    '''
+    sc.tl.ingest(feature_topic_adatas['target_atac'], feature_topic_adatas['target_rna'], embedding_method='umap')
+    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['target_rna'], feature_topic_adatas['target_atac']], axis=0)
+    sc.pp.neighbors(concat_feature_topic_adatas, use_rep='X', n_neighbors=10)
+    sc.tl.leiden(concat_feature_topic_adatas)
+
+    umap_axes = sc.pl.umap(
+        concat_feature_topic_adatas,
+        color=['gene_or_topic', 'leiden'],
+        ncols=3,
+        wspace=0.2,
+        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':250}),
+        show=False,
+    )
+    topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
+    topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
+    n_topics = int(feature_topic_adatas['target_rna'].obs['gene_or_topic'].eq('topic').sum())
+    topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
+    for ax in np.atleast_1d(umap_axes):
+        for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
+            ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
+    plt.tight_layout(); plt.show()
+    '''
 
     ## compare topic embeddings across datasets and modalities
     topic_embeddings = []
@@ -1988,46 +2066,36 @@ def main():
 
     topic_embeddings = np.concatenate(topic_embeddings, axis=0)
     corr_matrix = np.corrcoef(topic_embeddings)
-    plt.figure(figsize=(12, 12))
+    plt.figure(figsize=(5, 4))
     sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0)
     plt.tight_layout(); plt.show()
 
+    ## build shared Hallmark mouse net once
+    hallmark_human = dc.op.hallmark(organism="human")
+    map_path = os.path.join(os.environ["DATAPATH"], "gene_annotations", "human_mouse_gene_orthologs.csv")
+    map_df = (
+        pd.read_csv(map_path)
+        .rename(columns={"Gene name": "target_human", "Mouse gene name": "target"})[
+            ["target_human", "target"]
+        ]
+        .dropna()
+        .drop_duplicates()
+    )
+    hallmark_mouse_net = (
+        hallmark_human.rename(columns={"target": "target_human"})
+        .merge(map_df, on="target_human", how="inner")[["source", "target"]]
+        .drop_duplicates()
+    )
+
+    ## extract topic-by-gene weight matrix from source and target data
+    source_topic_mat, source_sorted_topics, source_net = _extract_fastopic_topic_gene_weights(
+        source_rna, hallmark_mouse_net,
+    )
+    target_topic_mat, target_sorted_topics, target_net = _extract_fastopic_topic_gene_weights(
+        target_rna, hallmark_mouse_net,
+    )
+
     #%% gene-set enrichment analysis
-
-    ## extract fastopic results
-    def _extract_fastopic_topic_gene_weights(adata, net):
-        """Build the topic-by-gene weight matrix from FASTopic obsm/uns/varm keys.
-
-        Returns
-        -------
-        topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
-            Topics ordered by descending global weight, cleaned of inf/NaN columns.
-        sorted_topics : np.ndarray
-            Topic indices in descending global-weight order.
-        net : pd.DataFrame
-            Hallmark net filtered to genes present in topic_gene_weight_mat.
-        """
-        topic_global_weights = adata.uns['fastopic']['global_weights'].copy()
-        topic_by_genes = adata.varm['fastopic_genes_topic_weights'].T.copy()
-        topic_by_genes_df = pd.DataFrame(
-            topic_by_genes,
-            columns=adata.var_names,
-            index=[f'topic_{i}' for i in range(len(topic_by_genes))],
-        )
-        sorted_topics = np.flip(np.argsort(topic_global_weights))
-
-        plt.figure(figsize=(12, 5))
-        plt.plot(topic_by_genes_df.index[sorted_topics], topic_global_weights[sorted_topics], marker='o')
-        plt.xticks(rotation=45); plt.tight_layout(); plt.show()
-
-        topic_gene_weight_mat = topic_by_genes_df.loc[[f"topic_{i}" for i in sorted_topics]].copy()
-        topic_gene_weight_mat = topic_gene_weight_mat.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="any")
-
-        net_filtered = net[net["target"].isin(topic_gene_weight_mat.columns)].copy()
-        if net_filtered.empty:
-            raise ValueError("No Hallmark mouse genes overlap with topic-gene weight columns.")
-
-        return topic_gene_weight_mat, sorted_topics, net_filtered
 
     def run_topic_gsea(topic_gene_weight_mat, net, tmin=3, times=1000, seed=42, padj_thresh=0.05):
         """Run decoupler GSEA over a topic-by-gene weight matrix.
@@ -2228,36 +2296,11 @@ def main():
         print(gsea_ora_jaccard)
         return gsea_ora_jaccard
 
-    ## build shared Hallmark mouse net once
-    import decoupler as dc
-
-    hallmark_human = dc.op.hallmark(organism="human")
-    map_path = os.path.join(os.environ["DATAPATH"], "gene_annotations", "human_mouse_gene_orthologs.csv")
-    map_df = (
-        pd.read_csv(map_path)
-        .rename(columns={"Gene name": "target_human", "Mouse gene name": "target"})[
-            ["target_human", "target"]
-        ]
-        .dropna()
-        .drop_duplicates()
-    )
-    hallmark_mouse_net = (
-        hallmark_human.rename(columns={"target": "target_human"})
-        .merge(map_df, on="target_human", how="inner")[["source", "target"]]
-        .drop_duplicates()
-    )
-
     ## run for source_rna
-    source_topic_mat, source_sorted_topics, source_net = _extract_fastopic_topic_gene_weights(
-        source_rna, hallmark_mouse_net,
-    )
     source_gsea = run_topic_gsea(source_topic_mat, source_net)
     source_ora  = run_topic_ora(source_topic_mat, source_net)
 
     ## run for target_rna
-    target_topic_mat, target_sorted_topics, target_net = _extract_fastopic_topic_gene_weights(
-        target_rna, hallmark_mouse_net,
-    )
     target_gsea = run_topic_gsea(target_topic_mat, target_net)
     target_ora  = run_topic_ora(target_topic_mat, target_net)
 
