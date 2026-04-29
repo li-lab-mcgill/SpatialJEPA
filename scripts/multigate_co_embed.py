@@ -2087,16 +2087,35 @@ def main():
 
     # 2) Load pathway gene sets / weights from decoupler
     #avail_resources = dc.op.show_resources()
+    #resource = dc.op.resource('HPA_secretome')
+
 
     # 3) Generate LR-level sender-receiver gene sets
-    lr_resource = li.rs.generate_lr_geneset(
+    lr_hallmark = li.rs.generate_lr_geneset(
         lr_pairs,
         hallmark_mouse_net,
         lr_sep="^",
         weight=None
     )
 
+    ortholog_mapper = map_df.set_index('target_human').to_dict()['target']
+    resource = dc.op.progeny(organism='human')
+    resource = resource.map(lambda x: ortholog_mapper.get(x, x) if pd.notnull(x) else x)
+
+    lr_resource = li.rs.generate_lr_geneset(
+        lr_pairs,
+        resource,
+        lr_sep="^",
+        weight=None
+    )
+
     ## create LR genesets
+    lr_hallmark_grouped_source = lr_hallmark.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[0].explode().tolist()))
+    lr_hallmark_grouped_target = lr_hallmark.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[1].explode().tolist()))
+    lr_hallmark_grouped = pd.concat([lr_hallmark_grouped_source.rename('source_genes'), lr_hallmark_grouped_target.rename('target_genes')], axis=1)
+    lr_hallmark_grouped['all_genes'] = lr_hallmark_grouped.apply(lambda x: list(x['source_genes']) + list(x['target_genes']), axis=1)
+    lr_hallmark_grouped.index.rename('pathway', inplace=True)
+
     lr_resource_grouped_source = lr_resource.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[0].explode().tolist()))
     lr_resource_grouped_target = lr_resource.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[1].explode().tolist()))
     lr_resource_grouped = pd.concat([lr_resource_grouped_source.rename('source_genes'), lr_resource_grouped_target.rename('target_genes')], axis=1)
@@ -2316,6 +2335,10 @@ def main():
                 no_plot=True,
                 outdir=None,
             )
+            if enr.res2d is None:
+                print(f"No ORA results produced for leiden {leiden}. Consider lowering ora_tmin.")
+                continue
+
             res = enr.res2d.copy()
             res_filt = res[res['Adjusted P-value'].le(padj_thresh)]
             filt_enr_per_leiden[leiden] = res_filt
@@ -2367,6 +2390,8 @@ def main():
 
     #source_gene_sets_dict = _net_to_gene_sets_dict(source_net)
     #target_gene_sets_dict = _net_to_gene_sets_dict(target_net)
+
+    #source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_hallmark_grouped, split_source_target=False)
     source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_resource_grouped, split_source_target=False)
 
     ## fetch background genes
