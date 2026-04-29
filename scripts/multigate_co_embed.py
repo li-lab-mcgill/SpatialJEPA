@@ -1967,11 +1967,25 @@ def main():
     feature_topic_adatas['source_rna'], feature_topic_adatas['target_rna'] = extract_fastopic_embeddings(source_rna, target_rna, modality='rna')
     feature_topic_adatas['source_atac'], feature_topic_adatas['target_atac'] = extract_fastopic_embeddings(source_atac, target_atac, modality='atac')
 
+    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['source_rna'], feature_topic_adatas['source_atac']], axis=0)
+    sc.pp.neighbors(concat_feature_topic_adatas, use_rep='X', n_neighbors=10)
+    sc.tl.leiden(concat_feature_topic_adatas)
+    sc.tl.umap(concat_feature_topic_adatas, min_dist=0.3)
+    sc.pl.umap(concat_feature_topic_adatas, color=['gene_or_topic', 'source_or_target', 'leiden'], ncols=3, wspace=0.2,
+        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':5, 'peak':5, 'topic':150}))
+    plt.tight_layout(); plt.show()
+
     ## compare topic embeddings across datasets and modalities
     topic_embeddings = []
     for dat in feature_topic_adatas.values():
         embs = dat[dat.obs['gene_or_topic'].eq('topic')].X.copy()
         topic_embeddings.append(embs)
+
+    if \
+        (topic_embeddings[0] == topic_embeddings[2]).all() and \
+        (topic_embeddings[1] == topic_embeddings[3]).all():
+        print("Tied topic embeddings confirmed.")
+
     topic_embeddings = np.concatenate(topic_embeddings, axis=0)
     corr_matrix = np.corrcoef(topic_embeddings)
     plt.figure(figsize=(12, 12))
