@@ -1981,31 +1981,6 @@ def main():
         )
         gene_topic_adata.obs['combination'] = gene_topic_adata.obs['source_or_target'].astype(str) + '_' + gene_topic_adata.obs['gene_or_topic'].astype(str)
 
-        ## perform clustering and UMAP embedding on full gene and topic embeddings
-        sc.pp.neighbors(gene_topic_adata, use_rep='X', n_neighbors=10)
-        sc.tl.leiden(gene_topic_adata)
-        sc.tl.umap(gene_topic_adata, min_dist=0.3)
-        sc.pl.umap(gene_topic_adata, color=['source_or_target', 'gene_or_topic', 'leiden'], ncols=3, wspace=0.2, size=25)
-        plt.tight_layout(); plt.show()
-
-        ## split adata object into source and target
-        source_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('source')]
-        target_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('target')]
-        
-        ## perform clustering and UMAP embedding on source and target gene embeddings
-        sc.pp.neighbors(source_adata, use_rep='X', n_neighbors=10)
-        sc.tl.leiden(source_adata)
-        sc.tl.umap(source_adata, min_dist=0.3)
-        sc.pl.umap(source_adata, color=['gene_or_topic', 'leiden'], ncols=2, wspace=0.2, \
-            size=source_adata.obs['gene_or_topic'].map({feature_type:10, 'topic':150}))
-
-        ## perform clustering and UMAP embedding on source and target topic embeddings
-        sc.pp.neighbors(target_adata, use_rep='X', n_neighbors=10)
-        sc.tl.leiden(target_adata)
-        sc.tl.umap(target_adata, min_dist=0.3)
-        sc.pl.umap(target_adata, color=['gene_or_topic', 'leiden'], ncols=2, wspace=0.2, \
-            size=target_adata.obs['gene_or_topic'].map({feature_type:10, 'topic':150}))
-
         return source_adata, target_adata
 
     ## extract topic embeddings from source and target data
@@ -2039,11 +2014,10 @@ def main():
     '''
     ## ingest ATAC embeddings into RNA UMAP
     '''
-    sc.tl.ingest(feature_topic_adatas['target_atac'], feature_topic_adatas['target_rna'], embedding_method='umap')
+    sc.pp.neighbors(feature_topic_adatas['target_rna'], use_rep='X', n_neighbors=10)
+    sc.tl.leiden(feature_topic_adatas['target_rna'], resolution=0.5)
+    sc.tl.ingest(feature_topic_adatas['target_atac'], feature_topic_adatas['target_rna'], embedding_method='umap', obs='leiden')
     concat_feature_topic_adatas = sc.concat([feature_topic_adatas['target_rna'], feature_topic_adatas['target_atac']], axis=0)
-    sc.pp.neighbors(concat_feature_topic_adatas, use_rep='X', n_neighbors=10)
-    sc.tl.leiden(concat_feature_topic_adatas)
-
     umap_axes = sc.pl.umap(
         concat_feature_topic_adatas,
         color=['gene_or_topic', 'leiden'],
@@ -2298,9 +2272,12 @@ def main():
 
     def run_topic_ora_leiden(feature_topic_adata, gene_sets_dict, background_genes, ora_tmin=3, padj_thresh=0.05):
 
-        index_per_leiden = feature_topic_adata.obs.groupby('leiden').apply(lambda x: x.index.tolist())
-        n_gene_topics_per_leiden = feature_topic_adata.obs.groupby('leiden')['gene_or_topic'].value_counts()
+        # Set categorical order so that 'topic' is before 'gene' in gene_or_topic
+        gene_topic_cat = pd.CategoricalDtype(['topic', 'gene'], ordered=True)
+        feature_topic_adata.obs['gene_or_topic'] = feature_topic_adata.obs['gene_or_topic'].astype(gene_topic_cat)
+        n_gene_topics_per_leiden = feature_topic_adata.obs.groupby('leiden')['gene_or_topic'].value_counts().sort_index(level=['leiden', 'gene_or_topic'])
         
+        index_per_leiden = feature_topic_adata.obs.groupby('leiden').apply(lambda x: x.index.tolist())
         filt_enr_per_leiden = {}
         for leiden, index in index_per_leiden.items():
             data = feature_topic_adata[index].copy()
@@ -2308,7 +2285,7 @@ def main():
             
             enr = gp.enrich(
                 gene_list=genes,
-                gene_sets=gene_sets_dict,
+                gene_sets='GO_Biological_Process_2025' if gene_sets_dict is None else gene_sets_dict,
                 background=background_genes,
                 cutoff=1.0,
                 no_plot=True,
@@ -2318,7 +2295,7 @@ def main():
             res_filt = res[res['Adjusted P-value'].le(padj_thresh)]
             filt_enr_per_leiden[leiden] = res_filt
 
-        return filt_enr_per_leiden
+        return filt_enr_per_leiden, n_gene_topics_per_leiden
             
 
     def run_gsea_ora_overlap(gsea_long_filt, ora_long_filt):
@@ -2361,11 +2338,11 @@ def main():
 
     ## run for source_rna
     source_gsea = run_topic_gsea(source_topic_mat, source_gene_sets_dict)
-    source_ora  = run_topic_ora_leiden(feature_topic_adatas['source_rna'], source_gene_sets_dict, background_genes, ora_tmin=3, padj_thresh=0.05)
+    source_ora, source_n_gene_topics_per_leiden = run_topic_ora_leiden(feature_topic_adatas['source_rna'], source_gene_sets_dict, background_genes)
 
     ## run for target_rna
     target_gsea = run_topic_gsea(target_topic_mat, target_gene_sets_dict)
-    target_ora  = run_topic_ora_leiden(feature_topic_adatas['target_rna'], target_gene_sets_dict, background_genes)
+    target_ora, target_n_gene_topics_per_leiden = run_topic_ora_leiden(feature_topic_adatas['target_rna'], target_gene_sets_dict, background_genes)
 
     ## compute jaccard similarity between GSEA and ORA results
     source_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], source_ora["ora_long_filt"])
