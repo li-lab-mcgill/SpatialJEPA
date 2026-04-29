@@ -2078,6 +2078,31 @@ def main():
         target_rna, hallmark_mouse_net,
     )
 
+    ## build LR-level sender-receiver gene sets
+    import liana as li
+    import decoupler as dc
+
+    # 1) Load ligand-receptor pairs from LIANA
+    lr_pairs = li.rs.select_resource('mouseconsensus')
+
+    # 2) Load pathway gene sets / weights from decoupler
+    #avail_resources = dc.op.show_resources()
+
+    # 3) Generate LR-level sender-receiver gene sets
+    lr_resource = li.rs.generate_lr_geneset(
+        lr_pairs,
+        hallmark_mouse_net,
+        lr_sep="^",
+        weight=None
+    )
+
+    ## create LR genesets
+    lr_resource_grouped_source = lr_resource.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[0].explode().tolist()))
+    lr_resource_grouped_target = lr_resource.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[1].explode().tolist()))
+    lr_resource_grouped = pd.concat([lr_resource_grouped_source.rename('source_genes'), lr_resource_grouped_target.rename('target_genes')], axis=1)
+    lr_resource_grouped['all_genes'] = lr_resource_grouped.apply(lambda x: list(x['source_genes']) + list(x['target_genes']), axis=1)
+    lr_resource_grouped.index.rename('pathway', inplace=True)
+
     #%% gene-set enrichment analysis
     import gseapy as gp
 
@@ -2327,22 +2352,33 @@ def main():
         return gsea_ora_jaccard
 
     ## convert net DataFrame to dict {pathway: [gene, ...]} for gseapy
-    def _net_to_gene_sets_dict(net):
-        return net.groupby("source")["target"].apply(list).to_dict()
+    def _net_to_gene_sets_dict(net, split_source_target=False):
+        if net.columns.equals(pd.Index(['source', 'target'])):
+            return net.groupby("source")["target"].apply(list).to_dict()
+        
+        if split_source_target: # split by source/sender and target/receiver (nothing to do with source/target data)
+            combined_gene_sets = {}
+            combined_gene_sets.update({str(idx) + '_source': genes for idx, genes in net['source_genes'].to_dict().items()})
+            combined_gene_sets.update({str(idx) + '_target': genes for idx, genes in net['target_genes'].to_dict().items()})
+            return combined_gene_sets
+        else:
+            return net['all_genes'].to_dict()
+   
 
-    source_gene_sets_dict = _net_to_gene_sets_dict(source_net)
-    target_gene_sets_dict = _net_to_gene_sets_dict(target_net)
+    #source_gene_sets_dict = _net_to_gene_sets_dict(source_net)
+    #target_gene_sets_dict = _net_to_gene_sets_dict(target_net)
+    source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_resource_grouped, split_source_target=False)
 
     ## fetch background genes
     background_genes = source_x1.columns.tolist()
 
-    ## run for source_rna
-    source_gsea = run_topic_gsea(source_topic_mat, source_gene_sets_dict)
+    ## run ORA
     source_ora, source_n_gene_topics_per_leiden = run_topic_ora_leiden(feature_topic_adatas['source_rna'], source_gene_sets_dict, background_genes)
-
-    ## run for target_rna
-    target_gsea = run_topic_gsea(target_topic_mat, target_gene_sets_dict)
     target_ora, target_n_gene_topics_per_leiden = run_topic_ora_leiden(feature_topic_adatas['target_rna'], target_gene_sets_dict, background_genes)
+
+    ## run GSEA
+    source_gsea = run_topic_gsea(source_topic_mat, source_gene_sets_dict)
+    target_gsea = run_topic_gsea(target_topic_mat, target_gene_sets_dict)
 
     ## compute jaccard similarity between GSEA and ORA results
     source_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], source_ora["ora_long_filt"])
