@@ -316,6 +316,22 @@ if __name__ == "__main__":
 
     target_rna = ad.read_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", "target_rna_aligned_with_latents.h5ad"))
     target_atac = ad.read_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", "target_atac_aligned_with_latents.h5ad"))
+
+    ## subsample genes & peaks
+    n_genes = 1000
+    source_rna = source_rna[:, source_rna.var['highly_variable_rank'].le(n_genes)].copy()
+    target_rna = target_rna[:, target_rna.var['highly_variable_rank'].le(n_genes)].copy()
+
+    gp_net = source_rna.uns['gene_peak_Net']
+    keep_peaks = gp_net[gp_net['Gene'].isin(source_rna.var_names)]['Peak'].unique()
+
+    source_atac = source_atac[:, source_atac.var_names.isin(keep_peaks)].copy()
+    target_atac = target_atac[:, target_atac.var_names.isin(keep_peaks)].copy()
+
+    source_atac = source_atac[:, source_atac.var['highly_variable_rank'].nsmallest(source_rna.n_vars).index].copy()
+    target_atac = target_atac[:, target_atac.var['highly_variable_rank'].nsmallest(target_rna.n_vars).index].copy()
+
+    print(f"Subsampled to {source_rna.shape[1]} genes and {source_atac.shape[1]} peaks.")
     
     #%% fit FASTopic model with tied (shared) topic embeddings within each domain
     (
