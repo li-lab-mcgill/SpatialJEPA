@@ -2396,10 +2396,6 @@ def load_and_prepare_data_bundle(args):
     target_atac = sc.read_h5ad(os.path.join(BASE_PATH, "target_atac_aligned.h5ad"))
     assert target_rna.obs_names.equals(target_atac.obs_names), "Target RNA and ATAC must have matching obs_names"
 
-    ## set SCT assay for source and target
-    source_rna.X = source_rna.layers["SCT"].copy()
-    target_rna.X = target_rna.layers["SCT"].copy()
-
     source_label_key = resolve_domain_label_key(
         source_rna,
         requested_key=args.source_label_key,

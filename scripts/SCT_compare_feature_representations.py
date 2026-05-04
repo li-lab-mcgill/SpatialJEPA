@@ -47,15 +47,14 @@ def run_SCTransform(adata, cell_type_key="RNA_clusters"):
         assay = "originalexp",
         vars.to.regress = "percent.mt",
         return.only.var.genes = FALSE,
-        do.correct.umi = FALSE,
-        verbose = FALSE
+        do.correct.umi = TRUE,
+        verbose = FALSE,
+        min_cells = 0
     )
 
     sct_genes <- VariableFeatures(res)
-    sct_scale <- GetAssayData(res, assay = "SCT", layer = "scale.data")
-    sct_scale <- sct_scale[sct_genes, , drop = FALSE]
 
-    res <- RunPCA(res, verbose = FALSE)
+    res <- RunPCA(res, verbose = FALSE, features = rownames(res)) # use rownames of res to avoid dropping genes
     res <- RunUMAP(res, dims = 1:30, verbose = FALSE)
 
     res <- FindNeighbors(res, dims = 1:30, verbose = FALSE)
@@ -70,15 +69,17 @@ def run_SCTransform(adata, cell_type_key="RNA_clusters"):
     adata.obs = seurat_obs.copy()
     assert adata.obs['percent.mt'].sum() > 0, "Percent mitochondrial genes is 0, likely due to wrong pattern for mitochondrial genes"
 
-    seurat_pca = ro.r('res@reductions$pca@cell.embeddings')
-    seurat_umap = ro.r('res@reductions$umap@cell.embeddings')
-    seurat_neighbors = ro.r('res@graphs$SCT_snn')
-    seurat_clusters = ro.r('Idents(res)')
+    adata.obsm['X_seurat_pca'] = ro.r('res@reductions$pca@cell.embeddings')
+    adata.obsm['X_seurat_umap'] = ro.r('res@reductions$umap@cell.embeddings')
+    #adata.varm['X_seurat_pca_loadings'] = ro.r('res@reductions$pca@feature.loadings')
+    #adata.obsp['X_seurat_neighbors'] = ro.r('res@graphs$SCT_snn')
 
-    sct_norm_x = np.asarray(ro.r("sct_scale")).T
     #norm_x = ro.r('res@assays$SCT@scale.data').T
-    norm_x = ro.r('GetAssayData(res, assay = "SCT", layer = "data")').T
-    adata.X = norm_x
+    #sct_genes_full = list(ro.r("rownames(res@assays$SCT)"))
+    sct_counts = ro.r('GetAssayData(res, assay = "SCT", layer = "counts")').T
+    sct_scale_data = ro.r('GetAssayData(res, assay = "SCT", layer = "scale.data")').T
+    adata.X = sct_scale_data
+    adata.layers['SCT_counts'] = sct_counts
 
     sct_genes = list(ro.r("sct_genes"))
     adata.var['SCT_gene'] = adata.var_names.isin(sct_genes)
@@ -93,7 +94,7 @@ def run_SCTransform(adata, cell_type_key="RNA_clusters"):
     h.set_xlabel('PCA components')
     h.set_title('Correlation between QC metrics and PCA components derived from SCT features')
 
-    return adata, norm_x, sct_norm_x
+    return adata
 
 #%%
 if __name__ == "__main__":
@@ -112,13 +113,17 @@ if __name__ == "__main__":
     target_adata.layers['pseudocounts'] = target_adata.X.copy()
     target_adata.X = target_adata.layers["counts"].copy()
 
-    source_adata, source_norm_x, source_sct_norm_x = run_SCTransform(source_adata, cell_type_key="RNA_clusters")
-    target_adata, target_norm_x, target_sct_norm_x = run_SCTransform(target_adata, cell_type_key="arc_gex_graphclust_Cluster")
+    source_adata = run_SCTransform(source_adata, cell_type_key="RNA_clusters")
+    target_adata = run_SCTransform(target_adata, cell_type_key="arc_gex_graphclust_Cluster")
 
-    from IPython.display import Image, display
-    display(Image("/home/mcb/users/dmannk/BAKLAVA_base/outputs/compare_feature_representations/seurat_dimplot_RNA_clusters.png"))
-    display(Image("/home/mcb/users/dmannk/BAKLAVA_base/outputs/compare_feature_representations/seurat_dimplot_arc_gex_graphclust_Cluster.png"))
+    #from IPython.display import Image, display
+    #display(Image("/home/mcb/users/dmannk/BAKLAVA_base/outputs/compare_feature_representations/seurat_dimplot_RNA_clusters.png"))
+    #display(Image("/home/mcb/users/dmannk/BAKLAVA_base/outputs/compare_feature_representations/seurat_dimplot_arc_gex_graphclust_Cluster.png"))
 
     #%% save source and target adatas
     source_adata.write(os.path.join(base_path, "source_rna_aligned_SCT.h5ad"))
     target_adata.write(os.path.join(base_path, "target_rna_aligned_SCT.h5ad"))
+
+    print("Done.")
+
+# %%
