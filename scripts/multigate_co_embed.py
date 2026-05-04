@@ -1885,6 +1885,7 @@ def main():
     #%% Save adata for FASTopic analysis
 
     import decoupler as dc
+    import decoupler.op
 
     ## [COMMENTED OUT] write to disk
     # for keys in (source_rna.obsm.keys(), source_atac.obsm.keys(), target_rna.obsm.keys(), target_atac.obsm.keys()):
@@ -1981,6 +1982,10 @@ def main():
         )
         gene_topic_adata.obs['combination'] = gene_topic_adata.obs['source_or_target'].astype(str) + '_' + gene_topic_adata.obs['gene_or_topic'].astype(str)
 
+        ## split source and target adatas
+        source_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('source')].copy()
+        target_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('target')].copy()
+
         return source_adata, target_adata
 
     ## extract topic embeddings from source and target data
@@ -2012,9 +2017,9 @@ def main():
     plt.tight_layout(); plt.show()
     
     '''
-    ## ingest ATAC embeddings into RNA UMAP
-    '''
+    ## ingest ATAC embeddings into RNA UMAP - TARGET DATA
     sc.pp.neighbors(feature_topic_adatas['target_rna'], use_rep='X', n_neighbors=10)
+    sc.tl.umap(feature_topic_adatas['target_rna'], min_dist=0.3)
     sc.tl.leiden(feature_topic_adatas['target_rna'], resolution=0.5)
     sc.tl.ingest(feature_topic_adatas['target_atac'], feature_topic_adatas['target_rna'], embedding_method='umap', obs='leiden')
     concat_feature_topic_adatas = sc.concat([feature_topic_adatas['target_rna'], feature_topic_adatas['target_atac']], axis=0)
@@ -2022,8 +2027,8 @@ def main():
         concat_feature_topic_adatas,
         color=['gene_or_topic', 'leiden'],
         ncols=3,
-        wspace=0.2,
-        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':250}),
+        wspace=0.1,
+        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':350}),
         show=False,
     )
     topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
@@ -2034,7 +2039,29 @@ def main():
         for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
             ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
     plt.tight_layout(); plt.show()
-    '''
+
+    ## ingest ATAC embeddings into RNA UMAP - SOURCE DATA
+    sc.pp.neighbors(feature_topic_adatas['source_rna'], use_rep='X', n_neighbors=10)
+    sc.tl.umap(feature_topic_adatas['source_rna'], min_dist=0.3)
+    sc.tl.leiden(feature_topic_adatas['source_rna'], resolution=0.5)
+    sc.tl.ingest(feature_topic_adatas['source_atac'], feature_topic_adatas['source_rna'], embedding_method='umap', obs='leiden')
+    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['source_rna'], feature_topic_adatas['source_atac']], axis=0)
+    umap_axes = sc.pl.umap(
+        concat_feature_topic_adatas,
+        color=['gene_or_topic', 'leiden'],
+        ncols=3,
+        wspace=0.1,
+        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':350}),
+        show=False,
+    )
+    topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
+    topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
+    n_topics = int(feature_topic_adatas['source_rna'].obs['gene_or_topic'].eq('topic').sum())
+    topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
+    for ax in np.atleast_1d(umap_axes):
+        for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
+            ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
+    plt.tight_layout(); plt.show()
 
     ## compare topic embeddings across datasets and modalities
     topic_embeddings = []
@@ -2051,6 +2078,8 @@ def main():
     corr_matrix = np.corrcoef(topic_embeddings)
     plt.figure(figsize=(5, 4))
     sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0)
+    plt.xticks([])
+    plt.yticks([])
     plt.tight_layout(); plt.show()
 
     ## build shared Hallmark mouse net once
@@ -2391,8 +2420,8 @@ def main():
     #source_gene_sets_dict = _net_to_gene_sets_dict(source_net)
     #target_gene_sets_dict = _net_to_gene_sets_dict(target_net)
 
-    #source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_hallmark_grouped, split_source_target=False)
-    source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_resource_grouped, split_source_target=False)
+    source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_hallmark_grouped, split_source_target=True)
+    source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_resource_grouped, split_source_target=True)
 
     ## fetch background genes
     background_genes = source_x1.columns.tolist()
