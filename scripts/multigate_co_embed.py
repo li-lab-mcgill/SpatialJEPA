@@ -1374,9 +1374,9 @@ def main():
 
     #%% ── Load raw aligned datasets ────────────────────────────────────────────
     print("\nLoading source and target datasets...")
-    source_rna  = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned.h5ad"))
+    source_rna  = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_SCT.h5ad"))
     source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned.h5ad"))
-    target_rna  = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
+    target_rna  = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_SCT.h5ad"))
     target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
     if not target_rna.obs_names.equals(target_atac.obs_names):
         raise AssertionError("Target RNA and ATAC must have matching obs_names")
