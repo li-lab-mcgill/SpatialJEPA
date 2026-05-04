@@ -24,7 +24,7 @@ class MultiGATE(object):
         random_seed=2020,
         config=None,
         skip_gp_attention=True,
-        linear_etm_decoder=True,
+        linear_etm_decoder=False,
         etm_emb_dim=None,
         rho_rna_mask=None,
         rho_atac_mask=None,

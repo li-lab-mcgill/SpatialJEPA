@@ -334,6 +334,7 @@ class Stage1CacheConfig:
     dual_source_kd: bool = False
     student_graph_type: str = "identity"
     vgp_anchor_mode: str = "feature"
+    skip_gp_attention: bool = True
 
 
 @dataclass
@@ -451,6 +452,13 @@ def parse_args(notebook: bool = False):
             "'spot': vgp shape is (n_cells, 1), i.e. spot-anchored (legacy behavior). "
             "'feature': vgp shape is (n_features_total, 1), i.e. feature-anchored."
         ),
+    )
+    parser.add_argument(
+        "--no-skip-gp-attention",
+        dest="skip_gp_attention",
+        action="store_false",
+        default=True,
+        help="Enable GP-attention layers in MGATE (default: GP attention is skipped).",
     )
     parser.add_argument(
         "--spatial-graph-type",
@@ -1922,6 +1930,7 @@ def run_stage2_distillation(
         verbose=False,
         random_seed=2021,
         config={"device": str(source_trainer.device)},
+        skip_gp_attention=source_trainer.mgate.skip_gp_attention,
         **_extract_linear_decoder_kwargs_from_mgate(source_trainer.mgate),
     )
     for attr_name in (
@@ -2307,6 +2316,7 @@ def resolve_stage1_cache_config(args, mlflow_client):
         dual_source_kd=bool(args.stage1_dual_source_kd),
         student_graph_type=args.spatial_graph_type,
         vgp_anchor_mode=args.vgp_anchor_mode,
+        skip_gp_attention=args.skip_gp_attention,
     )
 
     if cache_config.use_cache:
@@ -2377,14 +2387,18 @@ def load_and_prepare_data_bundle(args):
     if getattr(args, "combined_gp_dict", True):
         combined_gp_dict = load_nichecompass_combined_gp_dict_mouse(verbose=True, load_from_disk=True)
 
-    source_rna = sc.read_h5ad(os.path.join(BASE_PATH, "source_rna_aligned.h5ad"))
+    source_rna = sc.read_h5ad(os.path.join(BASE_PATH, "source_rna_aligned_SCT.h5ad"))
     source_atac = sc.read_h5ad(os.path.join(BASE_PATH, "source_atac_aligned.h5ad"))
     source_rna.obsm["spatial"] = source_rna.obsm["spatial"] * -1
     source_atac.obsm["spatial"] = source_atac.obsm["spatial"] * -1
 
-    target_rna = sc.read_h5ad(os.path.join(BASE_PATH, "target_rna_aligned.h5ad"))
+    target_rna = sc.read_h5ad(os.path.join(BASE_PATH, "target_rna_aligned_SCT.h5ad"))
     target_atac = sc.read_h5ad(os.path.join(BASE_PATH, "target_atac_aligned.h5ad"))
     assert target_rna.obs_names.equals(target_atac.obs_names), "Target RNA and ATAC must have matching obs_names"
+
+    ## set SCT assay for source and target
+    source_rna.X = source_rna.layers["SCT"].copy()
+    target_rna.X = target_rna.layers["SCT"].copy()
 
     source_label_key = resolve_domain_label_key(
         source_rna,
@@ -2584,7 +2598,7 @@ def initialize_stage1_trainers_for_training(data_bundle, graph_bundle, cache_con
         n_epochs=num_epochs,
         vgp_anchor_mode=cache_config.vgp_anchor_mode,
         random_seed=2020,
-        skip_gp_attention=True,
+        skip_gp_attention=cache_config.skip_gp_attention,
         pathway_decoder_masks=pathway_decoder_masks,
     )
     source_inputs_tensors = teacher_trainer._prepare_inputs(
@@ -2611,6 +2625,7 @@ def initialize_stage1_trainers_for_training(data_bundle, graph_bundle, cache_con
             n_epochs=num_epochs,
             vgp_anchor_mode=cache_config.vgp_anchor_mode,
             random_seed=2021,
+            skip_gp_attention=cache_config.skip_gp_attention,
             device=teacher_trainer.device,
             pathway_decoder_masks=pathway_decoder_masks,
         )
@@ -2627,6 +2642,7 @@ def initialize_stage1_trainers_for_training(data_bundle, graph_bundle, cache_con
             n_epochs=num_epochs,
             vgp_anchor_mode=cache_config.vgp_anchor_mode,
             random_seed=2022,
+            skip_gp_attention=cache_config.skip_gp_attention,
             device=teacher_trainer.device,
             pathway_decoder_masks=pathway_decoder_masks,
         )
@@ -2691,9 +2707,10 @@ def load_cached_stage1_primary_trainer(data_bundle, graph_bundle, cache_config, 
 
     cache_config.vgp_anchor_mode = inferred_vgp_anchor_mode
     if "skip_gp_attention" in cache_config.run_params:
-        stage1_primary_trainer.mgate.skip_gp_attention = (
+        cache_config.skip_gp_attention = (
             str(cache_config.run_params["skip_gp_attention"]).lower() == "true"
         )
+    stage1_primary_trainer.mgate.skip_gp_attention = cache_config.skip_gp_attention
     _apply_pathway_metadata_to_mgate(stage1_primary_trainer.mgate, stage1_pathway_metadata)
     primary_model_name = cache_config.run_params.get(
         "stage1_primary_model",
@@ -2901,12 +2918,13 @@ def run_stage1_training_and_log(
 
         for epoch in tqdm(range(1, num_epochs + 1), desc="Stage 1 training", unit="epoch"):
 
-            mask_sim_rna = cosine_similarity(trainer.mgate.rho_rna_mask.detach().cpu().numpy(), trainer.mgate.rho_rna.detach().cpu().numpy())
-            mask_sim_atac = cosine_similarity(trainer.mgate.rho_atac_mask.detach().cpu().numpy(), trainer.mgate.rho_atac.detach().cpu().numpy())
-            mask_sim_score_rna = np.abs(np.diag(mask_sim_rna)).mean()
-            mask_sim_score_atac = np.abs(np.diag(mask_sim_atac)).mean()
-            mlflow.log_metric("source_train_mask_sim_score_rna", mask_sim_score_rna, step=epoch-1)
-            mlflow.log_metric("source_train_mask_sim_score_atac", mask_sim_score_atac, step=epoch-1)
+            if trainer.mgate.linear_etm_decoder:
+                mask_sim_rna = cosine_similarity(trainer.mgate.rho_rna_mask.detach().cpu().numpy(), trainer.mgate.rho_rna.detach().cpu().numpy())
+                mask_sim_atac = cosine_similarity(trainer.mgate.rho_atac_mask.detach().cpu().numpy(), trainer.mgate.rho_atac.detach().cpu().numpy())
+                mask_sim_score_rna = np.abs(np.diag(mask_sim_rna)).mean()
+                mask_sim_score_atac = np.abs(np.diag(mask_sim_atac)).mean()
+                mlflow.log_metric("source_train_mask_sim_score_rna", mask_sim_score_rna, step=epoch-1)
+                mlflow.log_metric("source_train_mask_sim_score_atac", mask_sim_score_atac, step=epoch-1)
 
             trainer.mgate.train()
             teacher_loss = trainer.run_epoch(epoch, source_a_t, source_prune_t, source_gp_t, source_x1_t, source_x2_t)
