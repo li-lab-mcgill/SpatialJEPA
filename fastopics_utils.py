@@ -78,7 +78,7 @@ def fit_fastopic(X, genes, fixed_embeddings, num_topics=50):
     top_words, doc_topic_dist = model.fit_transform(
         dummy_docs,
         preset_doc_embeddings=fixed_embeddings,
-        epochs=1000,
+        epochs=10000,
     )
 
     model = send_to_cpu(model)
@@ -95,7 +95,7 @@ def fit_fastopic_tied(
     X1, genes1, fixed_embeddings1,
     X2, genes2, fixed_embeddings2,
     num_topics=20,
-    epochs=1000,
+    epochs=10000,
     learning_rate=0.002,
     DT_alpha=3.0,
     TW_alpha=2.0,
@@ -318,7 +318,7 @@ if __name__ == "__main__":
     target_atac = ad.read_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", "target_atac_aligned_with_latents.h5ad"))
 
     ## subsample genes & peaks
-    n_genes = 1000  # source_rna.var['highly_variable_rank'].max().item()
+    n_genes = source_rna.var['highly_variable_rank'].max().item()  # 1000
     source_rna = source_rna[:, source_rna.var['highly_variable_rank'].le(n_genes)].copy()
     target_rna = target_rna[:, target_rna.var['highly_variable_rank'].le(n_genes)].copy()
 
