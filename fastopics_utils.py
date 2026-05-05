@@ -85,9 +85,9 @@ def fit_fastopic(X, genes, fixed_embeddings, num_topics=50):
 
     return model, top_words, doc_topic_dist
 
-def run_fastopic(adata):
+def run_fastopic(adata, counts_key):
     fixed_embeddings = adata.obsm["MultiGATE_source_aligned"].copy()
-    rna_counts = adata.layers["counts"].copy()
+    rna_counts = adata.layers[counts_key].copy()
     fastopic_model, top_genes, cell_topic_dist = fit_fastopic(rna_counts, adata.var_names, fixed_embeddings, num_topics=20)
     return fastopic_model, cell_topic_dist
 
@@ -238,12 +238,12 @@ def fit_fastopic_tied(
     return results[0], results[1]
 
 
-def run_fastopic_tied(rna_adata, atac_adata, num_topics=20):
+def run_fastopic_tied(rna_adata, atac_adata, counts_key, num_topics=20):
     """Fit FASTopic on RNA and ATAC adata jointly with shared topic embeddings."""
     rna_emb = rna_adata.obsm["MultiGATE_source_aligned"].copy()
     atac_emb = atac_adata.obsm["MultiGATE_source_aligned"].copy()
-    rna_counts = rna_adata.layers["counts"].copy()
-    atac_counts = atac_adata.layers["counts"].copy()
+    rna_counts = rna_adata.layers[counts_key].copy()
+    atac_counts = atac_adata.layers[counts_key].copy()
 
     (rna_model, _, rna_theta), (atac_model, _, atac_theta) = fit_fastopic_tied(
         rna_counts, rna_adata.var_names, rna_emb,
@@ -318,7 +318,7 @@ if __name__ == "__main__":
     target_atac = ad.read_h5ad(os.path.join(os.getenv('DATAPATH'), "aligned_data", "target_atac_aligned_with_latents.h5ad"))
 
     ## subsample genes & peaks
-    n_genes = 1000
+    n_genes = 1000  # source_rna.var['highly_variable_rank'].max().item()
     source_rna = source_rna[:, source_rna.var['highly_variable_rank'].le(n_genes)].copy()
     target_rna = target_rna[:, target_rna.var['highly_variable_rank'].le(n_genes)].copy()
 
@@ -333,20 +333,33 @@ if __name__ == "__main__":
 
     print(f"Subsampled to {source_rna.shape[1]} genes and {source_atac.shape[1]} peaks.")
     
-    #%% fit FASTopic model with tied (shared) topic embeddings within each domain
-    (
-        source_rna_fastopic_model,
-        source_rna_cell_topic_dist,
-        source_atac_fastopic_model,
-        source_atac_cell_topic_dist,
-    ) = run_fastopic_tied(source_rna, source_atac)
+    #%% fit FASTopic model
 
-    (
-        target_rna_fastopic_model,
-        target_rna_cell_topic_dist,
-        target_atac_fastopic_model,
-        target_atac_cell_topic_dist,
-    ) = run_fastopic_tied(target_rna, target_atac)
+    counts_key = "SCT_counts"
+    tied_topics = False
+
+    if tied_topics:
+        # with tied (shared) topic embeddings within each modality
+        (
+            source_rna_fastopic_model,
+            source_rna_cell_topic_dist,
+            source_atac_fastopic_model,
+            source_atac_cell_topic_dist,
+        ) = run_fastopic_tied(source_rna, source_atac, counts_key)
+
+        (
+            target_rna_fastopic_model,
+            target_rna_cell_topic_dist,
+            target_atac_fastopic_model,
+            target_atac_cell_topic_dist,
+        ) = run_fastopic_tied(target_rna, target_atac, counts_key)
+    else:
+        # with separate topic embeddings for each modality
+        source_rna_fastopic_model, source_rna_cell_topic_dist = run_fastopic(source_rna, counts_key)
+        source_atac_fastopic_model, source_atac_cell_topic_dist = run_fastopic(source_atac, "counts")
+
+        target_rna_fastopic_model, target_rna_cell_topic_dist = run_fastopic(target_rna, counts_key)
+        target_atac_fastopic_model, target_atac_cell_topic_dist = run_fastopic(target_atac, "counts")
 
     #%% visualize FASTopic model
     visualize_fastopic_model(source_rna_fastopic_model, "source_rna")
@@ -361,3 +374,4 @@ if __name__ == "__main__":
 
     export_adata_with_fastopic(target_rna_fastopic_model, target_rna_cell_topic_dist, target_rna, "target_rna_aligned_with_fastopic.h5ad")
     export_adata_with_fastopic(target_atac_fastopic_model, target_atac_cell_topic_dist, target_atac, "target_atac_aligned_with_fastopic.h5ad")
+# %%
