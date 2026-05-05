@@ -382,14 +382,14 @@ def parse_args(notebook: bool = False):
     parser.add_argument(
         "--top-n-genes",
         type=int,
-        default=2000,
-        help="Number of top genes to keep for filtering.",
+        default=0,
+        help="Number of top genes to keep for filtering. If 0, use SCT genes.",
     )
     parser.add_argument(
         "--top-n-peaks",
         type=int,
-        default=10000,
-        help="Number of top in-cis peaks to keep for filtering.",
+        default=0,
+        help="Number of top in-cis peaks to keep for filtering. If 0, use peaks linked to SCT genes.",
     )
     parser.add_argument(
         "--lambda-kd",
@@ -1233,6 +1233,49 @@ def apply_hvg_and_gp_filtering(
     # Re-introduce gp-net based on filtered genes and peaks.
     gp_net = gp_net[
         gp_net["Gene"].isin(gene_filt.loc[gene_filt].index)
+        & gp_net["Peak"].isin(peak_filt)
+    ]
+    source_rna.uns["gene_peak_Net"] = gp_net.copy()
+    target_rna.uns["gene_peak_Net"] = gp_net.copy()
+
+    return source_rna, source_atac, target_rna, target_atac, gp_net
+
+def get_sct_genes_and_gp_filtering(
+    source_rna,
+    source_atac,
+    target_rna,
+    target_atac,
+    gp_net
+    ):
+
+    gp_net_genes = gp_net["Gene"].unique()
+    gp_net_peaks = gp_net["Peak"].unique()
+
+    source_rna = source_rna[:, source_rna.var_names.isin(gp_net_genes)].copy()
+    source_atac = source_atac[:, source_atac.var_names.isin(gp_net_peaks)].copy()
+    target_rna = target_rna[:, target_rna.var_names.isin(gp_net_genes)].copy()
+    target_atac = target_atac[:, target_atac.var_names.isin(gp_net_peaks)].copy()
+
+    source_rna.var["highly_variable"] = False
+    source_atac.var["highly_variable"] = False
+    target_rna.var["highly_variable"] = False
+    target_atac.var["highly_variable"] = False
+
+    where_overlap_sct_genes = source_rna.var['SCT_gene'] & target_rna.var['SCT_gene']
+    overlap_sct_genes = where_overlap_sct_genes.index[where_overlap_sct_genes]
+
+    source_rna.var.loc[overlap_sct_genes, "highly_variable"] = True
+    target_rna.var.loc[overlap_sct_genes, "highly_variable"] = True
+
+    peak_filt = gp_net.loc[
+        gp_net["Gene"].isin(overlap_sct_genes),
+        "Peak",
+    ].unique()
+    source_atac.var.loc[source_atac.var_names.isin(peak_filt), "highly_variable"] = True
+    target_atac.var.loc[target_atac.var_names.isin(peak_filt), "highly_variable"] = True
+
+    gp_net = gp_net[
+        gp_net["Gene"].isin(overlap_sct_genes)
         & gp_net["Peak"].isin(peak_filt)
     ]
     source_rna.uns["gene_peak_Net"] = gp_net.copy()
@@ -2423,16 +2466,29 @@ def load_and_prepare_data_bundle(args):
     gp_net = source_atac.uns["gene_peak_Net"].copy()
     del source_atac.uns["gene_peak_Net"]
 
-    source_rna, source_atac, target_rna, target_atac, gp_net = apply_hvg_and_gp_filtering(
-        source_rna=source_rna,
-        source_atac=source_atac,
-        target_rna=target_rna,
-        target_atac=target_atac,
-        gp_net=gp_net,
-        top_n_genes=args.top_n_genes,
-        top_n_peaks=args.top_n_peaks,
-        rank_type="fused",
-    )
+    use_sct_genes = (args.top_n_genes==0 and args.top_n_peaks==0)
+
+    if use_sct_genes:
+        source_rna, source_atac, target_rna, target_atac, gp_net = get_sct_genes_and_gp_filtering(
+            source_rna=source_rna,
+            source_atac=source_atac,
+            target_rna=target_rna,
+            target_atac=target_atac,
+            gp_net=gp_net,
+        )
+
+    else:
+        source_rna, source_atac, target_rna, target_atac, gp_net = apply_hvg_and_gp_filtering(
+            source_rna=source_rna,
+            source_atac=source_atac,
+            target_rna=target_rna,
+            target_atac=target_atac,
+            gp_net=gp_net,
+            top_n_genes=args.top_n_genes,
+            top_n_peaks=args.top_n_peaks,
+            rank_type="fused",
+        )
+
     print("Filtered {} genes and {} peaks from gene-peak net".format(len(target_rna.var_names), len(target_atac.var_names)))
     del gp_net
 
