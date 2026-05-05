@@ -1252,7 +1252,7 @@ def main():
     #%% ── MLflow setup ────────────────────────────────────────────────────────
     #bash /home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/scripts/start_mlflow_services.sh all
 
-    #args.run_name = '20260402_153455' #'20260402_153455'
+    #args.run_name = '20260504_180921' #'20260402_153455'
     #args.stage2_run_name = '20260402_153455_stage2_20260402_165006'
     #sqlite_tracking_uri = "sqlite:////home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db"
     #postgres_tracking_uri = "http://127.0.0.1:5000"
@@ -1794,6 +1794,13 @@ def main():
 
     sc.pl.umap(source_target_adata, color=['modality', 'leiden', 'source_or_target'], ncols=3, wspace=0.2, size=25)
 
+    ## [COMMENTED OUT] write to disk
+    # for keys in (source_rna.obsm.keys(), source_atac.obsm.keys(), target_rna.obsm.keys(), target_atac.obsm.keys()):
+    #     assert 'MultiGATE_source_aligned' in keys, f"MultiGATE_source_aligned not found in {keys}"
+    #source_rna.write_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
+    #source_atac.write_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
+    #target_rna.write_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
+    #target_atac.write_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
 
     #%% Analysis on concatenated data
 
@@ -1886,14 +1893,6 @@ def main():
 
     import decoupler as dc
     import decoupler.op
-
-    ## [COMMENTED OUT] write to disk
-    # for keys in (source_rna.obsm.keys(), source_atac.obsm.keys(), target_rna.obsm.keys(), target_atac.obsm.keys()):
-    #     assert 'MultiGATE_source_aligned' in keys, f"MultiGATE_source_aligned not found in {keys}"
-    #source_rna.write_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
-    #source_atac.write_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
-    #target_rna.write_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
-    #target_atac.write_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
 
     ## load from disk, after FASTopic analysis
     source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_with_fastopic.h5ad"))
