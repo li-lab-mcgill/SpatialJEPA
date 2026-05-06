@@ -238,12 +238,12 @@ def fit_fastopic_tied(
     return results[0], results[1]
 
 
-def run_fastopic_tied(rna_adata, atac_adata, counts_key, n_epochs, num_topics=20):
+def run_fastopic_tied(rna_adata, atac_adata, counts_key_dict, n_epochs, num_topics=20):
     """Fit FASTopic on RNA and ATAC adata jointly with shared topic embeddings."""
     rna_emb = rna_adata.obsm["MultiGATE_source_aligned"].copy()
     atac_emb = atac_adata.obsm["MultiGATE_source_aligned"].copy()
-    rna_counts = rna_adata.layers[counts_key].copy()
-    atac_counts = atac_adata.layers[counts_key].copy()
+    rna_counts = rna_adata.layers[counts_key_dict["rna"]].copy()
+    atac_counts = atac_adata.layers[counts_key_dict["atac"]].copy()
 
     (rna_model, _, rna_theta), (atac_model, _, atac_theta) = fit_fastopic_tied(
         rna_counts, rna_adata.var_names, rna_emb,
@@ -338,8 +338,11 @@ if __name__ == "__main__":
     
     #%% fit FASTopic model
 
-    counts_key = "SCT_counts"
-    n_epochs = 1e5
+    counts_key_dict = {
+        "rna": "SCT_counts",
+        "atac": "counts",
+    }
+    n_epochs = int(1e3)
     tied_topics = False
 
     if tied_topics:
@@ -349,21 +352,21 @@ if __name__ == "__main__":
             source_rna_cell_topic_dist,
             source_atac_fastopic_model,
             source_atac_cell_topic_dist,
-        ) = run_fastopic_tied(source_rna, source_atac, counts_key, n_epochs)
+        ) = run_fastopic_tied(source_rna, source_atac, counts_key_dict, n_epochs)
 
         (
             target_rna_fastopic_model,
             target_rna_cell_topic_dist,
             target_atac_fastopic_model,
             target_atac_cell_topic_dist,
-        ) = run_fastopic_tied(target_rna, target_atac, counts_key, n_epochs)
+        ) = run_fastopic_tied(target_rna, target_atac, counts_key_dict, n_epochs)
     else:
         # with separate topic embeddings for each modality
-        source_rna_fastopic_model, source_rna_cell_topic_dist = run_fastopic(source_rna, counts_key, n_epochs)
-        target_rna_fastopic_model, target_rna_cell_topic_dist = run_fastopic(target_rna, counts_key, n_epochs)
+        source_rna_fastopic_model, source_rna_cell_topic_dist = run_fastopic(source_rna, counts_key_dict["rna"], n_epochs)
+        target_rna_fastopic_model, target_rna_cell_topic_dist = run_fastopic(target_rna, counts_key_dict["rna"], n_epochs)
 
-        source_atac_fastopic_model, source_atac_cell_topic_dist = run_fastopic(source_atac, "counts", n_epochs)
-        target_atac_fastopic_model, target_atac_cell_topic_dist = run_fastopic(target_atac, "counts", n_epochs)
+        source_atac_fastopic_model, source_atac_cell_topic_dist = run_fastopic(source_atac, counts_key_dict["atac"], n_epochs)
+        target_atac_fastopic_model, target_atac_cell_topic_dist = run_fastopic(target_atac, counts_key_dict["atac"], n_epochs)
 
     #%% visualize FASTopic model
     visualize_fastopic_model(source_rna_fastopic_model, "source_rna")
