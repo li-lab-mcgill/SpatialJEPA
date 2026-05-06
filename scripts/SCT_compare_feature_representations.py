@@ -49,6 +49,7 @@ def run_SCTransform(adata, cell_type_key="RNA_clusters"):
         return.only.var.genes = FALSE,
         do.correct.umi = TRUE,
         verbose = FALSE,
+        variable.features.n = 6000,
         min_cells = 0
     )
 

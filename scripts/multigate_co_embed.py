@@ -119,6 +119,7 @@ print("Using MultiGATE module:", MultiGATE.__file__)
 
 from mouse_brain_spatial_rna_atac import (  # noqa: E402
     apply_hvg_and_gp_filtering,
+    get_sct_genes_and_gp_filtering,
     build_concat_adata_for_umap,
     build_graph_inputs,
     build_source_student_graph_tf,
@@ -1396,16 +1397,26 @@ def main():
         "Replicating feature selection "
         "(top_n_genes={}, top_n_peaks={})...".format(run_params.get("n_genes"), run_params.get("n_peaks"))
     )
-    source_rna, source_atac, target_rna, target_atac, gp_net = apply_hvg_and_gp_filtering(
-        source_rna=source_rna,
-        source_atac=source_atac,
-        target_rna=target_rna,
-        target_atac=target_atac,
-        gp_net=gp_net,
-        top_n_genes=int(run_params.get("n_genes")),
-        top_n_peaks=int(run_params.get("n_peaks")),
-        rank_type="fused",
-    )
+    use_sct_genes = True
+    if use_sct_genes:
+        source_rna, source_atac, target_rna, target_atac, gp_net = get_sct_genes_and_gp_filtering(
+            source_rna=source_rna,
+            source_atac=source_atac,
+            target_rna=target_rna,
+            target_atac=target_atac,
+            gp_net=gp_net,
+        )
+    else:
+        source_rna, source_atac, target_rna, target_atac, gp_net = apply_hvg_and_gp_filtering(
+            source_rna=source_rna,
+            source_atac=source_atac,
+            target_rna=target_rna,
+            target_atac=target_atac,
+            gp_net=gp_net,
+            top_n_genes=int(run_params.get("n_genes")),
+            top_n_peaks=int(run_params.get("n_peaks")),
+            rank_type="fused",
+        )
 
     # Attach gene-peak net before HVG slicing (needed by build_graph_inputs)
     source_rna.uns["gene_peak_Net"] = gp_net.copy()
@@ -1772,6 +1783,23 @@ def main():
     ## concatenate source and target data
     source_rna.obsm['MultiGATE_source_aligned'] = source_rna.obsm['MultiGATE']
     source_atac.obsm['MultiGATE_source_aligned'] = source_atac.obsm['MultiGATE']
+
+    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_source_aligned")
+    source_concat_adata.obs = source_concat_adata.obs.assign(source_obs_names = source_concat_adata.obs_names)
+    source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
+
+    source_target_adata = run_alignment_and_spatial_plot(
+        model,
+        source_mgate,
+        target_mgate,
+        source_rna,
+        source_atac,
+        source_concat_adata,
+        target_concat_adata,
+        deterministic_seed,
+    )
+
+    '''
     source_target_rna = sc.concat([source_rna, target_rna], axis=0)
     source_target_atac = sc.concat([source_atac, target_atac], axis=0)
     source_target_adata = build_concat_adata_for_umap(source_target_rna, source_target_atac, embedding_key="MultiGATE_source_aligned")
@@ -1793,6 +1821,9 @@ def main():
     )
 
     sc.pl.umap(source_target_adata, color=['modality', 'leiden', 'source_or_target'], ncols=3, wspace=0.2, size=25)
+    '''
+
+
 
     ## [COMMENTED OUT] write to disk
     # for keys in (source_rna.obsm.keys(), source_atac.obsm.keys(), target_rna.obsm.keys(), target_atac.obsm.keys()):
@@ -1834,6 +1865,7 @@ def main():
         source_target_adata.obs['source_or_target'].eq('target')
     ].obsm['spatial'].copy()
  
+    #%% Add cluster information
     target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
 
     ## ingest source embeddings into target data
