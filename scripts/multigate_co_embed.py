@@ -1818,6 +1818,9 @@ def main():
     source_rna.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'rna']).all(1)].obsm['X_umap'].copy()
     source_atac.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'atac']).all(1)].obsm['X_umap'].copy()
 
+    source_rna.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'rna']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
+    source_atac.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'atac']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
+
     target_rna.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'rna']).all(1)].obsm['X_umap'].copy()
     target_atac.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'atac']).all(1)].obsm['X_umap'].copy()
 
@@ -3084,7 +3087,7 @@ def main():
         resource=None,
         spatial_key="spatial",
         cell_type_col="RNA_clusters",
-        labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60
+        labels=["R2", "R4", "R7"], interaction=None, ncomps=30, bandwidth=40, s=60
         ):
         """
         Performs LIANA+ inflow and associated spatial ligand-receptor analyses on `source_rna` AnnData object.
@@ -3135,7 +3138,8 @@ def main():
         map_df = map_df.drop(columns=["Gene stable ID", "Mouse gene stable ID"])
 
         if resource is None:
-            resource = li.rs.select_resource('consensus') # NOTE: mouse_consensus could be used in future
+            resource = li.rs.select_resource('mouseconsensus') # NOTE: mouse_consensus could be used in future
+            '''
             resource = li.rs.translate_resource(
                 resource,
                 map_df=map_df,
@@ -3143,6 +3147,7 @@ def main():
                 replace=True,
                 one_to_many=2,
             )
+            '''
 
         lrdata = li.mt.inflow(
             adata,
@@ -3151,56 +3156,58 @@ def main():
             use_raw=False,
         )
 
-        sq.gr.spatial_autocorr(lrdata, mode='moran', use_raw=False)
-        svis = lrdata.uns['moranI'].index[(lrdata.uns['moranI']['pval_norm_fdr_bh'] <= 0.05) & (lrdata.uns['moranI']['I'] > 0.01)]
-        print(f"Number of spatially variable ligand-receptor interactions: {len(svis)}")
-        lrdata = lrdata[:, svis]
-        lrdata.uns['moranI'].sort_values("I").tail(30)
+        if interaction is not None:
 
-        try:
-            ligands = lrdata.var_names.str.split("^").str[1]
-            receptors = lrdata.var_names.str.split("^").str[2]
-            fused_I = adata.uns['moranI'].loc[ligands, 'I'].values * adata.uns['moranI'].loc[receptors, 'I'].values
-            print(lrdata.var_names[np.flip(fused_I.argsort())])
-        except:
-            fused_I = None
+            sq.gr.spatial_autocorr(lrdata, mode='moran', use_raw=False)
+            svis = lrdata.uns['moranI'].index[(lrdata.uns['moranI']['pval_norm_fdr_bh'] <= 0.05) & (lrdata.uns['moranI']['I'] > 0.01)]
+            print(f"Number of spatially variable ligand-receptor interactions: {len(svis)}")
+            lrdata = lrdata[:, svis]
+            lrdata.uns['moranI'].sort_values("I").tail(30)
 
-        comp = interaction.split("^")
+            try:
+                ligands = lrdata.var_names.str.split("^").str[1]
+                receptors = lrdata.var_names.str.split("^").str[2]
+                fused_I = adata.uns['moranI'].loc[ligands, 'I'].values * adata.uns['moranI'].loc[receptors, 'I'].values
+                print(lrdata.var_names[np.flip(fused_I.argsort())])
+            except:
+                fused_I = None
 
-        sc.pl.embedding(
-            lrdata,
-            basis=spatial_key,
-            color=interaction,
-            s=s,
-            ncols=2,
-        )
+            comp = interaction.split("^")
 
-        sc.pl.embedding(
-            adata,
-            basis=spatial_key,
-            color=[comp[1], comp[2]],
-            s=s,
-            use_raw=False,
-            ncols=2,
-        )
+            sc.pl.embedding(
+                lrdata,
+                basis=spatial_key,
+                color=interaction,
+                s=s,
+                ncols=2,
+            )
 
-        fig, ax = plt.subplots(figsize=(14, 5)) 
-        sc.pl.violin(lrdata, groupby=cell_type_col, keys=interaction, size=0.5, rotation=90, ax=ax)
-        plt.tight_layout()
-        plt.show()
+            sc.pl.embedding(
+                adata,
+                basis=spatial_key,
+                color=[comp[1], comp[2]],
+                s=s,
+                use_raw=False,
+                ncols=2,
+            )
 
-        li.pl.feature_by_group(
-            adata=lrdata,
-            spatial_key=spatial_key,
-            feature=interaction,
-            groupby=cell_type_col,
-            percentile_scaling=(1,97),
-            labels=labels,
-            show_counts=False,
-            normalize=True,
-            figure_size=(10,8),
-        )
-        ## stopped at "Global Summaries"
+            fig, ax = plt.subplots(figsize=(14, 5)) 
+            sc.pl.violin(lrdata, groupby=cell_type_col, keys=interaction, size=0.5, rotation=90, ax=ax)
+            plt.tight_layout()
+            plt.show()
+
+            li.pl.feature_by_group(
+                adata=lrdata,
+                spatial_key=spatial_key,
+                feature=interaction,
+                groupby=cell_type_col,
+                percentile_scaling=(1,97),
+                labels=labels,
+                show_counts=False,
+                normalize=True,
+                figure_size=(10,8),
+            )
+            ## stopped at "Global Summaries"
 
         ## NMF
         li.multi.nmf(lrdata, n_components=ncomps, inplace=True, random_state=0, max_iter=200, verbose=True)
@@ -3558,6 +3565,31 @@ def main():
     _, _, _, pls_target_rna = run_pls_embedding_to_gene_plots(target_rna)
     _, _, _, pls_source_atac = run_pls_embedding_to_gene_plots(source_atac)
     _, _, _, pls_target_atac = run_pls_embedding_to_gene_plots(target_atac)
+
+    def get_liana_lrdata(adata, cell_type_col):
+
+        adata.X = adata.layers["SCT_counts"].copy()
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+
+        li.ut.spatial_neighbors(adata=adata, bandwidth=40, spatial_key='spatial')
+        li.pl.connectivity(adata, idx=5500, size=1, figure_size=(6, 5), spatial_key='spatial')
+        sq.gr.spatial_autocorr(adata, mode='moran', use_raw=False, show_progress_bar=True)
+        svgs = adata.uns['moranI'].index[(adata.uns['moranI']['pval_norm_fdr_bh'] < 0.05) & (adata.uns['moranI']['I'] > 0.01)]
+        adata = adata[:, svgs]
+
+        lrdata = li.mt.inflow(
+            adata,
+            groupby=cell_type_col,
+            resource = li.rs.select_resource('mouseconsensus'),
+            use_raw=False,
+        )
+        return lrdata
+
+    lrdata_source_rna = get_liana_lrdata(source_rna, 'leiden')
+    _, _, _, pls_source_rna_liana = run_pls_embedding_to_gene_plots(lrdata_source_rna)
+    lrdata_target_rna = get_liana_lrdata(target_rna, 'leiden')
+    _, _, _, pls_target_rna_liana = run_pls_embedding_to_gene_plots(lrdata_target_rna)
 
     ## plot correlation between source and target PLS dimensions
     pls_rna_corr = np.corrcoef(pls_source_rna.y_weights_, pls_target_rna.y_weights_, rowvar=False)
