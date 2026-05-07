@@ -1862,6 +1862,12 @@ def main():
     #target_rna.write_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
     #target_atac.write_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
 
+    ## [COMMENTED OUT] load from disk
+    #source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
+    #source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
+    #target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
+    #target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
+
 
     #%% Analysis on concatenated data
 
@@ -3566,14 +3572,13 @@ def main():
     _, _, _, pls_source_atac = run_pls_embedding_to_gene_plots(source_atac)
     _, _, _, pls_target_atac = run_pls_embedding_to_gene_plots(target_atac)
 
-    def get_liana_lrdata(adata, cell_type_col):
+    def get_liana_lrdata(adata, cell_type_col, lr_pairs):
 
         adata.X = adata.layers["SCT_counts"].copy()
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
 
         li.ut.spatial_neighbors(adata=adata, bandwidth=40, spatial_key='spatial')
-        li.pl.connectivity(adata, idx=5500, size=1, figure_size=(6, 5), spatial_key='spatial')
         sq.gr.spatial_autocorr(adata, mode='moran', use_raw=False, show_progress_bar=True)
         svgs = adata.uns['moranI'].index[(adata.uns['moranI']['pval_norm_fdr_bh'] < 0.05) & (adata.uns['moranI']['I'] > 0.01)]
         adata = adata[:, svgs]
@@ -3581,15 +3586,63 @@ def main():
         lrdata = li.mt.inflow(
             adata,
             groupby=cell_type_col,
-            resource = li.rs.select_resource('mouseconsensus'),
+            resource = lr_pairs,
             use_raw=False,
         )
+        lrdata.var['interaction'] = lrdata.var_names.str.split('^').to_series().apply(lambda x: f'{x[1]}^{x[2]}').values
         return lrdata
 
-    lrdata_source_rna = get_liana_lrdata(source_rna, 'leiden')
+    ## build shared Hallmark mouse net once
+    hallmark_human = dc.op.hallmark(organism="human")
+    map_path = os.path.join(os.environ["DATAPATH"], "gene_annotations", "human_mouse_gene_orthologs.csv")
+    map_df = (
+        pd.read_csv(map_path)
+        .rename(columns={"Gene name": "target_human", "Mouse gene name": "target"})[
+            ["target_human", "target"]
+        ]
+        .dropna()
+        .drop_duplicates()
+    )
+    hallmark_mouse_net = (
+        hallmark_human.rename(columns={"target": "target_human"})
+        .merge(map_df, on="target_human", how="inner")[["source", "target"]]
+        .drop_duplicates()
+    )
+
+    lr_pairs = li.rs.select_resource('mouseconsensus')
+    
+    lr_geneset = li.rs.generate_lr_geneset(
+        lr_pairs,
+        hallmark_mouse_net,
+        lr_sep="^",
+        weight=None,
+    )
+
+
+    lrdata_source_rna = get_liana_lrdata(source_rna, 'leiden', lr_pairs)
+    lrdata_target_rna = get_liana_lrdata(target_rna, 'leiden', lr_pairs)
     _, _, _, pls_source_rna_liana = run_pls_embedding_to_gene_plots(lrdata_source_rna)
-    lrdata_target_rna = get_liana_lrdata(target_rna, 'leiden')
     _, _, _, pls_target_rna_liana = run_pls_embedding_to_gene_plots(lrdata_target_rna)
+
+    lrdata_source_rna.var = lrdata_source_rna.var.merge(unique_geneset_per_lr, left_on='interaction', right_index=True, how='left')
+    lrdata_target_rna.var = lrdata_target_rna.var.merge(unique_geneset_per_lr, left_on='interaction', right_index=True, how='left')
+
+    unique_geneset_per_lr = lr_geneset.groupby('interaction')['source'].unique().map(list).rename('genesets')
+    unique_geneset_per_lr = unique_geneset_per_lr.explode().str.get_dummies().groupby(level=0).max()
+
+    target_rna_liana_by_geneset = lrdata_target_rna.var.merge(unique_geneset_per_lr, left_on='interaction', right_index=True, how='left')
+    target_rna_liana_by_geneset = target_rna_liana_by_geneset[unique_geneset_per_lr.columns].fillna(0)
+    X_genesets_liana = lrdata_target_rna.X @ sp.csr_matrix(target_rna_liana_by_geneset.values)
+    lrdata_target_rna_genesets = sc.AnnData(X=X_genesets_liana, var=pd.DataFrame(index=target_rna_liana_by_geneset.columns))
+    sc.pp.neighbors(lrdata_target_rna_genesets, use_rep='X')
+    sc.tl.umap(lrdata_target_rna_genesets)
+    sc.tl.leiden(lrdata_target_rna_genesets)
+    sc.pl.umap(lrdata_target_rna_genesets, color='leiden', size=25)
+    plt.tight_layout(); plt.show()
+
+    lrdata_target_rna_genesets.obsm['MultiGATE_source_aligned'] = lrdata_target_rna.obsm['MultiGATE_source_aligned'].copy()
+    lrdata_target_rna_genesets.obsm['spatial'] = lrdata_target_rna.obsm['spatial'].copy()
+    _, _, _, pls_lrdata_target_rna_genesets = run_pls_embedding_to_gene_plots(lrdata_target_rna_genesets)
 
     ## plot correlation between source and target PLS dimensions
     pls_rna_corr = np.corrcoef(pls_source_rna.y_weights_, pls_target_rna.y_weights_, rowvar=False)
