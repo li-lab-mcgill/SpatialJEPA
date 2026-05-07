@@ -1967,13 +1967,15 @@ def main():
 
         return topic_gene_weight_mat, sorted_topics, net_filtered
 
-    def extract_fastopic_embeddings(source_adata, target_adata, modality, do_procrustes=False):
+    def extract_fastopic_embeddings(source_adata, target_adata, modality, do_procrustes=False, keep_cells=False):
 
         ## extract gene and topic embeddings from source and target data
         source_gene_embeddings = source_adata.varm['fastopic_gene_embeddings'].copy()
         target_gene_embeddings = target_adata.varm['fastopic_gene_embeddings'].copy()
         source_topic_embeddings = source_adata.uns['fastopic']['topic_embeddings'].copy()
         target_topic_embeddings = target_adata.uns['fastopic']['topic_embeddings'].copy()
+        source_cell_embeddings = source_adata.obsm['MultiGATE_source_aligned'].copy()
+        target_cell_embeddings = target_adata.obsm['MultiGATE_source_aligned'].copy()
 
         if do_procrustes:
             from scipy.spatial import procrustes
@@ -1983,27 +1985,36 @@ def main():
         ## form sinlge adata object
         source_target_gene_embeddings = np.concatenate([source_gene_embeddings, target_gene_embeddings], axis=0)
         source_target_topic_embeddings = np.concatenate([source_topic_embeddings, target_topic_embeddings], axis=0)
-        
+        source_target_cell_embeddings = np.concatenate([source_cell_embeddings, target_cell_embeddings], axis=0)
+
         feature_type = 'gene' if modality == 'rna' else 'peak'
         gene_or_topic = np.concatenate([
             np.full(source_target_gene_embeddings.shape[0], feature_type),
-            np.full(source_target_topic_embeddings.shape[0], 'topic')
+            np.full(source_target_topic_embeddings.shape[0], 'topic'),
+            np.full(source_target_cell_embeddings.shape[0], 'cell'),
         ])
         label = np.concatenate([
             source_adata.var_names,
             target_adata.var_names,
             [f'topic_{i}' for i in range(source_topic_embeddings.shape[0])],
             [f'topic_{i}' for i in range(target_topic_embeddings.shape[0])],
+            source_adata.obs_names,
+            target_adata.obs_names,
         ])
         source_or_target = np.concatenate([
             np.full(source_gene_embeddings.shape[0], 'source'),
             np.full(target_gene_embeddings.shape[0], 'target'),
             np.full(source_topic_embeddings.shape[0], 'source'),
             np.full(target_topic_embeddings.shape[0], 'target'),
+            np.full(source_cell_embeddings.shape[0], 'source'),
+            np.full(target_cell_embeddings.shape[0], 'target'),
         ])
 
         gene_topic_adata = sc.AnnData(
-            X = np.concatenate([source_target_gene_embeddings, source_target_topic_embeddings], axis=0),
+            X = np.concatenate(
+                [source_target_gene_embeddings, source_target_topic_embeddings, source_target_cell_embeddings],
+                axis=0,
+            ),
             obs = pd.DataFrame(
                 data = {
                 'gene_or_topic': gene_or_topic,
@@ -2016,6 +2027,10 @@ def main():
         ## split source and target adatas
         source_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('source')].copy()
         target_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('target')].copy()
+
+        if not keep_cells:
+            source_adata = source_adata[~source_adata.obs['gene_or_topic'].eq('cell')]
+            target_adata = target_adata[~target_adata.obs['gene_or_topic'].eq('cell')]
 
         return source_adata, target_adata
 
@@ -3467,13 +3482,41 @@ def main():
     from sklearn.multioutput import MultiOutputRegressor
 
     #X = pathway_embedding_results['source_rna'].pathway_scores.to_numpy()
-    X = source_rna.X.toarray()
-    Z = source_rna.obsm['MultiGATE'].copy()
+    X = source_rna.X#.toarray()
+    Z = source_rna.obsm['MultiGATE_source_aligned'].copy()
     C = source_rna.obs['RNA_clusters'].copy()
 
-    pls = PLSRegression(n_components=30)
+    pls = PLSRegression(n_components=9)
     pls.fit(Z, X)
     T = pls.transform(Z)
+
+    ## plot PLS laodings onto UMAP
+    source_rna_pls = source_rna.copy()
+
+    sc.pp.neighbors(source_rna_pls, use_rep='MultiGATE_source_aligned', metric='cosine')
+    sc.tl.umap(source_rna_pls, min_dist=0.3, spread=1.0)
+    source_rna_pls.obsm['spatial'] = source_rna_pls.obsm['spatial']# * [-1, -1]
+
+    source_rna_pls.obs = source_rna_pls.obs.merge(
+        pd.DataFrame(T, index=source_rna.obs_names, columns=[f'PLS_{i}' for i in range(T.shape[1])]),
+        left_index=True, right_index=True,
+    )
+    p = sc.pl.embedding(
+        source_rna_pls,
+        basis='spatial', # 'spatial' or 'X_seurat_umap' or 'X_umap
+        color=source_rna_pls.obs.columns[source_rna_pls.obs.columns.str.startswith('PLS_')],
+        ncols=3, wspace=0.2, size=25, show=False)
+    # Ensure the figure size is set before plotting
+    # Remove axis titles from all subplots
+    fig = plt.gcf()
+    fig.set_size_inches(12, 10)  # or any desired figsize (width, height)
+    for ax in fig.get_axes():
+        ax.set_xlabel('')
+        ax.set_ylabel('')
+    plt.tight_layout(); plt.show()
+
+    ## plot heatmap of PLS coef
+    sns.clustermap(pls.coef_, cmap='viridis', cbar=True, vmax=1.5)
 
     model = MultiOutputRegressor(PoissonRegressor())
     model.fit(T, X)
