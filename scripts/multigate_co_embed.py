@@ -99,6 +99,8 @@ _path_entries = os.environ.get("PATH", "").split(os.pathsep)
 if _env_bin and _env_bin not in _path_entries:
     os.environ["PATH"] = _env_bin + os.pathsep + os.environ.get("PATH", "")
 
+os.chdir(os.path.join(BAKLAVA_BASE_DIR, "MultiGATE", "scripts"))
+
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -859,10 +861,13 @@ def linear_decoder_kwargs_from_mgate(mgate):
     return kwargs
 
 
-def mgate_from_state_dict(state_dict, device):
+def mgate_from_state_dict(state_dict, device, skip_gp_attention=True):
     """
     Infer the MGATE architecture entirely from a state dict, instantiate
     the model, load the weights, and return it in eval mode.
+
+    skip_gp_attention is not stored in the state dict; it must be supplied
+    explicitly from the MLflow run params of the originating training run.
     """
     hidden_dims1 = hidden_dims_from_state_dict(state_dict, "W1")
     hidden_dims2 = hidden_dims_from_state_dict(state_dict, "W2")
@@ -885,6 +890,7 @@ def mgate_from_state_dict(state_dict, device):
         temp=temp,
         nonlinear=True,
         vgp_anchor_mode=vgp_anchor_mode,
+        skip_gp_attention=skip_gp_attention,
         **linear_decoder_kwargs_from_state_dict(state_dict),
     ).to(device)
     mgate.load_state_dict(state_dict, strict=False)
@@ -913,16 +919,18 @@ def apply_pathway_metadata_to_mgate(mgate, pathway_metadata):
         setattr(mgate, attr_name, int(value))
 
 
-def load_mgate(client, run_id, artifact_name, device, dst_dir):
+def load_mgate(client, run_id, artifact_name, device, dst_dir, skip_gp_attention=True):
     """Download a model .pth artifact and return a reconstructed, eval-mode MGATE."""
     local_path = download_model_artifact(client, run_id, artifact_name, dst_dir)
     payload = torch.load(local_path, map_location=device, weights_only=False)
     state_dict, pathway_metadata = unpack_mgate_checkpoint_payload(payload)
-    mgate, hidden_dims1, hidden_dims2, vgp_anchor_mode = mgate_from_state_dict(state_dict, device)
+    mgate, hidden_dims1, hidden_dims2, vgp_anchor_mode = mgate_from_state_dict(
+        state_dict, device, skip_gp_attention=skip_gp_attention
+    )
     apply_pathway_metadata_to_mgate(mgate, pathway_metadata)
     print(
-        "    hidden_dims1={}, hidden_dims2={}, vgp_anchor_mode={}".format(
-            hidden_dims1, hidden_dims2, vgp_anchor_mode
+        "    hidden_dims1={}, hidden_dims2={}, vgp_anchor_mode={}, skip_gp_attention={}".format(
+            hidden_dims1, hidden_dims2, vgp_anchor_mode, skip_gp_attention
         )
     )
     return mgate, hidden_dims1, hidden_dims2, vgp_anchor_mode
@@ -944,6 +952,7 @@ def build_zero_shot_mgate(source_mgate, target_spot_num, vgp_anchor_mode, device
         temp=float(source_mgate.logit_scale.detach().cpu().item()),
         nonlinear=source_mgate.nonlinear,
         vgp_anchor_mode=vgp_anchor_mode,
+        skip_gp_attention=source_mgate.skip_gp_attention,
         **linear_decoder_kwargs_from_mgate(source_mgate),
     ).to(device)
 
@@ -1253,7 +1262,7 @@ def main():
     #%% ── MLflow setup ────────────────────────────────────────────────────────
     #bash /home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/scripts/start_mlflow_services.sh all
 
-    #args.run_name = '20260504_180921' #'20260402_153455'
+    #args.run_name = '20260505_190037' #'20260402_153455'
     #args.stage2_run_name = '20260402_153455_stage2_20260402_165006'
     #sqlite_tracking_uri = "sqlite:////home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db"
     #postgres_tracking_uri = "http://127.0.0.1:5000"
@@ -1286,9 +1295,11 @@ def main():
         spatial_graph_type = "identity"
     print("Target spatial graph type:", spatial_graph_type)
 
-    bp_width       = int(run_params.get("bp_width", 400))
-    graph_type     = run_params.get("graph_type", "ATAC")
-    dual_source_kd = run_params.get("stage1_dual_source_kd", "False").lower() == "true"
+    bp_width           = int(run_params.get("bp_width", 400))
+    graph_type         = run_params.get("graph_type", "ATAC")
+    dual_source_kd     = run_params.get("stage1_dual_source_kd", "False").lower() == "true"
+    skip_gp_attention  = str(run_params.get("skip_gp_attention", "True")).lower() == "true"
+    print("skip_gp_attention (from run params):", skip_gp_attention)
     legacy_target_subsample_n = int(run_params.get("target_subsample_n", 5000))
     legacy_target_subsample_seed = int(run_params.get("target_subsample_seed", 0))
     if legacy_target_subsample_n <= 0:
@@ -1453,15 +1464,18 @@ def main():
 
         print("Source model ({}) :".format(source_artifact_name))
         source_mgate, hidden_dims1, hidden_dims2, source_vgp_anchor_mode = load_mgate(
-            client, run_id, source_artifact_name, device, tmpdir
+            client, run_id, source_artifact_name, device, tmpdir,
+            skip_gp_attention=skip_gp_attention,
         )
 
         if dual_source_kd:
             teacher_source_mgate, _, _, _ = load_mgate(
-                client, run_id, source_artifact_map["stage1_teacher"], device, tmpdir
+                client, run_id, source_artifact_map["stage1_teacher"], device, tmpdir,
+                skip_gp_attention=skip_gp_attention,
             )
             nonspatial_source_mgate, _, _, _ = load_mgate(
-                client, run_id, source_artifact_map["stage1_nonspatial"], device, tmpdir
+                client, run_id, source_artifact_map["stage1_nonspatial"], device, tmpdir,
+                skip_gp_attention=skip_gp_attention,
             )
         else:
             teacher_source_mgate = source_mgate
@@ -1497,7 +1511,8 @@ def main():
                     )
                 )
             target_mgate, _, _, _ = load_mgate(
-                client, resolved_stage2_run_id, "model_stage2.pth", device, tmpdir
+                client, resolved_stage2_run_id, "model_stage2.pth", device, tmpdir,
+                skip_gp_attention=skip_gp_attention,
             )
         else:
             # Zero-shot: built after download, outside the tmpdir block
@@ -1788,7 +1803,7 @@ def main():
     source_concat_adata.obs = source_concat_adata.obs.assign(source_obs_names = source_concat_adata.obs_names)
     source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
 
-    source_target_adata = run_alignment_and_spatial_plot(
+    source_target_adata, _, _ = run_alignment_and_spatial_plot(
         model,
         source_mgate,
         target_mgate,
@@ -1798,6 +1813,19 @@ def main():
         target_concat_adata,
         deterministic_seed,
     )
+
+    ## transfer UMAP, spatial coordinates and ingest-transferred variables to original datasets
+    source_rna.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'rna']).all(1)].obsm['X_umap'].copy()
+    source_atac.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'atac']).all(1)].obsm['X_umap'].copy()
+
+    target_rna.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'rna']).all(1)].obsm['X_umap'].copy()
+    target_atac.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'atac']).all(1)].obsm['X_umap'].copy()
+
+    target_rna.obsm['spatial'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'rna']).all(1)].obsm['spatial'].copy()
+    target_atac.obsm['spatial'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'atac']).all(1)].obsm['spatial'].copy()
+
+    target_rna.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'rna']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
+    target_atac.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'atac']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
 
     '''
     source_target_rna = sc.concat([source_rna, target_rna], axis=0)
@@ -1823,8 +1851,6 @@ def main():
     sc.pl.umap(source_target_adata, color=['modality', 'leiden', 'source_or_target'], ncols=3, wspace=0.2, size=25)
     '''
 
-
-
     ## [COMMENTED OUT] write to disk
     # for keys in (source_rna.obsm.keys(), source_atac.obsm.keys(), target_rna.obsm.keys(), target_atac.obsm.keys()):
     #     assert 'MultiGATE_source_aligned' in keys, f"MultiGATE_source_aligned not found in {keys}"
@@ -1832,6 +1858,7 @@ def main():
     #source_atac.write_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
     #target_rna.write_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
     #target_atac.write_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
+
 
     #%% Analysis on concatenated data
 
@@ -1921,7 +1948,7 @@ def main():
         sc.pl.umap(target_concat_adata, color=['modality', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
         plt.tight_layout(); plt.show()
 
-    #%% Save adata for FASTopic analysis
+    #%% FASTopic analysis
 
     import decoupler as dc
     import decoupler.op
@@ -3481,42 +3508,71 @@ def main():
     from sklearn.linear_model import LogisticRegression, PoissonRegressor
     from sklearn.multioutput import MultiOutputRegressor
 
-    #X = pathway_embedding_results['source_rna'].pathway_scores.to_numpy()
-    X = source_rna.X#.toarray()
-    Z = source_rna.obsm['MultiGATE_source_aligned'].copy()
-    C = source_rna.obs['RNA_clusters'].copy()
+    def run_pls_embedding_to_gene_plots(adata, n_components=9, basis='spatial', top_n_genes=5, heatmap_cmap='YlGn'):
+        # X = pathway_embedding_results['source_rna'].pathway_scores.to_numpy()
+        X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
+        Z = adata.obsm['MultiGATE_source_aligned'].copy()
 
-    pls = PLSRegression(n_components=9)
-    pls.fit(Z, X)
-    T = pls.transform(Z)
+        pls = PLSRegression(n_components=n_components)
+        pls.fit(Z, X)
+        T = pls.transform(Z)
 
-    ## plot PLS laodings onto UMAP
-    source_rna_pls = source_rna.copy()
+        ## plot PLS loadings onto embedding
+        adata_pls = adata.copy()
+        adata_pls.obs = adata_pls.obs.merge(
+            pd.DataFrame(T, index=adata.obs_names, columns=[f'PLS_{i}' for i in range(T.shape[1])]),
+            left_index=True, right_index=True,
+        )
+        sc.pl.embedding(
+            adata_pls,
+            basis=basis,  # 'spatial' or 'X_seurat_umap' or 'X_umap
+            color=adata_pls.obs.columns[adata_pls.obs.columns.str.startswith('PLS_')],
+            ncols=3, wspace=0.2, size=25, show=False
+        )
+        fig = plt.gcf()
+        fig.set_size_inches(12, 10)  # or any desired figsize (width, height)
+        for ax in fig.get_axes():
+            ax.set_xlabel('')
+            ax.set_ylabel('')
+        plt.tight_layout()
+        plt.show()
 
-    sc.pp.neighbors(source_rna_pls, use_rep='MultiGATE_source_aligned', metric='cosine')
-    sc.tl.umap(source_rna_pls, min_dist=0.3, spread=1.0)
-    source_rna_pls.obsm['spatial'] = source_rna_pls.obsm['spatial']# * [-1, -1]
+        ## plot heatmap of PLS coef
+        pls_coef_df = pd.DataFrame(
+            pls.y_weights_.T,
+            index=[f'PLS_{i}' for i in range(pls.y_weights_.shape[1])],
+            columns=adata.var_names
+        )
+        top_genes_sort = pls_coef_df.abs().apply(
+            lambda x: x.nlargest(top_n_genes).index, axis=1, result_type='reduce'
+        ).explode().unique()
+        pls_coef_df_sorted = pls_coef_df.loc[:, top_genes_sort]
+        plt.figure(figsize=(5, 8))
+        sns.heatmap(pls_coef_df_sorted.T.abs(), cmap=heatmap_cmap, cbar=True)
+        plt.tight_layout()
+        plt.show()
 
-    source_rna_pls.obs = source_rna_pls.obs.merge(
-        pd.DataFrame(T, index=source_rna.obs_names, columns=[f'PLS_{i}' for i in range(T.shape[1])]),
-        left_index=True, right_index=True,
-    )
-    p = sc.pl.embedding(
-        source_rna_pls,
-        basis='spatial', # 'spatial' or 'X_seurat_umap' or 'X_umap
-        color=source_rna_pls.obs.columns[source_rna_pls.obs.columns.str.startswith('PLS_')],
-        ncols=3, wspace=0.2, size=25, show=False)
-    # Ensure the figure size is set before plotting
-    # Remove axis titles from all subplots
-    fig = plt.gcf()
-    fig.set_size_inches(12, 10)  # or any desired figsize (width, height)
-    for ax in fig.get_axes():
-        ax.set_xlabel('')
-        ax.set_ylabel('')
+        return X, Z, T, pls
+
+    _, _, _, pls_source_rna = run_pls_embedding_to_gene_plots(source_rna)
+    _, _, _, pls_target_rna = run_pls_embedding_to_gene_plots(target_rna)
+    _, _, _, pls_source_atac = run_pls_embedding_to_gene_plots(source_atac)
+    _, _, _, pls_target_atac = run_pls_embedding_to_gene_plots(target_atac)
+
+    ## plot correlation between source and target PLS dimensions
+    pls_rna_corr = np.corrcoef(pls_source_rna.y_weights_, pls_target_rna.y_weights_, rowvar=False)
+    pls_rna_corr = pls_rna_corr[:pls_source_rna.y_weights_.shape[1], pls_target_rna.y_weights_.shape[1]:]
+    sns.heatmap(np.abs(pls_rna_corr), cmap='YlGn', cbar=True)
+    plt.xlabel('Target RNA PLS dimensions')
+    plt.ylabel('Source RNA PLS dimensions')
     plt.tight_layout(); plt.show()
 
-    ## plot heatmap of PLS coef
-    sns.clustermap(pls.coef_, cmap='viridis', cbar=True, vmax=1.5)
+    pls_atac_corr = np.corrcoef(pls_source_atac.y_weights_, pls_target_atac.y_weights_, rowvar=False)
+    pls_atac_corr = pls_atac_corr[:pls_source_atac.y_weights_.shape[1], pls_target_atac.y_weights_.shape[1]:]
+    sns.heatmap(np.abs(pls_atac_corr), cmap='YlGn', cbar=True)
+    plt.xlabel('Target ATAC PLS dimensions')
+    plt.ylabel('Source ATAC PLS dimensions')
+    plt.tight_layout(); plt.show()
 
     model = MultiOutputRegressor(PoissonRegressor())
     model.fit(T, X)

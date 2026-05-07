@@ -342,7 +342,7 @@ if __name__ == "__main__":
         "rna": "SCT_counts",
         "atac": "counts",
     }
-    n_epochs = int(1e4)
+    n_epochs = int(1e3)
     tied_topics = True
 
     if tied_topics:
