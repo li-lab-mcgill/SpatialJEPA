@@ -3571,7 +3571,7 @@ def main():
     import decoupler.op
     import liana as li
 
-    def run_pls_embedding_to_gene_plots(adata, n_components=9, basis='spatial', weights_plot_type='staircase', top_n_genes=5, heatmap_cmap='YlGn'):
+    def run_pls_embedding_to_gene_plots(adata, full_adata=None, n_components=9, basis='spatial', weights_plot_type='staircase', top_n_genes=5, heatmap_cmap='YlGn'):
         # X = pathway_embedding_results['source_rna'].pathway_scores.to_numpy()
         X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
         Z = adata.obsm['MultiGATE_source_aligned'].copy()
@@ -3581,16 +3581,27 @@ def main():
         T = pls.transform(Z)
 
         ## plot PLS loadings onto embedding
-        adata_pls = adata.copy()
-        adata_pls.obs = adata_pls.obs.merge(
-            pd.DataFrame(T, index=adata.obs_names, columns=[f'PLS_{i}' for i in range(T.shape[1])]),
-            left_index=True, right_index=True,
-        )
+        pls_cols = [f'PLS_{i}' for i in range(T.shape[1])]
+        pls_df = pd.DataFrame(T, index=adata.obs_names, columns=pls_cols)
+
+        if full_adata is not None:
+            # Reindex onto the full cell set; cells filtered out get NaN and are
+            # rendered as na_color ('lightgray') to form a spatial background.
+            full_obs = full_adata.obs.copy().join(pls_df, how='left')
+            adata_pls = sc.AnnData(
+                X=np.zeros((full_adata.n_obs, 1)),
+                obs=full_obs,
+                obsm={'spatial': full_adata.obsm['spatial'].copy()},
+            )
+        else:
+            adata_pls = adata.copy()
+            adata_pls.obs = adata_pls.obs.merge(pls_df, left_index=True, right_index=True)
+
         sc.pl.embedding(
             adata_pls,
             basis=basis,  # 'spatial' or 'X_seurat_umap' or 'X_umap
             color=adata_pls.obs.columns[adata_pls.obs.columns.str.startswith('PLS_')],
-            ncols=3, wspace=0.2, size=25, show=False
+            ncols=3, wspace=0.2, size=25, show=False, na_color='darkgray'
         )
         fig = plt.gcf()
         fig.set_size_inches(12, 10)  # or any desired figsize (width, height)
@@ -3738,6 +3749,19 @@ def main():
     unique_geneset_per_lr = lr_geneset.groupby('interaction')['source'].unique().map(list).rename('genesets')
     unique_geneset_per_lr = unique_geneset_per_lr.explode().str.get_dummies().groupby(level=0).max()
 
+    # Capture full spatial layout before filter_cells removes any cells, so
+    # filtered-out cells can be rendered as a gray background in spatial plots.
+    full_spatial_obsm_df_source = sc.AnnData(
+        X=np.zeros((lrdata_source_rna.n_obs, 1)),
+        obs=lrdata_source_rna.obs.copy(),
+        obsm={'spatial': lrdata_source_rna.obsm['spatial'].copy()},
+    )
+    full_spatial_obsm_df_target = sc.AnnData(
+        X=np.zeros((lrdata_target_rna.n_obs, 1)),
+        obs=lrdata_target_rna.obs.copy(),
+        obsm={'spatial': lrdata_target_rna.obsm['spatial'].copy()},
+    )
+
     lrdata_source_rna_genesets = build_lrdata_aggregated_by_genesets(
         lrdata_source_rna, unique_geneset_per_lr, umap_title='source RNA LIANA (geneset aggregate)'
     )
@@ -3747,27 +3771,29 @@ def main():
 
     if lrdata_source_rna_genesets is not None:
         _, _, _, pls_lrdata_source_rna_genesets = run_pls_embedding_to_gene_plots(
-            lrdata_source_rna_genesets, weights_plot_type='barplot'
+            lrdata_source_rna_genesets, full_spatial_obsm_df_source, weights_plot_type='barplot'
         )
     if lrdata_target_rna_genesets is not None:
         _, _, _, pls_lrdata_target_rna_genesets = run_pls_embedding_to_gene_plots(
-            lrdata_target_rna_genesets, weights_plot_type='barplot'
+            lrdata_target_rna_genesets, full_spatial_obsm_df_target, weights_plot_type='barplot'
         )
 
     ## plot correlation between source and target PLS dimensions
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
     pls_rna_corr = np.corrcoef(pls_source_rna.y_weights_, pls_target_rna.y_weights_, rowvar=False)
     pls_rna_corr = pls_rna_corr[:pls_source_rna.y_weights_.shape[1], pls_target_rna.y_weights_.shape[1]:]
-    sns.heatmap(np.abs(pls_rna_corr), cmap='YlGn', cbar=True)
-    plt.xlabel('Target RNA PLS dimensions')
-    plt.ylabel('Source RNA PLS dimensions')
-    plt.tight_layout(); plt.show()
+    sns.heatmap(np.abs(pls_rna_corr), cmap='YlGn', cbar=True, ax=ax[0])
+    ax[0].set_xlabel('Target PLS dimensions')
+    ax[0].set_ylabel('Source PLS dimensions')
+    ax[0].set_title('RNA')
 
     pls_atac_corr = np.corrcoef(pls_source_atac.y_weights_, pls_target_atac.y_weights_, rowvar=False)
     pls_atac_corr = pls_atac_corr[:pls_source_atac.y_weights_.shape[1], pls_target_atac.y_weights_.shape[1]:]
-    sns.heatmap(np.abs(pls_atac_corr), cmap='YlGn', cbar=True)
-    plt.xlabel('Target ATAC PLS dimensions')
-    plt.ylabel('Source ATAC PLS dimensions')
-    plt.tight_layout(); plt.show()
+    sns.heatmap(np.abs(pls_atac_corr), cmap='YlGn', cbar=True, ax=ax[1])
+    ax[1].set_xlabel('Target PLS dimensions')
+    ax[1].set_ylabel('Source PLS dimensions')
+    ax[1].set_title('ATAC')
+    fig.tight_layout(); plt.show()
 
     #%% AJIVE analysis
     from mvlearn.decomposition import AJIVE
