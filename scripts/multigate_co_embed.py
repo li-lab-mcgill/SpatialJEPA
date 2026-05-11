@@ -1830,6 +1830,55 @@ def main():
     target_rna.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'rna']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
     target_atac.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'atac']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
 
+    ## get top genes per leiden cluster
+    sc.tl.rank_genes_groups(
+        source_rna,
+        groupby="leiden",
+        method="t-test",   # or "t-test", "logreg"
+        reference="rest"
+    )
+    source_rna_rank_genes_leidens_df = sc.get.rank_genes_groups_df(source_rna, group=None)
+    
+    sc.tl.rank_genes_groups(
+        target_rna,
+        groupby="leiden",
+        method="t-test",   # or "t-test", "logreg"
+        reference="rest"
+    )
+    target_rna_rank_genes_leidens_df = sc.get.rank_genes_groups_df(target_rna, group=None)
+
+    ## merge source and target rank genes leidens dataframes, only keep significant genes
+    merged_rank_genes_leidens_df = pd.merge(
+        source_rna_rank_genes_leidens_df.drop(columns=['scores', 'logfoldchanges', 'pvals']),
+        target_rna_rank_genes_leidens_df.drop(columns=['scores', 'logfoldchanges', 'pvals']),
+        on=["group", "names"],
+        how="outer",
+        suffixes=("_source", "_target"),
+    )
+    prop_signif_per_leiden = merged_rank_genes_leidens_df.drop(columns=['group','names']).le(0.05).mean(axis=0)
+    print(prop_signif_per_leiden)
+
+    merged_rank_genes_leidens_df = merged_rank_genes_leidens_df[(
+        merged_rank_genes_leidens_df['pvals_adj_source'].le(0.05) &
+        merged_rank_genes_leidens_df['pvals_adj_target'].le(0.05)
+    )]
+    rank_genes_leidens_corr = merged_rank_genes_leidens_df.groupby('group')[['pvals_adj_source', 'pvals_adj_target']].corr(method='spearman')
+    rank_genes_leidens_corr = rank_genes_leidens_corr.groupby(level=0).apply(lambda df: df.iloc[0, 1])
+
+    ## combine p-values and get top genes per leiden cluster
+    from scipy.stats import combine_pvalues
+    merged_rank_genes_leidens_df['combined_pvals'] = merged_rank_genes_leidens_df.apply(
+        lambda row: combine_pvalues([row['pvals_adj_source'], row['pvals_adj_target']], method='pearson')[1], axis=1)
+    top_genes_per_leiden = merged_rank_genes_leidens_df.groupby('group').apply(
+        lambda group: group.nsmallest(3, 'combined_pvals', keep='all').loc[:,['names','combined_pvals']]
+    )
+    print(top_genes_per_leiden)
+
+    ## plot top genes per leiden cluster on UMAP
+    marker_leiden_genes = top_genes_per_leiden.names.unique()
+    sc.pl.embedding(source_rna, color=marker_leiden_genes, basis='spatial', ncols=marker_leiden_genes.size, cmap='YlGn', wspace=0.2, size=50)
+    sc.pl.embedding(target_rna, color=marker_leiden_genes, basis='spatial', ncols=marker_leiden_genes.size, cmap='viridis', wspace=0.2, size=50)
+
     '''
     source_target_rna = sc.concat([source_rna, target_rna], axis=0)
     source_target_atac = sc.concat([source_atac, target_atac], axis=0)
@@ -3526,7 +3575,7 @@ def main():
         X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
         Z = adata.obsm['MultiGATE_source_aligned'].copy()
 
-        pls = PLSRegression(n_components=n_components)
+        pls = PLSRegression(n_components=n_components)  
         pls.fit(Z, X)
         T = pls.transform(Z)
 
