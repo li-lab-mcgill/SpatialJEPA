@@ -78,9 +78,11 @@ def run_SCTransform(adata, cell_type_key="RNA_clusters"):
     #norm_x = ro.r('res@assays$SCT@scale.data').T
     #sct_genes_full = list(ro.r("rownames(res@assays$SCT)"))
     sct_counts = ro.r('GetAssayData(res, assay = "SCT", layer = "counts")').T
+    sct_data = ro.r('GetAssayData(res, assay = "SCT", layer = "data")').T
     sct_scale_data = ro.r('GetAssayData(res, assay = "SCT", layer = "scale.data")').T
     adata.X = sct_scale_data
     adata.layers['SCT_counts'] = sct_counts
+    adata.layers['SCT_data'] = sct_data
 
     sct_genes = list(ro.r("sct_genes"))
     adata.var['SCT_gene'] = adata.var_names.isin(sct_genes)
