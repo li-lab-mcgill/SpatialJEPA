@@ -3571,7 +3571,37 @@ def main():
     import decoupler.op
     import liana as li
 
-    def run_pls_embedding_to_gene_plots(adata, full_adata=None, n_components=9, basis='spatial', weights_plot_type='staircase', top_n_genes=5, heatmap_cmap='YlGn'):
+    def rasterize_heavy_pdf_artists(fig):
+        """Rasterize dense artists while keeping text and axes vector in PDFs."""
+        for ax in fig.get_axes():
+            for artist in ax.collections:
+                artist.set_rasterized(True)
+            for artist in ax.images:
+                artist.set_rasterized(True)
+
+    def save_plot_to_pdf(fig, filename, save_dir="/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis", dpi=300):
+        """Save figure as a fast-rendering PDF with heavy plot layers rasterized."""
+        import logging
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+        filepath = os.path.join(save_dir, f"{filename}.pdf")
+        rasterize_heavy_pdf_artists(fig)
+        fonttools_logger = logging.getLogger('fontTools')
+        fonttools_level = fonttools_logger.level
+        fonttools_logger.setLevel(logging.WARNING)
+        try:
+            with plt.rc_context({'pdf.fonttype': 42, 'ps.fonttype': 42}):
+                fig.savefig(filepath, format='pdf', dpi=dpi, bbox_inches='tight')
+        finally:
+            fonttools_logger.setLevel(fonttools_level)
+        print(f"Saved: {filepath}")
+        plt.close(fig)
+
+    def run_pls_embedding_to_gene_plots(
+        adata, full_adata=None, umap_title=None, save_plots=False, plot_prefix='',
+        umap_plot_prefix=None, spatial_leiden_plot_prefix=None,
+        n_components=9, basis='spatial', weights_plot_type='staircase', top_n_genes=5, heatmap_cmap='YlGn'
+    ):
         # X = pathway_embedding_results['source_rna'].pathway_scores.to_numpy()
         X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
         Z = adata.obsm['MultiGATE_source_aligned'].copy()
@@ -3597,6 +3627,33 @@ def main():
             adata_pls = adata.copy()
             adata_pls.obs = adata_pls.obs.merge(pls_df, left_index=True, right_index=True)
 
+        if 'X_umap' in adata.obsm and 'leiden' in adata.obs:
+            sc.pl.umap(adata_pls, color='leiden', size=25, show=False)
+            if umap_title is not None:
+                plt.gca().set_title(umap_title)
+            plt.tight_layout()
+            fig = plt.gcf()
+            if save_plots:
+                save_prefix = umap_plot_prefix or plot_prefix
+                save_plot_to_pdf(fig, f"{save_prefix}_liana_umap_leiden")
+            plt.show()
+
+        if 'spatial' in adata_pls.obsm and 'leiden' in adata_pls.obs:
+            sc.pl.embedding(
+                adata_pls,
+                basis='spatial',
+                color='leiden',
+                size=60,
+                show=False,
+                na_color='darkgray',
+            )
+            fig = plt.gcf()
+            plt.tight_layout()
+            if save_plots:
+                save_prefix = spatial_leiden_plot_prefix or plot_prefix
+                save_plot_to_pdf(fig, f"{save_prefix}_spatial_leiden")
+            plt.show()
+
         sc.pl.embedding(
             adata_pls,
             basis=basis,  # 'spatial' or 'X_seurat_umap' or 'X_umap
@@ -3609,6 +3666,8 @@ def main():
             ax.set_xlabel('')
             ax.set_ylabel('')
         plt.tight_layout()
+        if save_plots:
+            save_plot_to_pdf(fig, f"{plot_prefix}_pls_embedding_spatial")
         plt.show()
 
         ## plot heatmap of PLS coef
@@ -3622,9 +3681,11 @@ def main():
                 lambda x: x.nlargest(top_n_genes).index, axis=1, result_type='reduce'
             ).explode().unique()
             pls_coef_df_sorted = pls_coef_df.loc[:, top_genes_sort]
-            plt.figure(figsize=(5, 8))
+            fig = plt.figure(figsize=(5, 8))
             sns.heatmap(pls_coef_df_sorted.T.abs(), cmap=heatmap_cmap, cbar=True)
             plt.tight_layout()
+            if save_plots:
+                save_plot_to_pdf(fig, f"{plot_prefix}_pls_weights_heatmap_staircase")
             plt.show()
         elif weights_plot_type == 'barplot':
             fig, ax = plt.subplots(figsize=(6, 4))
@@ -3649,14 +3710,17 @@ def main():
             from matplotlib.patches import Patch
             legend_elements = [Patch(facecolor=geneset_colors[col], label=col) for col in pls_coef_df.columns]
             ax.legend(handles=legend_elements, bbox_to_anchor=(0.5, -0.2), loc='upper center', ncol=2)
-            plt.tight_layout(); plt.show()
+            plt.tight_layout()
+            if save_plots:
+                save_plot_to_pdf(fig, f"{plot_prefix}_pls_weights_barplot")
+            plt.show()
         return X, Z, T, pls
 
     ## train PLS models on source and target data
-    _, _, _, pls_source_rna = run_pls_embedding_to_gene_plots(source_rna)
-    _, _, _, pls_target_rna = run_pls_embedding_to_gene_plots(target_rna)
-    _, _, _, pls_source_atac = run_pls_embedding_to_gene_plots(source_atac)
-    _, _, _, pls_target_atac = run_pls_embedding_to_gene_plots(target_atac)
+    _, _, _, pls_source_rna = run_pls_embedding_to_gene_plots(source_rna, save_plots=True, plot_prefix='01_source_rna_pls')
+    _, _, _, pls_target_rna = run_pls_embedding_to_gene_plots(target_rna, save_plots=True, plot_prefix='02_target_rna_pls')
+    _, _, _, pls_source_atac = run_pls_embedding_to_gene_plots(source_atac, save_plots=True, plot_prefix='03_source_atac_pls')
+    _, _, _, pls_target_atac = run_pls_embedding_to_gene_plots(target_atac, save_plots=True, plot_prefix='04_target_atac_pls')
 
     def get_liana_lrdata(adata, cell_type_col, lr_pairs):
 
@@ -3707,10 +3771,10 @@ def main():
     ## build LR data and train PLS models on LR data
     lrdata_source_rna = get_liana_lrdata(source_rna, 'leiden', lr_pairs)
     lrdata_target_rna = get_liana_lrdata(target_rna, 'leiden', lr_pairs)
-    _, _, _, pls_source_rna_liana = run_pls_embedding_to_gene_plots(lrdata_source_rna)
-    _, _, _, pls_target_rna_liana = run_pls_embedding_to_gene_plots(lrdata_target_rna)
+    _, _, _, pls_source_rna_liana = run_pls_embedding_to_gene_plots(lrdata_source_rna, save_plots=True, plot_prefix='05_source_rna_liana_pls')
+    _, _, _, pls_target_rna_liana = run_pls_embedding_to_gene_plots(lrdata_target_rna, save_plots=True, plot_prefix='06_target_rna_liana_pls')
 
-    def build_lrdata_aggregated_by_genesets(lrdata, unique_geneset_per_lr, umap_title=None):
+    def build_lrdata_aggregated_by_genesets(lrdata, unique_geneset_per_lr, umap_title=None, save_plots=False, plot_prefix=''):
         """Aggregate LIANA inflow by hallmark geneset; mutates lrdata.var with geneset columns."""
         lrdata.var = lrdata.var.merge(
             unique_geneset_per_lr, left_on='interaction', right_index=True, how='left'
@@ -3727,18 +3791,14 @@ def main():
             X=X_genesets,
             obs=lrdata.obs,
             var=pd.DataFrame(index=liana_by_geneset.columns),
+            obsm={'spatial': lrdata.obsm['spatial'].copy()},
         )
         sc.pp.filter_cells(lrdata_genesets, min_genes=3)
         sc.pp.filter_genes(lrdata_genesets, min_cells=2)
 
         sc.pp.neighbors(lrdata_genesets, use_rep='X', metric='cosine')
         sc.tl.umap(lrdata_genesets)
-        sc.tl.leiden(lrdata_genesets, resolution=0.1)
-        sc.pl.umap(lrdata_genesets, color='leiden', size=25, show=False)
-        if umap_title is not None:
-            plt.gca().set_title(umap_title)
-        plt.tight_layout()
-        plt.show()
+        sc.tl.leiden(lrdata_genesets, resolution=0.03)
 
         lrdata_genesets.obsm['MultiGATE_source_aligned'] = lrdata[
             lrdata_genesets.obs_names
@@ -3763,19 +3823,31 @@ def main():
     )
 
     lrdata_source_rna_genesets = build_lrdata_aggregated_by_genesets(
-        lrdata_source_rna, unique_geneset_per_lr, umap_title='source RNA LIANA (geneset aggregate)'
+        lrdata_source_rna, unique_geneset_per_lr
     )
     lrdata_target_rna_genesets = build_lrdata_aggregated_by_genesets(
-        lrdata_target_rna, unique_geneset_per_lr, umap_title='target RNA LIANA (geneset aggregate)'
+        lrdata_target_rna, unique_geneset_per_lr
     )
 
     if lrdata_source_rna_genesets is not None:
         _, _, _, pls_lrdata_source_rna_genesets = run_pls_embedding_to_gene_plots(
-            lrdata_source_rna_genesets, full_spatial_obsm_df_source, weights_plot_type='barplot'
+            lrdata_source_rna_genesets,
+            full_spatial_obsm_df_source,
+            umap_title='source RNA LIANA (geneset aggregate)',
+            umap_plot_prefix='07_source_rna_liana_geneset',
+            weights_plot_type='barplot',
+            save_plots=True,
+            plot_prefix='09_source_rna_liana_geneset_pls',
         )
     if lrdata_target_rna_genesets is not None:
         _, _, _, pls_lrdata_target_rna_genesets = run_pls_embedding_to_gene_plots(
-            lrdata_target_rna_genesets, full_spatial_obsm_df_target, weights_plot_type='barplot'
+            lrdata_target_rna_genesets,
+            full_spatial_obsm_df_target,
+            umap_title='target RNA LIANA (geneset aggregate)',
+            umap_plot_prefix='08_target_rna_liana_geneset',
+            weights_plot_type='barplot',
+            save_plots=True,
+            plot_prefix='10_target_rna_liana_geneset_pls',
         )
 
     ## plot correlation between source and target PLS dimensions
@@ -3793,7 +3865,9 @@ def main():
     ax[1].set_xlabel('Target PLS dimensions')
     ax[1].set_ylabel('Source PLS dimensions')
     ax[1].set_title('ATAC')
-    fig.tight_layout(); plt.show()
+    fig.tight_layout()
+    save_plot_to_pdf(fig, '11_pls_source_target_correlation_heatmaps')
+    plt.show()
 
     #%% AJIVE analysis
     from mvlearn.decomposition import AJIVE
