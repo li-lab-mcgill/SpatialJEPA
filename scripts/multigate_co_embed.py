@@ -3567,10 +3567,11 @@ def main():
 
     #%% embedding-to-gene modelling
     from sklearn.cross_decomposition import PLSRegression
-    from sklearn.linear_model import LogisticRegression, PoissonRegressor
-    from sklearn.multioutput import MultiOutputRegressor
+    import decoupler as dc
+    import decoupler.op
+    import liana as li
 
-    def run_pls_embedding_to_gene_plots(adata, n_components=9, basis='spatial', top_n_genes=5, heatmap_cmap='YlGn'):
+    def run_pls_embedding_to_gene_plots(adata, n_components=9, basis='spatial', weights_plot_type='staircase', top_n_genes=5, heatmap_cmap='YlGn'):
         # X = pathway_embedding_results['source_rna'].pathway_scores.to_numpy()
         X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
         Z = adata.obsm['MultiGATE_source_aligned'].copy()
@@ -3605,17 +3606,42 @@ def main():
             index=[f'PLS_{i}' for i in range(pls.y_weights_.shape[1])],
             columns=adata.var_names
         )
-        top_genes_sort = pls_coef_df.abs().apply(
-            lambda x: x.nlargest(top_n_genes).index, axis=1, result_type='reduce'
-        ).explode().unique()
-        pls_coef_df_sorted = pls_coef_df.loc[:, top_genes_sort]
-        plt.figure(figsize=(5, 8))
-        sns.heatmap(pls_coef_df_sorted.T.abs(), cmap=heatmap_cmap, cbar=True)
-        plt.tight_layout()
-        plt.show()
-
+        if weights_plot_type == 'staircase':
+            top_genes_sort = pls_coef_df.abs().apply(
+                lambda x: x.nlargest(top_n_genes).index, axis=1, result_type='reduce'
+            ).explode().unique()
+            pls_coef_df_sorted = pls_coef_df.loc[:, top_genes_sort]
+            plt.figure(figsize=(5, 8))
+            sns.heatmap(pls_coef_df_sorted.T.abs(), cmap=heatmap_cmap, cbar=True)
+            plt.tight_layout()
+            plt.show()
+        elif weights_plot_type == 'barplot':
+            fig, ax = plt.subplots(figsize=(6, 4))
+            
+            n_components = len(pls_coef_df)
+            n_genesets = len(pls_coef_df.columns)
+            bar_width = 0.8 / n_genesets
+            
+            colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+            geneset_colors = {col: colors[i % len(colors)] for i, col in enumerate(pls_coef_df.columns)}
+            
+            for i, (idx, row) in enumerate(pls_coef_df.iterrows()):
+                sorted_row = row.sort_values(ascending=False)
+                for j, (geneset, val) in enumerate(sorted_row.items()):
+                    pos = i - 0.4 + (j + 0.5) * bar_width
+                    ax.bar(pos, val, width=bar_width, color=geneset_colors[geneset])
+            
+            ax.set_xticks(range(n_components))
+            ax.set_xticklabels(pls_coef_df.index, rotation=30)
+            ax.set_ylabel('PLS weight')
+            
+            from matplotlib.patches import Patch
+            legend_elements = [Patch(facecolor=geneset_colors[col], label=col) for col in pls_coef_df.columns]
+            ax.legend(handles=legend_elements, bbox_to_anchor=(0.5, -0.2), loc='upper center', ncol=2)
+            plt.tight_layout(); plt.show()
         return X, Z, T, pls
 
+    ## train PLS models on source and target data
     _, _, _, pls_source_rna = run_pls_embedding_to_gene_plots(source_rna)
     _, _, _, pls_target_rna = run_pls_embedding_to_gene_plots(target_rna)
     _, _, _, pls_source_atac = run_pls_embedding_to_gene_plots(source_atac)
@@ -3623,7 +3649,7 @@ def main():
 
     def get_liana_lrdata(adata, cell_type_col, lr_pairs):
 
-        adata.X = adata.layers["SCT_counts"].copy()
+        adata.X = adata.layers["SCT_data"].copy()
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
 
@@ -3667,31 +3693,37 @@ def main():
         weight=None,
     )
 
-
+    ## build LR data and train PLS models on LR data
     lrdata_source_rna = get_liana_lrdata(source_rna, 'leiden', lr_pairs)
     lrdata_target_rna = get_liana_lrdata(target_rna, 'leiden', lr_pairs)
     _, _, _, pls_source_rna_liana = run_pls_embedding_to_gene_plots(lrdata_source_rna)
     _, _, _, pls_target_rna_liana = run_pls_embedding_to_gene_plots(lrdata_target_rna)
 
-    lrdata_source_rna.var = lrdata_source_rna.var.merge(unique_geneset_per_lr, left_on='interaction', right_index=True, how='left')
-    lrdata_target_rna.var = lrdata_target_rna.var.merge(unique_geneset_per_lr, left_on='interaction', right_index=True, how='left')
-
+    ## create LR anndata
     unique_geneset_per_lr = lr_geneset.groupby('interaction')['source'].unique().map(list).rename('genesets')
     unique_geneset_per_lr = unique_geneset_per_lr.explode().str.get_dummies().groupby(level=0).max()
+    lrdata_source_rna.var = lrdata_source_rna.var.merge(unique_geneset_per_lr, left_on='interaction', right_index=True, how='left')
+    lrdata_target_rna.var = lrdata_target_rna.var.merge(unique_geneset_per_lr, left_on='interaction', right_index=True, how='left')
 
     target_rna_liana_by_geneset = lrdata_target_rna.var.merge(unique_geneset_per_lr, left_on='interaction', right_index=True, how='left')
     target_rna_liana_by_geneset = target_rna_liana_by_geneset[unique_geneset_per_lr.columns].fillna(0)
     X_genesets_liana = lrdata_target_rna.X @ sp.csr_matrix(target_rna_liana_by_geneset.values)
-    lrdata_target_rna_genesets = sc.AnnData(X=X_genesets_liana, var=pd.DataFrame(index=target_rna_liana_by_geneset.columns))
-    sc.pp.neighbors(lrdata_target_rna_genesets, use_rep='X')
+    lrdata_target_rna_genesets = sc.AnnData(X=X_genesets_liana, obs=lrdata_target_rna.obs, var=pd.DataFrame(index=target_rna_liana_by_geneset.columns))
+    sc.pp.filter_cells(lrdata_target_rna_genesets, min_genes=3)
+    sc.pp.filter_genes(lrdata_target_rna_genesets, min_cells=2)
+
+    ## run UMAP and Leiden clustering on LR data
+    sc.pp.neighbors(lrdata_target_rna_genesets, use_rep='X', metric='cosine')
     sc.tl.umap(lrdata_target_rna_genesets)
-    sc.tl.leiden(lrdata_target_rna_genesets)
+    sc.tl.leiden(lrdata_target_rna_genesets, resolution=0.1)
     sc.pl.umap(lrdata_target_rna_genesets, color='leiden', size=25)
     plt.tight_layout(); plt.show()
 
-    lrdata_target_rna_genesets.obsm['MultiGATE_source_aligned'] = lrdata_target_rna.obsm['MultiGATE_source_aligned'].copy()
-    lrdata_target_rna_genesets.obsm['spatial'] = lrdata_target_rna.obsm['spatial'].copy()
-    _, _, _, pls_lrdata_target_rna_genesets = run_pls_embedding_to_gene_plots(lrdata_target_rna_genesets)
+    ## copy over MultiGATE source aligned and spatial coordinates to LR data
+    lrdata_target_rna_genesets.obsm['MultiGATE_source_aligned'] = lrdata_target_rna[lrdata_target_rna_genesets.obs_names].obsm['MultiGATE_source_aligned'].copy()
+    lrdata_target_rna_genesets.obsm['spatial'] = lrdata_target_rna[lrdata_target_rna_genesets.obs_names].obsm['spatial'].copy()
+    
+    _, _, _, pls_lrdata_target_rna_genesets = run_pls_embedding_to_gene_plots(lrdata_target_rna_genesets, weights_plot_type='barplot')
 
     ## plot correlation between source and target PLS dimensions
     pls_rna_corr = np.corrcoef(pls_source_rna.y_weights_, pls_target_rna.y_weights_, rowvar=False)
@@ -3707,44 +3739,6 @@ def main():
     plt.xlabel('Target ATAC PLS dimensions')
     plt.ylabel('Source ATAC PLS dimensions')
     plt.tight_layout(); plt.show()
-
-    model = MultiOutputRegressor(PoissonRegressor())
-    model.fit(T, X)
-    #model.fit(Z, X)
-
-    B = np.column_stack([est.coef_ for est in model.estimators_])
-    b = np.array([est.intercept_ for est in model.estimators_])
-
-    genes_to_embs = (pls.x_weights_ @ B).T
-    #genes_to_embs = B.T
-    n_genes, n_embs = genes_to_embs.shape # shape: (n_emb, n_genes)
-
-    # Get gene names and embedding names
-    gene_names = source_rna.var_names
-    emb_names = [f"emb_{i}" for i in range(n_embs)]
-
-    # For each embedding dimension, find top 5 genes by absolute coefficient
-    topk = 5
-    top_genes = []
-
-    for emb_idx in range(n_embs):
-        col = genes_to_embs[:, emb_idx]
-        col = abs(col)
-        top_gene_indices = np.argsort(col)[::-1][:topk]
-        top_genes.append(gene_names[top_gene_indices])
-
-    top_genes = np.hstack(top_genes)
-
-    genes_to_embs_df = pd.DataFrame(genes_to_embs, index=gene_names, columns=emb_names)
-    top_genes_to_embs_df = genes_to_embs_df.loc[top_genes]
-    top_genes_to_embs_df = top_genes_to_embs_df.abs()
-
-    sns.heatmap(top_genes_to_embs_df, cmap='viridis', cbar=True)
-    plt.title("Top 5 genes per embedding (PLS coefficients)")
-    plt.ylabel("Gene")
-    plt.xlabel("Embedding dimension")
-    plt.tight_layout()
-    plt.show()
 
     #%% AJIVE analysis
     from mvlearn.decomposition import AJIVE
