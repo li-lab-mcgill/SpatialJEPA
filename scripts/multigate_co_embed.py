@@ -126,6 +126,7 @@ from mouse_brain_spatial_rna_atac import (  # noqa: E402
     build_graph_inputs,
     build_source_student_graph_tf,
     compute_concat_umap,
+    compute_scib_metrics_for_domain,
     load_nichecompass_combined_gp_dict_mouse,
     pair_and_subsample_target,
     prepare_target_for_spatial_graph_type,
@@ -553,6 +554,110 @@ def load_run_params(client, run_id, run_name):
     print("\nRun params for '{}' (ID: {}):".format(run_name, run_id))
     pprint(params)
     return params
+
+
+MODEL_METRIC_GROUP_PREFIXES = (
+    ("source_train", "source_training_loss"),
+    ("stage1_nonspatial_train", "nonspatial_training_loss"),
+    ("stage1_student_distill", "distillation"),
+    ("source_scib", "source_scib"),
+    ("target_scib", "target_scib"),
+    ("stage1_nonspatial_source_target", "nonspatial_alignment"),
+    ("stage1_source_target", "alignment"),
+)
+
+# Ordered longest-first so more-specific prefixes match before shorter ones.
+_DOMAIN_PREFIXES = (
+    "stage2_target",
+    "stage1_nonspatial",
+    "stage1_student",
+    "stage1",
+    "stage2",
+    "source",
+    "target",
+)
+
+
+def _metric_group(metric_name):
+    for prefix, group in MODEL_METRIC_GROUP_PREFIXES:
+        if metric_name.startswith(prefix):
+            return group
+    return "other"
+
+
+def parse_metric_domain_and_name(metric_name):
+    """
+    Split an MLflow metric key into ``(domain, base_metric_name)``.
+
+    scIB keys logged by ``log_scib_metrics`` have the form
+    ``{domain}_scib_{base}`` (e.g. ``source_scib_silhouette_label``).
+    Other keys have the form ``{domain}_{rest}``
+    (e.g. ``source_train_loss``, ``stage2_distill_loss``).
+
+    Domains are matched against ``_DOMAIN_PREFIXES`` longest-first so that
+    ``stage2_target`` is preferred over ``stage2`` or ``target``.
+    """
+    for prefix in _DOMAIN_PREFIXES:
+        scib_tag = "{}_scib_".format(prefix)
+        if metric_name.startswith(scib_tag):
+            return prefix, metric_name[len(scib_tag):]
+    for prefix in _DOMAIN_PREFIXES:
+        tag = "{}_".format(prefix)
+        if metric_name.startswith(tag):
+            return prefix, metric_name[len(tag):]
+    return "other", metric_name
+
+
+def extract_logged_model_metrics(client, run_id, run_name=None, metric_keys=None):
+    """
+    Return all logged MLflow model metric history for a run as a tidy DataFrame.
+
+    One row is emitted per logged metric point. ``domain`` and ``metric_name``
+    are split via ``parse_metric_domain_and_name`` so that, e.g.,
+    ``source_scib_silhouette_label`` becomes domain=``source``,
+    metric_name=``silhouette_label``.  The latest-value table is recoverable
+    via ``df.sort_values(["metric_name", "step", "timestamp"])``.
+    """
+    run = client.get_run(run_id)
+    if metric_keys is None:
+        metric_keys = sorted(run.data.metrics)
+
+    rows = []
+    for raw_key in metric_keys:
+        domain, base_name = parse_metric_domain_and_name(raw_key)
+        history = client.get_metric_history(run_id, raw_key)
+        for point in history:
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "run_name": run_name or run.info.run_name,
+                    "metric_group": _metric_group(raw_key),
+                    "domain": domain,
+                    "metric_name": base_name,
+                    "value": point.value,
+                    "step": point.step,
+                    "timestamp": point.timestamp,
+                    "logged_at": pd.to_datetime(point.timestamp, unit="ms"),
+                }
+            )
+
+    columns = [
+        "run_id",
+        "run_name",
+        "metric_group",
+        "domain",
+        "metric_name",
+        "value",
+        "step",
+        "timestamp",
+        "logged_at",
+    ]
+    metrics_df = pd.DataFrame(rows, columns=columns)
+    if not metrics_df.empty:
+        metrics_df = metrics_df.sort_values(
+            ["domain", "metric_group", "metric_name", "step", "timestamp"]
+        ).reset_index(drop=True)
+    return metrics_df
 
 
 def _format_stage2_run_choices(run_infos):
@@ -1218,8 +1323,8 @@ def run_alignment_and_spatial_plot(
     sc.pl.umap(target_adata, color="leiden", ax=axs[1, 1], size=embedding_point_size, show=False)
     axs[0, 0].set_title("Source spatial")
     axs[0, 1].set_title("Source UMAP")
-    axs[1, 0].set_title("Target spatial (imputed from source)")
-    axs[1, 1].set_title("Target UMAP")
+    axs[1, 0].set_title("Target spatial, aligned to source")
+    axs[1, 1].set_title("Target UMAP, aligned to source")
     plt.tight_layout()
     plt.show()
 
@@ -1375,6 +1480,12 @@ def main():
         output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     print("Output directory:", output_dir)
+
+    #  ── Extract logged model metrics ──────────────────────────────────────
+    model_metrics_df = extract_logged_model_metrics(client, run_id, run_name=args.run_name)
+    model_metrics_df = model_metrics_df.loc[model_metrics_df['step'].eq(model_metrics_df['step'].max())]
+    model_metrics_df.drop(columns=['run_id', 'run_name', 'timestamp', 'logged_at', 'step'], inplace=True)
+    # columns now: metric_group, domain, metric_name, value
 
     # ── GTF path ────────────────────────────────────────────────────────────
     gtf_path = os.path.join(
@@ -1687,7 +1798,7 @@ def main():
     ax = sc.pl.embedding(
         target_rna_ct, color='celltypist_predictions', basis='umap', size=40, show=False
     )
-    plt.gcf().set_size_inches(4, 4)
+    plt.gcf().set_size_inches(5, 4)
     # Force legend into a single column so all labels align on the same axis
     handles, labels = ax.get_legend_handles_labels()
     ax.legend(
@@ -1963,19 +2074,114 @@ def main():
     rank_genes_leidens_corr = merged_rank_genes_leidens_df.groupby('group')[['pvals_adj_source', 'pvals_adj_target']].corr(method='spearman')
     rank_genes_leidens_corr = rank_genes_leidens_corr.groupby(level=0).apply(lambda df: df.iloc[0, 1])
 
+    # Prepare the data: rank-transform and then -log (as in original code)
+    ranked_df = merged_rank_genes_leidens_df[['pvals_adj_source', 'pvals_adj_target']].apply(lambda x: -np.log(x)).rank()
+    ranked_df['leiden'] = merged_rank_genes_leidens_df['group']
+
+    import seaborn as sns
+    from matplotlib.contour import QuadContourSet
+
+    # Compatibility for seaborn 0.12.x with matplotlib >=3.10, where QuadContourSet
+    # no longer exposes the collections attribute that seaborn labels internally.
+    if not hasattr(QuadContourSet, 'collections'):
+        QuadContourSet.collections = property(lambda self: [self])
+
+    leiden_order = sorted(ranked_df['leiden'].dropna().unique())
+    leiden_palette = dict(zip(leiden_order, sns.color_palette(n_colors=len(leiden_order))))
+    from matplotlib.lines import Line2D
+
+    g = sns.jointplot(
+        data=ranked_df,
+        x='pvals_adj_source',
+        y='pvals_adj_target',
+        kind="hex",
+        joint_kws={
+            'gridsize': 10,   # smaller number = larger hex bins
+            'mincnt': 3,
+            'cmap': 'Greys',
+            'alpha': 0.5,
+        },
+    )
+    g.ax_marg_x.remove()
+    g.ax_marg_y.remove()
+    for leiden, leiden_df in ranked_df.groupby('leiden'):
+        sns.regplot(
+            data=leiden_df,
+            x='pvals_adj_source',
+            y='pvals_adj_target',
+            ax=g.ax_joint,
+            scatter=False,
+            ci=None,
+            color=leiden_palette[leiden],
+            lowess=True,
+            truncate=False,
+            line_kws={'linewidth': 3, 'alpha': 1., 'zorder': 3},
+        )
+    legend_handles = [
+        Line2D([0], [0], color=leiden_palette[leiden], lw=3, label=leiden)
+        for leiden in leiden_order
+    ]
+    g.ax_joint.legend(
+        handles=legend_handles,
+        title='leiden',
+        loc='center left',
+        bbox_to_anchor=(1.02, 0.5),
+        frameon=False,
+    )
+    g.fig.subplots_adjust(right=0.78)
+    plt.gcf().set_size_inches(6, 4.5)
+    plt.xlabel('source gene rank'); plt.ylabel('target gene rank')
+    plt.tight_layout(); plt.show()
+
+    ## plot correlations per leiden as a stemplot
+    plt.figure(figsize=(5.5, 2.5))
+    x = rank_genes_leidens_corr.index
+    y = rank_genes_leidens_corr.values
+
+    # Calculate new vmax (upper y-limit) by increasing the max y by 0.01
+    ymax = y.max() + 0.03
+
+    markerline, stemlines, baseline = plt.stem(
+        x, y, linefmt='grey', markerfmt='o', bottom=0.)
+    markerline.set_visible(True)
+    marker_colors = [leiden_palette[leiden] for leiden in x]
+    plt.scatter(
+        x,
+        y,
+        marker='o',
+        s=80,
+        facecolors=marker_colors,
+        edgecolors='black',
+        linewidths=1.5,
+        zorder=3,
+    )
+    plt.xlabel('leiden'); plt.ylabel('Spearman corr.')
+    plt.ylim(plt.ylim()[0], ymax)
+    plt.tight_layout(); plt.show()
+
     ## combine p-values and get top genes per leiden cluster
     from scipy.stats import combine_pvalues
     merged_rank_genes_leidens_df['combined_pvals'] = merged_rank_genes_leidens_df.apply(
         lambda row: combine_pvalues([row['pvals_adj_source'], row['pvals_adj_target']], method='pearson')[1], axis=1)
     top_genes_per_leiden = merged_rank_genes_leidens_df.groupby('group').apply(
-        lambda group: group.nsmallest(3, 'combined_pvals', keep='all').loc[:,['names','combined_pvals']]
+        lambda group: group.nsmallest(1, 'combined_pvals', keep='all').loc[:,['names','combined_pvals']]
     )
     print(top_genes_per_leiden)
 
     ## plot top genes per leiden cluster on UMAP
     marker_leiden_genes = top_genes_per_leiden.names.unique()
-    sc.pl.embedding(source_rna, color=marker_leiden_genes, basis='spatial', ncols=marker_leiden_genes.size, cmap='YlGn', wspace=0.2, size=50)
-    sc.pl.embedding(target_rna, color=marker_leiden_genes, basis='spatial', ncols=marker_leiden_genes.size, cmap='viridis', wspace=0.2, size=50)
+    striatal_markers = ['Pde10a', 'Rgs9', 'Gng7']
+    wm_markers = ['Mobp', 'Mal']
+    striatal_score_name = ','.join(striatal_markers)
+    wm_score_name = ','.join(wm_markers)
+    assert np.isin(striatal_markers, marker_leiden_genes).all() and np.isin(wm_markers, marker_leiden_genes).all()
+    sc.tl.score_genes(source_rna, gene_list=striatal_markers, score_name=striatal_score_name)
+    sc.tl.score_genes(source_rna, gene_list=wm_markers, score_name=wm_score_name)
+    sc.tl.score_genes(target_rna, gene_list=striatal_markers, score_name=striatal_score_name)
+    sc.tl.score_genes(target_rna, gene_list=wm_markers, score_name=wm_score_name)
+
+    sc.pl.embedding(source_rna, color=[striatal_score_name, wm_score_name], basis='spatial', ncols=2, wspace=0.05, size=60)
+    sc.pl.embedding(target_rna, color=[striatal_score_name, wm_score_name], basis='spatial', ncols=2, wspace=0.05, size=60)
 
     '''
     source_target_rna = sc.concat([source_rna, target_rna], axis=0)
@@ -2014,6 +2220,70 @@ def main():
     #source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
     #target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
     #target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
+
+    #%% compute scib metrics for OT-aligned and nonspatial data, and plot model metrics
+
+    ## OT-aligned data
+    target_ot_scib_metrics = compute_scib_metrics_for_domain(
+        rna_adata=target_rna,
+        atac_adata=target_atac,
+        domain_name="target",
+        label_key="celltypist_predictions",
+        scib_n_jobs=1,
+        embedding_key="MultiGATE_source_aligned",
+    )
+
+    ## nonspatial data
+    source_nonspatial_scib_metrics = compute_scib_metrics_for_domain(
+        rna_adata=source_rna,
+        atac_adata=source_atac,
+        domain_name="source",
+        label_key="RNA_clusters",
+        scib_n_jobs=1,
+        embedding_key="MultiGATE_nonspatial",
+    )
+
+    ## build tidy DataFrames for freshly computed scib metrics
+    _SCIB_NUMERIC_KEYS = {"silhouette_label", "ilisi", "bras", "bio_conservation", "batch_correction", "total"}
+
+    def _scib_metrics_to_df(metrics_dict, domain):
+        rows = [
+            {"domain": domain, "metric_name": k, "value": v}
+            for k, v in metrics_dict.items()
+            if k in _SCIB_NUMERIC_KEYS
+        ]
+        return pd.DataFrame(rows, columns=["domain", "metric_name", "value"])
+
+    target_ot_scib_metrics_df = _scib_metrics_to_df(target_ot_scib_metrics, domain="target_ot")
+    source_nonspatial_scib_metrics_df = _scib_metrics_to_df(source_nonspatial_scib_metrics, domain="source_nonspatial")
+
+    # model_metrics_df already has 'domain' and 'metric_name' (stripped) from
+    # extract_logged_model_metrics / parse_metric_domain_and_name.
+    # metric_group is only present in the MLflow rows; fill NaN for the new rows.
+    model_metrics_df = pd.concat(
+        [model_metrics_df, target_ot_scib_metrics_df, source_nonspatial_scib_metrics_df],
+        ignore_index=True,
+    )
+
+    model_metrics_df = model_metrics_df.loc[model_metrics_df['metric_name'].isin(['silhouette_label', 'ilisi', 'bio_conservation', 'total'])]
+    model_metrics_df['metric_name'] = model_metrics_df['metric_name'].replace({'bio_conservation': 'bio_cons.', 'silhouette_label': 'silhouette'})
+    
+    #ax = sns.barplot(data=model_metrics_df, y='metric_name', x='value', hue='domain', orient='h')
+    #ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=1, borderaxespad=0.)
+    #plt.gcf().set_size_inches(4, 5)
+    #ax.set_ylabel('')
+
+    ax = sns.barplot(data=model_metrics_df, y='value', x='metric_name', hue='domain', palette='Set2', orient='v')
+    ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=2, borderaxespad=0.)
+    plt.gcf().set_size_inches(4, 5.5)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=30)
+    ax.set_xlabel(''); ax.set_ylabel('')
+    
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    
+    # Place legend on top of the plot
+    plt.tight_layout(); plt.show()
 
 
     #%% Analysis on concatenated data
