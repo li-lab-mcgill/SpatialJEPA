@@ -1622,11 +1622,45 @@ def main():
         )
 
     #%% data figures
-    sc.pl.embedding(source_rna, color='RNA_clusters', basis='spatial', size=40)
-    sc.pl.embedding(source_atac, color='ATAC_clusters', basis='spatial', size=40)
+    try:
+        # Set matplotlib backend to enable retina display, equivalent to `%config InlineBackend.figure_format = 'retina'`
+        from IPython import get_ipython
+        ipython = get_ipython()
+        if ipython is not None:
+            ipython.run_line_magic('config', 'InlineBackend.figure_format = "retina"')
+    except Exception:
+        pass
+
+    import matplotlib as mpl
+    mpl.rcParams.update({
+        'font.size': 14,
+        'axes.titlesize': 16,
+        'axes.labelsize': 14,
+        'xtick.labelsize': 12,
+        'ytick.labelsize': 12,
+        'legend.fontsize': 12,
+        'legend.title_fontsize': 14,
+        'figure.titlesize': 18,
+    })
+
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+    sc.pl.embedding(source_rna, color='RNA_clusters', basis='spatial', size=40, ax=ax[0], show=False)
+    sc.pl.embedding(source_atac, color='ATAC_clusters', basis='spatial', size=40, ax=ax[1], show=False)
+    plt.tight_layout(); plt.show()
 
     import celltypist
     target_rna_ct = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
+
+    '''
+    import mudata
+    import muon
+    target_atac_ct = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
+    target_mudata_ct = mudata.MuData({
+        'rna': target_rna_ct,
+        'atac': target_atac_ct
+    })
+    muon.pp.neighbors(target_mudata_ct)
+    '''
 
     # Ensure a neighborhood graph exists for clustering
     if 'neighbors' not in target_rna_ct.uns:
@@ -1725,22 +1759,25 @@ def main():
         random_state=deterministic_seed,
     )
 
+    # flip x-axis coordinates of source_concat_adata UMAP
+    source_concat_adata.obsm['X_umap'][:, 0] = -source_concat_adata.obsm['X_umap'][:, 0]
+
     # plot teacher source UMAPs
-    teacher_source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
+    teacher_source_umap_colors = ['modality', 'RNA_clusters', 'ATAC_clusters']
     fig, axs = plt.subplots(1, len(teacher_source_umap_colors), figsize=(18, 5))
     for i, color in enumerate(teacher_source_umap_colors):
         sc.pl.umap(teacher_source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
     plt.tight_layout(); plt.show()
 
     # plot source UMAPs
-    source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
+    source_umap_colors = ['modality', 'RNA_clusters', 'ATAC_clusters']
     fig, axs = plt.subplots(1, len(source_umap_colors), figsize=(18, 5))
     for i, color in enumerate(source_umap_colors):
         sc.pl.umap(source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
     plt.tight_layout(); plt.show()
 
     # plot nonspatial source UMAPs
-    nonspatial_source_umap_colors = ['modality', 'leiden', 'RNA_clusters']
+    nonspatial_source_umap_colors = ['modality', 'RNA_clusters', 'ATAC_clusters']
     fig, axs = plt.subplots(1, len(nonspatial_source_umap_colors), figsize=(18, 5))
     for i, color in enumerate(nonspatial_source_umap_colors):
         sc.pl.umap(nonspatial_source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
@@ -1757,20 +1794,32 @@ def main():
 
         target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
 
-        compute_concat_umap(
-            target_concat_adata,
-            n_neighbors=10,
-            resolution=0.5,
-            deterministic=True,
-            random_state=deterministic_seed,
-        )
-        target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
+        ## subsample target data to test obs
+        test_target_obs_names = split_metadata.get('domains').get('target').get('splits').get('test').get('obs_names')
+        target_concat_adata = target_concat_adata[target_concat_adata.obs_names.str.split('_').str[0].isin(test_target_obs_names)].copy()
+
+        sc.pp.neighbors(target_concat_adata, n_neighbors=30)
+        sc.tl.umap(target_concat_adata, min_dist=0.1, spread=1.5)
+        sc.tl.leiden(target_concat_adata, resolution=leiden_resolution)
 
         # plot target UMAPs
-        target_umap_colors = ['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster']
-        fig, axs = plt.subplots(1, len(target_umap_colors), figsize=(18, 5))
+        target_umap_colors = ['modality', 'celltypist_predictions']
+        fig, axs = plt.subplots(1, len(target_umap_colors), figsize=(12, 5))
         for i, color in enumerate(target_umap_colors):
-            sc.pl.umap(target_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+            ax = axs[i]
+            sc.pl.umap(target_concat_adata, color=color, size=25, ax=ax, show=False)
+            
+            # Force legend into a single column
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:  # Only modify if a legend exists
+                ax.legend(
+                    handles=handles,
+                    labels=labels,
+                    loc='center left',
+                    bbox_to_anchor=(1, 0.5),
+                    ncol=1,
+                    frameon=False,
+                )
         plt.tight_layout(); plt.show()
 
     #%% Inference, all same model (except nonspatial source inference)
