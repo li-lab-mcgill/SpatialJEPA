@@ -1621,6 +1621,55 @@ def main():
             device=device,
         )
 
+    #%% data figures
+    sc.pl.embedding(source_rna, color='RNA_clusters', basis='spatial', size=40)
+    sc.pl.embedding(source_atac, color='ATAC_clusters', basis='spatial', size=40)
+
+    import celltypist
+    target_rna_ct = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
+
+    # Ensure a neighborhood graph exists for clustering
+    if 'neighbors' not in target_rna_ct.uns:
+        if 'X_pca' not in target_rna_ct.obsm:
+            sc.pp.pca(target_rna_ct)
+        sc.pp.neighbors(target_rna_ct)
+
+    # Run leiden clustering with lower resolution for smoother majority voting
+    # (CellTypist defaults to res=15 for this dataset size, which is too high)
+    sc.tl.leiden(target_rna_ct, resolution=0.5, key_added='over_clustering')
+    predictions = celltypist.annotate(
+        target_rna_ct,
+        model='Mouse_Whole_Brain.pkl',
+        majority_voting = True,
+        over_clustering = 'over_clustering'
+    )
+    # Strip the 3-digit numeric prefix (e.g. "001 CLA-EPd-CTX Car3 Glut" -> "CLA-EPd-CTX Car3 Glut")
+    cleaned_labels = predictions.predicted_labels['majority_voting'].str.replace(
+        r'^\d{3}\s+', '', regex=True
+    )
+    target_rna_ct.obs['celltypist_predictions'] = cleaned_labels
+
+    sc.tl.umap(target_rna_ct, min_dist=0.3, spread=1.0)
+    ax = sc.pl.embedding(
+        target_rna_ct, color='celltypist_predictions', basis='umap', size=40, show=False
+    )
+    plt.gcf().set_size_inches(4, 4)
+    # Force legend into a single column so all labels align on the same axis
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(
+        handles=handles,
+        labels=labels,
+        loc='center left',
+        bbox_to_anchor=(1, 0.5),
+        ncol=1,
+        frameon=False,
+    )
+    plt.show()
+
+    target_rna.obs['celltypist_predictions'] = cleaned_labels
+    target_atac.obs['celltypist_predictions'] = cleaned_labels
+    del target_rna_ct
+
     #%% ── Inference, by dataset ────────────────────────────────────────────────────────────
 
     ## (teacher) source inference
