@@ -4508,6 +4508,17 @@ def main():
         adata_atac=source_atac,
     )
 
+    ## load gene-peak attention links
+    gene_peak_attention_links = pd.read_csv(os.path.join(attention_analysis_summary['output_dir'], 'merged_df_threshold.csv'))
+    duplicate_rows = gene_peak_attention_links[gene_peak_attention_links.duplicated(subset=['Gene', 'Peak'], keep=False)]
+    gene_peak_attention_links = gene_peak_attention_links.loc[gene_peak_attention_links['chr'].str.startswith('chr')]
+    gene_peak_attention_links = gene_peak_attention_links.drop_duplicates(subset=['Gene', 'Peak', 'Attention', 'gene_idx', 'peak_idx'])
+    assert gene_peak_attention_links[['Gene', 'Peak']].value_counts().le(1).all()
+
+    gene_peak_attention_links['Gene'].value_counts(ascending=True).plot()
+    plt.xlabel('Genes'); plt.ylabel('Number of peaks'); plt.show()
+
+
     #%% ── Save outputs ─────────────────────────────────────────────────────────
     if args.save_h5ad:
         print("\nSaving h5ad files to {}...".format(output_dir))

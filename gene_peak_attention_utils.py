@@ -261,7 +261,7 @@ def _gmm_intersections_1d(
     # log(w1/sqrt(v1)) - (x-m1)^2/(2v1) = log(w2/sqrt(v2)) - (x-m2)^2/(2v2)
     a = 1.0 / (2.0 * v2) - 1.0 / (2.0 * v1)
     b = m1 / v1 - m2 / v2
-    c = (m2 ** 2) / (2.0 * v2) - (m1 ** 2) / (2.0 * v1) + np.log((w2 * np.sqrt(v1)) / (w1 * np.sqrt(v2)))
+    c = (m2 ** 2) / (2.0 * v2) - (m1 ** 2) / (2.0 * v1) + np.log((w1 * np.sqrt(v2)) / (w2 * np.sqrt(v1)))
 
     if np.isclose(a, 0.0):
         if np.isclose(b, 0.0):
