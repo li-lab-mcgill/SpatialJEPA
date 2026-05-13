@@ -112,12 +112,16 @@ def extract_gene_name(gene_value: str) -> str:
 
 
 def parse_peak(peak_value: str) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-    """Parse ``chr-start-end`` peak IDs into coordinates."""
+    """Parse ``chr:start-end`` or ``chr-start-end`` peak IDs into coordinates."""
+    import re
     if pd.isna(peak_value):
         return None, None, None
     try:
-        chrom, start, end = str(peak_value).split("-")
-        return chrom, int(start), int(end)
+        parts = re.split(r"[:-]", str(peak_value))
+        if len(parts) == 3:
+            chrom, start, end = parts
+            return chrom, int(start), int(end)
+        return None, None, None
     except Exception:
         return None, None, None
 
