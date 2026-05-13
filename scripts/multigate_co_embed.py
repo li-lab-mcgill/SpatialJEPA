@@ -3997,13 +3997,13 @@ def main():
             if save_plots:
                 save_plot_to_pdf(fig, f"{plot_prefix}_pls_weights_barplot")
             plt.show()
-        return X, Z, T, pls
+        return pls, pls_coef_df, pls_coef_df_sorted
 
     ## train PLS models on source and target data
-    _, _, _, pls_source_rna = run_pls_embedding_to_gene_plots(source_rna, save_plots=True, plot_prefix='01_source_rna_pls')
-    _, _, _, pls_target_rna = run_pls_embedding_to_gene_plots(target_rna, save_plots=True, plot_prefix='02_target_rna_pls')
-    _, _, _, pls_source_atac = run_pls_embedding_to_gene_plots(source_atac, save_plots=True, plot_prefix='03_source_atac_pls')
-    _, _, _, pls_target_atac = run_pls_embedding_to_gene_plots(target_atac, save_plots=True, plot_prefix='04_target_atac_pls')
+    pls_source_rna, pls_source_rna_coef_df, _ = run_pls_embedding_to_gene_plots(source_rna, save_plots=True, plot_prefix='01_source_rna_pls')
+    pls_target_rna, pls_target_rna_coef_df, _ = run_pls_embedding_to_gene_plots(target_rna, save_plots=True, plot_prefix='02_target_rna_pls')
+    pls_source_atac, pls_source_atac_coef_df, _ = run_pls_embedding_to_gene_plots(source_atac, save_plots=True, plot_prefix='03_source_atac_pls')
+    pls_target_atac, pls_target_atac_coef_df, _ = run_pls_embedding_to_gene_plots(target_atac, save_plots=True, plot_prefix='04_target_atac_pls')
 
     def get_liana_lrdata(adata, cell_type_col, lr_pairs):
 
@@ -4515,8 +4515,44 @@ def main():
     gene_peak_attention_links = gene_peak_attention_links.drop_duplicates(subset=['Gene', 'Peak', 'Attention', 'gene_idx', 'peak_idx'])
     assert gene_peak_attention_links[['Gene', 'Peak']].value_counts().le(1).all()
 
-    gene_peak_attention_links['Gene'].value_counts(ascending=True).plot()
+    plt.figure(figsize=(4, 3))
+    gene_peak_attention_links['Gene'].value_counts(ascending=True).plot(marker='.', color='black')
     plt.xlabel('Genes'); plt.ylabel('Number of peaks'); plt.show()
+
+    ## find high PLS-weighted gene-peak attention links
+    pls_source_rna_coef_ranked_df = pls_source_rna_coef_df.abs().rank(1, ascending=False)
+    pls_source_atac_coef_ranked_df = pls_source_atac_coef_df.abs().rank(1, ascending=False)
+
+    all_pls_scores_df = pd.DataFrame()
+    for gene, peak in gene_peak_attention_links[['Gene', 'Peak']].values:
+        rna_pls_scores = pls_source_rna_coef_ranked_df.loc[:, gene]
+        atac_pls_scores = pls_source_atac_coef_ranked_df.loc[:, peak]
+        pls_scores = pd.merge(rna_pls_scores, atac_pls_scores, left_index=True, right_index=True, how='inner')
+        pls_scores['mean_rank'] = pls_scores.mean(axis=1)
+        pls_scores.rename(columns={gene: 'gene_rank', peak: 'peak_rank'}, inplace=True)
+        pls_scores_df = pls_scores.assign(gene=gene, peak=peak)
+        all_pls_scores_df = pd.concat([all_pls_scores_df, pls_scores_df])
+
+    all_pls_scores_df.sort_values('mean_rank', inplace=True)
+    all_pls_scores_grouped_df = all_pls_scores_df.reset_index().groupby(['index', 'gene']).agg(
+        mean_rank=('mean_rank', 'mean'),
+        n_links=('mean_rank', 'count'),
+    ).sort_values('mean_rank')
+
+    print(all_pls_scores_df.head(5))
+    print(all_pls_scores_grouped_df.head(10))
+
+    ## select PLS-gene combinations and isolate gene-peak link df
+    pls_cmp = 'PLS_2'
+    gene = 'Zic1'
+    peaks = gene_peak_attention_links[gene_peak_attention_links['Gene'] == gene]['Peak'].values
+
+    gp_link_df = gene_peak_attention_links.loc[
+        gene_peak_attention_links['Gene'].eq(gene) &
+        (gene_peak_attention_links['Peak'].isin(peaks))
+    ]
+    gp_link_df[f'{pls_cmp}_gene_weight'] = pls_source_rna_coef_df.loc[pls_cmp, gene]
+    gp_link_df = pd.merge(gp_link_df, pls_source_atac_coef_df.loc[pls_cmp, peaks].rename(f'{pls_cmp}_peak_weight'), left_on='Peak', right_index=True, how='inner')
 
 
     #%% ── Save outputs ─────────────────────────────────────────────────────────
