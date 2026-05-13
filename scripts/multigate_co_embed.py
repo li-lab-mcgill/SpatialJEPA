@@ -2285,95 +2285,6 @@ def main():
     # Place legend on top of the plot
     plt.tight_layout(); plt.show()
 
-
-    #%% Analysis on concatenated data
-
-    ## concatenate modalities
-    teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher")
-    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
-    target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
-    nonspatial_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_nonspatial")
-
-    ## add spatial coordinates to concatenated source data
-    spatial_coords = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
-    teacher_source_concat_adata.obsm['spatial'] = spatial_coords
-    source_concat_adata.obsm['spatial'] = spatial_coords
-    nonspatial_source_concat_adata.obsm['spatial'] = spatial_coords
-    #target_concat_adata.obsm['spatial'] = np.concatenate([target_rna.obsm['spatial'], target_atac.obsm['spatial']], axis=0)
-
-    source_target_adata, source_concat_adata, target_concat_adata = run_alignment_and_spatial_plot(
-        model,
-        source_mgate,
-        target_mgate,
-        source_rna,
-        source_atac,
-        source_concat_adata,
-        target_concat_adata,
-        deterministic_seed,
-    )
-
-    ## transfer spatial coordinates to target data
-    target_rna.obsm['spatial'] = source_target_adata[
-        source_target_adata.obs['modality'].eq('rna') &
-        source_target_adata.obs['source_or_target'].eq('target')
-    ].obsm['spatial'].copy()
- 
-    #%% Add cluster information
-    target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
-
-    ## ingest source embeddings into target data
-    if model is source_mgate:
-        sc.tl.ingest(target_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters')
-        #sc.tl.ingest(teacher_source_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters')
-        ## confirm that the ingested representations are the same as the original embeddings
-        #assert (teacher_source_concat_adata.obsm['rep'] == teacher_source_concat_adata.X).all()
-        assert (target_concat_adata.obsm['rep'] == target_concat_adata.X).all()
-    elif model is target_mgate:
-        rna_target_obs_names = source_concat_adata.obs.loc[source_concat_adata.obs['modality'].eq('rna'), 'target_obs_names']
-        atac_target_obs_names = source_concat_adata.obs.loc[source_concat_adata.obs['modality'].eq('atac'), 'target_obs_names']
-        target_concat_adata.obs.loc[rna_target_obs_names.values, 'RNA_clusters'] = source_concat_adata.obs.loc[rna_target_obs_names.index, 'RNA_clusters'].values
-        target_concat_adata.obs.loc[atac_target_obs_names.values, 'RNA_clusters'] = source_concat_adata.obs.loc[atac_target_obs_names.index, 'RNA_clusters'].values
-        ## confirm that the ingested representations are the same as the original embeddings
-        #assert (target_concat_adata.obsm['rep'] == target_concat_adata.X).all()
-        assert (source_concat_adata.obsm['rep'] == source_concat_adata.X).all()
-
-    # assign RNA_clusters to target_rna specifically
-    ingested_rna_clusters = target_concat_adata.obs.loc[target_concat_adata.obs['modality'].eq('rna'), 'RNA_clusters']
-    ingested_rna_clusters.index = ingested_rna_clusters.index.str.replace('_rna', '')
-    target_rna.obs['RNA_clusters'] = ingested_rna_clusters
-
-    combined_gp_dict = None
-    if not getattr(args, "no_combined_gp_dict", False):
-        print("\nLoading NicheCompass combined_gp_dict...")
-        combined_gp_dict = load_nichecompass_combined_gp_dict_mouse(
-            load_from_disk=True,
-            verbose=True,
-        )
-
-    pathway_embedding_results = run_co_embed_pathway_embedding_analysis(
-        combined_gp_dict=combined_gp_dict,
-        source_rna=source_rna,
-        target_rna=target_rna,
-        embedding_key="MultiGATE",
-        include_teacher=True,
-        cluster_obs_key="RNA_clusters",
-    )
-
-    try:
-        #sc.pl.umap(teacher_source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-        #plt.tight_layout(); plt.show()
-        sc.pl.umap(source_concat_adata, color=['modality', 'leiden', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-        plt.tight_layout(); plt.show()
-        sc.pl.umap(target_concat_adata, color=['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
-        plt.tight_layout(); plt.show()
-    except:
-        #sc.pl.umap(teacher_source_concat_adata, color=['modality', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-        #plt.tight_layout(); plt.show()
-        sc.pl.umap(source_concat_adata, color=['modality', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-        plt.tight_layout(); plt.show()
-        sc.pl.umap(target_concat_adata, color=['modality', 'arc_gex_kmeans_5_clusters_Cluster'], ncols=3, wspace=0.2, size=25)
-        plt.tight_layout(); plt.show()
-
     #%% FASTopic analysis
 
     import decoupler as dc
@@ -3498,6 +3409,7 @@ def main():
 
     #%% LIANA+ inflow analysis
     import liana as li
+    import decoupler as dc
     import plotnine as p9
     import squidpy as sq
     import ot
@@ -3579,6 +3491,7 @@ def main():
             use_raw=False,
         )
 
+        fused_I = None
         if interaction is not None:
 
             sq.gr.spatial_autocorr(lrdata, mode='moran', use_raw=False)
@@ -3699,7 +3612,6 @@ def main():
             "nmf": nmf,
             "fused_I": fused_I,
             "svgs": svgs,
-            "svis": svis,
             "lr_loadings": lr_loadings,
             "factor_scores": factor_scores
         }
@@ -3781,36 +3693,36 @@ def main():
     del source_rna.layers['fusion_scores']
 
     ## format combined_gp_dict to adapt to LIANA+
-    basenames = [gp.split('__')[0] for gp in source_mgate.pathway_names]
-    combined_gp_df = pd.DataFrame()
-    for gp in basenames:
-        gp_dict = combined_gp_dict[gp]
-        sources_df = pd.DataFrame(np.stack([gp_dict['sources'], gp_dict['sources_categories']], axis=1), columns=['ligand', 'source_category'])
-        targets_df = pd.DataFrame(np.stack([gp_dict['targets'], gp_dict['targets_categories']], axis=1), columns=['receptor', 'target_category'])
-        all_pairs_df = sources_df.merge(targets_df, how='cross')
-        combined_gp_df = pd.concat([combined_gp_df, all_pairs_df])
-   
-    enforce_ligand_receptor = True
-    if enforce_ligand_receptor:
-        combined_gp_df = combined_gp_df.loc[
-            (combined_gp_df['source_category'] == 'ligand') & (combined_gp_df['target_category'] == 'receptor')
-        ]
+    resource = li.rs.select_resource('mouseconsensus')
 
-    resource = combined_gp_df.drop(columns=['source_category', 'target_category']).drop_duplicates()
+    ## ingest RNA_cluster assign RNA_clusters to target_rna
+    sc.tl.ingest(target_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters', inplace=True)
+
+    ingested_rna_clusters = target_concat_adata.obs.loc[
+        target_concat_adata.obs['modality'].eq('rna'), 'RNA_clusters'
+    ]
+    ingested_rna_clusters.index = ingested_rna_clusters.index.str.replace('_rna', '')
+    target_rna.obs['RNA_clusters'] = ingested_rna_clusters
+
+    ## set SCT_data as default assay
+    source_rna_liana = source_rna.copy()
+    source_rna_liana.X = source_rna_liana.layers['SCT_data'].copy()
+    target_rna_liana = target_rna.copy()
+    target_rna_liana.X = target_rna_liana.layers['SCT_data'].copy()
 
     ## LIANA+ inflow analysis
     source_liana_results = liana_spatial_analysis(
-        source_rna,
+        source_rna_liana,
         subsample_n=5000,
         resource=resource,
-        labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
+        labels=None, interaction=None, ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
         )
 
     target_liana_results = liana_spatial_analysis(
-        target_rna,
+        target_rna_liana,
         subsample_n=5000,
         resource=resource,
-        labels=["R2", "R4", "R7"], interaction='R1^Mdk^Alk', ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
+        labels=None, interaction=None, ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
         )
 
     ## LIANA-MultiGATE heatmaps
@@ -3829,9 +3741,12 @@ def main():
     topk=3
     corrs_order = pd.Series(corrs_df.apply(lambda x: corrs_df.index[np.argsort(x)[:topk]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values.tolist()
     corr_top = corrs_df.loc[corrs_order]
-    cg = sns.clustermap(corr_top, cmap='coolwarm', center=0.0, vmax=0.4, figsize=(9.5, 5))
+    cg = sns.clustermap(corr_top, cmap='coolwarm', center=0.0, vmax=0.4, figsize=(5, 3))
     cg.ax_heatmap.set_xlabel('MultiGATE dimensions')
     plt.show()
+
+    save_plot_to_pdf(cg.fig, "liana_multigate_heatmap")
+    plt.close(cg.fig)
 
     ## compare ARI between NMF leiden and source, target and nonspatial-source leiden
     from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
@@ -3921,8 +3836,8 @@ def main():
     ari_nmi_df = pd.DataFrame({
         'ARI': [source_ari, target_ari, nonspatial_source_ari, ingested_nonspatial_source_ari],
         'NMI': [source_nmi, target_nmi, nonspatial_source_nmi, ingested_nonspatial_source_nmi]
-    }, index=['Source', 'Target', 'Nsp Source', 'Nsp Source (ingst.)'])
-    ari_nmi_df.plot(kind='bar', rot=30, cmap='Set2', figsize=(4, 5))
+    }, index=['Source', 'Target', 'Nsp Source', 'Nsp Source$^\dagger$'])
+    ari_nmi_df.plot(kind='bar', rot=30, cmap='Set2', figsize=(4.5, 3)); plt.show()
 
     ## plot UMAP of source, target, nonspatial-source and ingested nonspatial-source
     fig, axs = plt.subplots(2, 2, figsize=(10, 10))
