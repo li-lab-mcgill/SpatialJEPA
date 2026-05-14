@@ -62,6 +62,28 @@ os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("NUMBA_NUM_THREADS", "1")
 
+## Plot default settings
+try:
+    # Set matplotlib backend to enable retina display, equivalent to `%config InlineBackend.figure_format = 'retina'`
+    from IPython import get_ipython
+    ipython = get_ipython()
+    if ipython is not None:
+        ipython.run_line_magic('config', 'InlineBackend.figure_format = "retina"')
+except Exception:
+    pass
+
+import matplotlib as mpl
+mpl.rcParams.update({
+    'font.size': 14,
+    'axes.titlesize': 16,
+    'axes.labelsize': 14,
+    'xtick.labelsize': 12,
+    'ytick.labelsize': 12,
+    'legend.fontsize': 12,
+    'legend.title_fontsize': 14,
+    'figure.titlesize': 18,
+})
+
 #%%
 
 from dotenv import dotenv_values, load_dotenv
@@ -113,6 +135,12 @@ import scipy.sparse as sp
 import torch
 from joblib import Parallel, delayed
 import seaborn as sns
+
+import liana as li
+import decoupler as dc
+import decoupler.op
+import squidpy as sq
+import ot
 
 import MultiGATE
 from MultiGATE.model_MultiGATE import MGATE
@@ -1733,27 +1761,6 @@ def main():
         )
 
     #%% data figures
-    try:
-        # Set matplotlib backend to enable retina display, equivalent to `%config InlineBackend.figure_format = 'retina'`
-        from IPython import get_ipython
-        ipython = get_ipython()
-        if ipython is not None:
-            ipython.run_line_magic('config', 'InlineBackend.figure_format = "retina"')
-    except Exception:
-        pass
-
-    import matplotlib as mpl
-    mpl.rcParams.update({
-        'font.size': 14,
-        'axes.titlesize': 16,
-        'axes.labelsize': 14,
-        'xtick.labelsize': 12,
-        'ytick.labelsize': 12,
-        'legend.fontsize': 12,
-        'legend.title_fontsize': 14,
-        'figure.titlesize': 18,
-    })
-
     fig, ax = plt.subplots(1, 2, figsize=(10, 4))
     sc.pl.embedding(source_rna, color='RNA_clusters', basis='spatial', size=40, ax=ax[0], show=False)
     sc.pl.embedding(source_atac, color='ATAC_clusters', basis='spatial', size=40, ax=ax[1], show=False)
@@ -1966,7 +1973,6 @@ def main():
     print("  Nonspatial source embeddings: shape {}".format(nonspatial_source_rna_emb.shape))
 
     #%% OT from target to source
-    import ot
     import gc
 
     X = torch.tensor(target_rna.obsm['MultiGATE'], device='cuda')
@@ -2268,6 +2274,9 @@ def main():
     model_metrics_df = model_metrics_df.loc[model_metrics_df['metric_name'].isin(['silhouette_label', 'ilisi', 'bio_conservation', 'total'])]
     model_metrics_df['metric_name'] = model_metrics_df['metric_name'].replace({'bio_conservation': 'bio_cons.', 'silhouette_label': 'silhouette'})
     
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+
     #ax = sns.barplot(data=model_metrics_df, y='metric_name', x='value', hue='domain', orient='h')
     #ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=1, borderaxespad=0.)
     #plt.gcf().set_size_inches(4, 5)
@@ -2277,22 +2286,14 @@ def main():
     ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=2, borderaxespad=0.)
     plt.gcf().set_size_inches(4, 5.5)
     ax.set_xticklabels(ax.get_xticklabels(), rotation=30)
-    ax.set_xlabel(''); ax.set_ylabel('')
-    
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
+    ax.set_xlabel(''); ax.set_ylabel('')    
     
     # Place legend on top of the plot
     plt.tight_layout(); plt.show()
 
 
-
     #%% LIANA+ inflow analysis
-    import liana as li
-    import decoupler as dc
     import plotnine as p9
-    import squidpy as sq
-    import ot
     import gc
     from sklearn.model_selection import StratifiedShuffleSplit
 
@@ -2844,15 +2845,17 @@ def main():
                 lambda x: x.nlargest(top_n_genes).index, axis=1, result_type='reduce'
             ).explode().unique()
             pls_coef_df_sorted = pls_coef_df.loc[:, top_genes_sort]
-            fig = plt.figure(figsize=(5, 8))
+
+            fig = plt.figure(figsize=(4.25, 9))
             sns.heatmap(pls_coef_df_sorted.T.abs(), cmap=heatmap_cmap, cbar=True)
             plt.tight_layout()
             if save_plots:
                 save_plot_to_pdf(fig, f"{plot_prefix}_pls_weights_heatmap_staircase")
             plt.show()
+
         elif weights_plot_type == 'barplot':
+
             fig, ax = plt.subplots(figsize=(6, 4))
-            
             n_components = len(pls_coef_df)
             n_genesets = len(pls_coef_df.columns)
             bar_width = 0.8 / n_genesets
@@ -2877,13 +2880,35 @@ def main():
             if save_plots:
                 save_plot_to_pdf(fig, f"{plot_prefix}_pls_weights_barplot")
             plt.show()
+
+            pls_coef_df_sorted = None
+
         return pls, pls_coef_df, pls_coef_df_sorted
 
     ## train PLS models on source and target data
-    pls_source_rna, pls_source_rna_coef_df, _ = run_pls_embedding_to_gene_plots(source_rna, save_plots=True, plot_prefix='01_source_rna_pls')
-    pls_target_rna, pls_target_rna_coef_df, _ = run_pls_embedding_to_gene_plots(target_rna, save_plots=True, plot_prefix='02_target_rna_pls')
-    pls_source_atac, pls_source_atac_coef_df, _ = run_pls_embedding_to_gene_plots(source_atac, save_plots=True, plot_prefix='03_source_atac_pls')
-    pls_target_atac, pls_target_atac_coef_df, _ = run_pls_embedding_to_gene_plots(target_atac, save_plots=True, plot_prefix='04_target_atac_pls')
+    pls_source_rna, pls_source_rna_coef_df, _ = run_pls_embedding_to_gene_plots(source_rna, save_plots=False, plot_prefix='01_source_rna_pls')
+    pls_target_rna, pls_target_rna_coef_df, _ = run_pls_embedding_to_gene_plots(target_rna, save_plots=False, plot_prefix='02_target_rna_pls')
+    pls_source_atac, pls_source_atac_coef_df, _ = run_pls_embedding_to_gene_plots(source_atac, save_plots=False, plot_prefix='03_source_atac_pls')
+    pls_target_atac, pls_target_atac_coef_df, _ = run_pls_embedding_to_gene_plots(target_atac, save_plots=False, plot_prefix='04_target_atac_pls')
+
+    ## plot correlation between source and target PLS dimensions
+    fig, ax = plt.subplots(2, 1, figsize=(4, 8))
+    pls_rna_corr = np.corrcoef(pls_source_rna.y_weights_, pls_target_rna.y_weights_, rowvar=False)
+    pls_rna_corr = pls_rna_corr[:pls_source_rna.y_weights_.shape[1], pls_target_rna.y_weights_.shape[1]:]
+    sns.heatmap(np.abs(pls_rna_corr), cmap='YlGn', cbar=True, ax=ax[0])
+    ax[0].set_xlabel('Target PLS dimensions')
+    ax[0].set_ylabel('Source PLS dimensions')
+    ax[0].set_title('RNA')
+
+    pls_atac_corr = np.corrcoef(pls_source_atac.y_weights_, pls_target_atac.y_weights_, rowvar=False)
+    pls_atac_corr = pls_atac_corr[:pls_source_atac.y_weights_.shape[1], pls_target_atac.y_weights_.shape[1]:]
+    sns.heatmap(np.abs(pls_atac_corr), cmap='YlGn', cbar=True, ax=ax[1])
+    ax[1].set_xlabel('Target PLS dimensions')
+    ax[1].set_ylabel('Source PLS dimensions')
+    ax[1].set_title('ATAC')
+    fig.tight_layout()
+    plt.show()
+    save_plot_to_pdf(fig, '11_pls_source_target_correlation_heatmaps')
 
     def get_liana_lrdata(adata, cell_type_col, lr_pairs):
 
@@ -2934,8 +2959,8 @@ def main():
     ## build LR data and train PLS models on LR data
     lrdata_source_rna = get_liana_lrdata(source_rna, 'leiden', lr_pairs)
     lrdata_target_rna = get_liana_lrdata(target_rna, 'leiden', lr_pairs)
-    _, _, _, pls_source_rna_liana = run_pls_embedding_to_gene_plots(lrdata_source_rna, save_plots=True, plot_prefix='05_source_rna_liana_pls')
-    _, _, _, pls_target_rna_liana = run_pls_embedding_to_gene_plots(lrdata_target_rna, save_plots=True, plot_prefix='06_target_rna_liana_pls')
+    pls_source_rna_liana, pls_source_rna_liana_coef_df, _ = run_pls_embedding_to_gene_plots(lrdata_source_rna, save_plots=True, plot_prefix='05_source_rna_liana_pls')
+    pls_target_rna_liana, pls_target_rna_liana_coef_df, _ = run_pls_embedding_to_gene_plots(lrdata_target_rna, save_plots=True, plot_prefix='06_target_rna_liana_pls')
 
     def build_lrdata_aggregated_by_genesets(lrdata, unique_geneset_per_lr, umap_title=None, save_plots=False, plot_prefix=''):
         """Aggregate LIANA inflow by hallmark geneset; mutates lrdata.var with geneset columns."""
@@ -2982,7 +3007,10 @@ def main():
     full_spatial_obsm_df_target = sc.AnnData(
         X=np.zeros((lrdata_target_rna.n_obs, 1)),
         obs=lrdata_target_rna.obs.copy(),
-        obsm={'spatial': lrdata_target_rna.obsm['spatial'].copy()},
+        obsm={
+            'spatial': lrdata_target_rna.obsm['spatial'].copy(),
+            'X_umap': lrdata_target_rna.obsm['X_umap'].copy(),
+        },
     )
 
     lrdata_source_rna_genesets = build_lrdata_aggregated_by_genesets(
@@ -2993,9 +3021,9 @@ def main():
     )
 
     if lrdata_source_rna_genesets is not None:
-        _, _, _, pls_lrdata_source_rna_genesets = run_pls_embedding_to_gene_plots(
+        pls_lrdata_source_rna_genesets, _, _ = run_pls_embedding_to_gene_plots(
             lrdata_source_rna_genesets,
-            full_spatial_obsm_df_source,
+            None, # full_spatial_obsm_df_source,
             umap_title='source RNA LIANA (geneset aggregate)',
             umap_plot_prefix='07_source_rna_liana_geneset',
             weights_plot_type='barplot',
@@ -3003,116 +3031,15 @@ def main():
             plot_prefix='09_source_rna_liana_geneset_pls',
         )
     if lrdata_target_rna_genesets is not None:
-        _, _, _, pls_lrdata_target_rna_genesets = run_pls_embedding_to_gene_plots(
+        pls_lrdata_target_rna_genesets, _, _ = run_pls_embedding_to_gene_plots(
             lrdata_target_rna_genesets,
-            full_spatial_obsm_df_target,
+            None, # full_spatial_obsm_df_target,
             umap_title='target RNA LIANA (geneset aggregate)',
             umap_plot_prefix='08_target_rna_liana_geneset',
             weights_plot_type='barplot',
             save_plots=True,
             plot_prefix='10_target_rna_liana_geneset_pls',
         )
-
-    ## plot correlation between source and target PLS dimensions
-    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-    pls_rna_corr = np.corrcoef(pls_source_rna.y_weights_, pls_target_rna.y_weights_, rowvar=False)
-    pls_rna_corr = pls_rna_corr[:pls_source_rna.y_weights_.shape[1], pls_target_rna.y_weights_.shape[1]:]
-    sns.heatmap(np.abs(pls_rna_corr), cmap='YlGn', cbar=True, ax=ax[0])
-    ax[0].set_xlabel('Target PLS dimensions')
-    ax[0].set_ylabel('Source PLS dimensions')
-    ax[0].set_title('RNA')
-
-    pls_atac_corr = np.corrcoef(pls_source_atac.y_weights_, pls_target_atac.y_weights_, rowvar=False)
-    pls_atac_corr = pls_atac_corr[:pls_source_atac.y_weights_.shape[1], pls_target_atac.y_weights_.shape[1]:]
-    sns.heatmap(np.abs(pls_atac_corr), cmap='YlGn', cbar=True, ax=ax[1])
-    ax[1].set_xlabel('Target PLS dimensions')
-    ax[1].set_ylabel('Source PLS dimensions')
-    ax[1].set_title('ATAC')
-    fig.tight_layout()
-    save_plot_to_pdf(fig, '11_pls_source_target_correlation_heatmaps')
-    plt.show()
-
-
-    
-    #%% compare spatial graph with latent knn graph
-    n_neighbors = 100
-
-    sc.pp.neighbors(source_rna, use_rep='MultiGATE', n_neighbors=n_neighbors)
-    sc.pp.neighbors(source_atac, use_rep='MultiGATE', n_neighbors=n_neighbors)
-    rna_multigate_knn_graph = source_rna.obsp['connectivities']
-    atac_multigate_knn_graph = source_atac.obsp['connectivities']
-
-    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
-    source_concat_adata.obs['jaccard_similarity'] = jaccard_similarity
-    source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
-
-    MultiGATE.Cal_Spatial_Net(source_rna, model='KNN', k_cutoff=n_neighbors)
-    MultiGATE.Cal_Spatial_Net(source_atac, model='KNN', k_cutoff=n_neighbors)
-
-    spatial_knn_graph, _, _, _ = build_graph_inputs(source_rna, source_atac)
-    indices, values, shape = spatial_knn_graph
-    indices = np.asarray(indices)
-    row, col = indices[:, 0], indices[:, 1]
-    spatial_knn_graph = sp.coo_matrix((values, (row, col)), shape=shape).tocsr()
-    assert indices.shape[1] == 2, "spatial_knn_graph should have 2 columns"
-
-    def jaccard_per_sample_csr(
-        a: sp.csr_matrix,
-        b: sp.csr_matrix,
-        *,
-        binarize: bool = True,
-        empty_value: float = 1.0,
-    ) -> np.ndarray:
-        if not sp.isspmatrix_csr(a):
-            a = a.tocsr()
-        else:
-            a = a.copy()
-
-        if not sp.isspmatrix_csr(b):
-            b = b.tocsr()
-        else:
-            b = b.copy()
-
-        if a.shape != b.shape:
-            raise ValueError(f"Shape mismatch: {a.shape} vs {b.shape}")
-
-        a.sum_duplicates()
-        b.sum_duplicates()
-        a.eliminate_zeros()
-        b.eliminate_zeros()
-
-        if binarize:
-            a.data = np.ones_like(a.data, dtype=np.uint8)
-            b.data = np.ones_like(b.data, dtype=np.uint8)
-
-        # For binary matrices:
-        # intersection count per row = number of coordinates nonzero in both
-        inter = a.multiply(b).count_nonzero(axis=1)
-
-        # union count per row = nnz(a_row) + nnz(b_row) - intersection
-        a_nnz = a.count_nonzero(axis=1)
-        b_nnz = b.count_nonzero(axis=1)
-        union = a_nnz + b_nnz - inter
-
-        inter = np.asarray(inter).ravel()
-        union = np.asarray(union).ravel()
-
-        out = np.empty(a.shape[0], dtype=float)
-        mask = union == 0
-        out[~mask] = inter[~mask] / union[~mask]
-        out[mask] = empty_value
-        return out
-        
-    # compute the Jaccard similarity between the two graphs
-    rna_jaccard_similarity = jaccard_per_sample_csr(rna_multigate_knn_graph, spatial_knn_graph)
-    atac_jaccard_similarity = jaccard_per_sample_csr(atac_multigate_knn_graph, spatial_knn_graph)
-    jaccard_similarity = np.concatenate([rna_jaccard_similarity, atac_jaccard_similarity])
-    plt.hist(jaccard_similarity, bins=50)
-
-    sc.pl.embedding(source_concat_adata, basis="spatial", color="jaccard_similarity", s=50, legend_loc='None')
-    sc.pl.embedding(source_concat_adata, basis="spatial", color="RNA_clusters", s=50, legend_loc='None')
-    
-    
     
     #%% attention matrix analysis
     from post_hoc_utils import run_gene_peak_attention_tutorial
@@ -3147,13 +3074,12 @@ def main():
     gene_peak_attention_links = gene_peak_attention_links.drop_duplicates(subset=['Gene', 'Peak', 'Attention', 'gene_idx', 'peak_idx'])
     assert gene_peak_attention_links[['Gene', 'Peak']].value_counts().le(1).all()
 
-    plt.figure(figsize=(4, 3))
-    gene_peak_attention_links['Gene'].value_counts(ascending=True).plot(marker='.', color='black')
-    plt.xlabel('Genes'); plt.ylabel('Number of peaks'); plt.show()
-
     ## find high PLS-weighted gene-peak attention links
-    pls_source_rna_coef_ranked_df = pls_source_rna_coef_df.abs().rank(1, ascending=False)
-    pls_source_atac_coef_ranked_df = pls_source_atac_coef_df.abs().rank(1, ascending=False)
+    try:
+        pls_source_rna_coef_ranked_df = pls_source_rna_coef_df.abs().rank(1, ascending=False)
+        pls_source_atac_coef_ranked_df = pls_source_atac_coef_df.abs().rank(1, ascending=False)
+    except:
+        print("Need to run PLS regression")
 
     all_pls_scores_df = pd.DataFrame()
     for gene, peak in gene_peak_attention_links[['Gene', 'Peak']].values:
@@ -3174,11 +3100,26 @@ def main():
     print(all_pls_scores_df.head(5))
     print(all_pls_scores_grouped_df.head(10))
 
-    ## select PLS-gene combinations and isolate gene-peak link df
+    ## select PLS-gene combinations
     pls_cmp = 'PLS_2'
     gene = 'Zic1'
     peaks = gene_peak_attention_links[gene_peak_attention_links['Gene'] == gene]['Peak'].values
 
+    plt.figure(figsize=(2.5, 3))
+    value_counts = gene_peak_attention_links['Gene'].value_counts(ascending=True)
+    ax = value_counts.plot(marker='.', color='black')
+    plt.xlabel('Genes')
+    plt.ylabel('Number of peaks')
+
+    # DORC plot and annotate the marker corresponding to 'gene'
+    if gene in value_counts.index:
+        y = value_counts[gene]
+        x = list(value_counts.index).index(gene)
+        ax.plot(x, y, 'ro', markersize=8, label=gene)
+        ax.annotate(gene, (x, y), xytext=(0, 10), textcoords='offset points', ha='center', va='bottom', fontsize=9, color='red', fontweight='bold')
+    plt.show()
+
+    ## isolate gene-peak link df
     gp_link_df = gene_peak_attention_links.loc[
         gene_peak_attention_links['Gene'].eq(gene) &
         (gene_peak_attention_links['Peak'].isin(peaks))
@@ -3197,7 +3138,10 @@ def main():
     print(f"  CSV:   {gp_link_csv_path}")
     print(f"  BEDPE: {gp_link_bedpe_path}")
 
-    
+    # Plot the saved BEDPE with CoolBox (run from MultiGATE/; env needs bgzip, tabix, pairix).
+    # Use the BEDPE path printed above as --links; pass a sorted, tabix-indexed .gtf.bgz as --gtf (or set $DATAPATH).
+    # python scripts/plot_gene_peak_attention_links_track.py --links gp_link_bedpe_path --gtf "$DATAPATH/gene_annotations/gencode.vM25.chr_patch_hapl_scaff.annotation.sorted.gtf.bgz" --out "$OUTPATH/MultiGATE/attention_analysis/gene_peak_links.pdf"
+
     #%% AJIVE analysis
     from mvlearn.decomposition import AJIVE
     import seaborn as sns
@@ -4463,6 +4407,84 @@ def main():
         color=['gene_or_topic', 'topic_gene_dist', 'max_abs_beta'],
         color_map='Set2',
         ncols=3, wspace=0.2, size=25)
+
+    #%% compare spatial graph with latent knn graph
+    n_neighbors = 100
+
+    sc.pp.neighbors(source_rna, use_rep='MultiGATE', n_neighbors=n_neighbors)
+    sc.pp.neighbors(source_atac, use_rep='MultiGATE', n_neighbors=n_neighbors)
+    rna_multigate_knn_graph = source_rna.obsp['connectivities']
+    atac_multigate_knn_graph = source_atac.obsp['connectivities']
+
+    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
+    source_concat_adata.obs['jaccard_similarity'] = jaccard_similarity
+    source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
+
+    MultiGATE.Cal_Spatial_Net(source_rna, model='KNN', k_cutoff=n_neighbors)
+    MultiGATE.Cal_Spatial_Net(source_atac, model='KNN', k_cutoff=n_neighbors)
+
+    spatial_knn_graph, _, _, _ = build_graph_inputs(source_rna, source_atac)
+    indices, values, shape = spatial_knn_graph
+    indices = np.asarray(indices)
+    row, col = indices[:, 0], indices[:, 1]
+    spatial_knn_graph = sp.coo_matrix((values, (row, col)), shape=shape).tocsr()
+    assert indices.shape[1] == 2, "spatial_knn_graph should have 2 columns"
+
+    def jaccard_per_sample_csr(
+        a: sp.csr_matrix,
+        b: sp.csr_matrix,
+        *,
+        binarize: bool = True,
+        empty_value: float = 1.0,
+    ) -> np.ndarray:
+        if not sp.isspmatrix_csr(a):
+            a = a.tocsr()
+        else:
+            a = a.copy()
+
+        if not sp.isspmatrix_csr(b):
+            b = b.tocsr()
+        else:
+            b = b.copy()
+
+        if a.shape != b.shape:
+            raise ValueError(f"Shape mismatch: {a.shape} vs {b.shape}")
+
+        a.sum_duplicates()
+        b.sum_duplicates()
+        a.eliminate_zeros()
+        b.eliminate_zeros()
+
+        if binarize:
+            a.data = np.ones_like(a.data, dtype=np.uint8)
+            b.data = np.ones_like(b.data, dtype=np.uint8)
+
+        # For binary matrices:
+        # intersection count per row = number of coordinates nonzero in both
+        inter = a.multiply(b).count_nonzero(axis=1)
+
+        # union count per row = nnz(a_row) + nnz(b_row) - intersection
+        a_nnz = a.count_nonzero(axis=1)
+        b_nnz = b.count_nonzero(axis=1)
+        union = a_nnz + b_nnz - inter
+
+        inter = np.asarray(inter).ravel()
+        union = np.asarray(union).ravel()
+
+        out = np.empty(a.shape[0], dtype=float)
+        mask = union == 0
+        out[~mask] = inter[~mask] / union[~mask]
+        out[mask] = empty_value
+        return out
+        
+    # compute the Jaccard similarity between the two graphs
+    rna_jaccard_similarity = jaccard_per_sample_csr(rna_multigate_knn_graph, spatial_knn_graph)
+    atac_jaccard_similarity = jaccard_per_sample_csr(atac_multigate_knn_graph, spatial_knn_graph)
+    jaccard_similarity = np.concatenate([rna_jaccard_similarity, atac_jaccard_similarity])
+    plt.hist(jaccard_similarity, bins=50)
+
+    sc.pl.embedding(source_concat_adata, basis="spatial", color="jaccard_similarity", s=50, legend_loc='None')
+    sc.pl.embedding(source_concat_adata, basis="spatial", color="RNA_clusters", s=50, legend_loc='None')
 
     #%% ── Save outputs ─────────────────────────────────────────────────────────
     if args.save_h5ad:
