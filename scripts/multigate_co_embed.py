@@ -2285,1127 +2285,7 @@ def main():
     # Place legend on top of the plot
     plt.tight_layout(); plt.show()
 
-    #%% FASTopic analysis
 
-    import decoupler as dc
-    import decoupler.op
-
-    ## load from disk, after FASTopic analysis
-    source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_with_fastopic.h5ad"))
-    source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned_with_fastopic.h5ad"))
-    target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_fastopic.h5ad"))
-    target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_fastopic.h5ad"))
-
-    ## extract fastopic results
-    def _extract_fastopic_topic_gene_weights(adata, net):
-        """Build the topic-by-gene weight matrix from FASTopic obsm/uns/varm keys.
-
-        Returns
-        -------
-        topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
-            Topics ordered by descending global weight, cleaned of inf/NaN columns.
-        sorted_topics : np.ndarray
-            Topic indices in descending global-weight order.
-        net : pd.DataFrame
-            Hallmark net filtered to genes present in topic_gene_weight_mat.
-        """
-        topic_global_weights = adata.uns['fastopic']['global_weights'].copy()
-        topic_by_genes = adata.varm['fastopic_genes_topic_weights'].T.copy()
-        topic_by_genes_df = pd.DataFrame(
-            topic_by_genes,
-            columns=adata.var_names,
-            index=[f'topic_{i}' for i in range(len(topic_by_genes))],
-        )
-        sorted_topics = np.flip(np.argsort(topic_global_weights))
-
-        plt.figure(figsize=(12, 5))
-        plt.plot(topic_by_genes_df.index[sorted_topics], topic_global_weights[sorted_topics], marker='o')
-        plt.xticks(rotation=45); plt.tight_layout(); plt.show()
-
-        topic_gene_weight_mat = topic_by_genes_df.loc[[f"topic_{i}" for i in sorted_topics]].copy()
-        topic_gene_weight_mat = topic_gene_weight_mat.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="any")
-
-        net_filtered = net[net["target"].isin(topic_gene_weight_mat.columns)].copy()
-        if net_filtered.empty:
-            raise ValueError("No Hallmark mouse genes overlap with topic-gene weight columns.")
-
-        return topic_gene_weight_mat, sorted_topics, net_filtered
-
-    def extract_fastopic_embeddings(source_adata, target_adata, modality, do_procrustes=False, keep_cells=False):
-
-        ## extract gene and topic embeddings from source and target data
-        source_gene_embeddings = source_adata.varm['fastopic_gene_embeddings'].copy()
-        target_gene_embeddings = target_adata.varm['fastopic_gene_embeddings'].copy()
-        source_topic_embeddings = source_adata.uns['fastopic']['topic_embeddings'].copy()
-        target_topic_embeddings = target_adata.uns['fastopic']['topic_embeddings'].copy()
-        source_cell_embeddings = source_adata.obsm['MultiGATE_source_aligned'].copy()
-        target_cell_embeddings = target_adata.obsm['MultiGATE_source_aligned'].copy()
-
-        if do_procrustes:
-            from scipy.spatial import procrustes
-            source_gene_embeddings, target_gene_embeddings, disparity = procrustes(source_gene_embeddings, target_gene_embeddings)
-            source_topic_embeddings, target_topic_embeddings, disparity = procrustes(source_topic_embeddings, target_topic_embeddings)
-
-        ## form sinlge adata object
-        source_target_gene_embeddings = np.concatenate([source_gene_embeddings, target_gene_embeddings], axis=0)
-        source_target_topic_embeddings = np.concatenate([source_topic_embeddings, target_topic_embeddings], axis=0)
-        source_target_cell_embeddings = np.concatenate([source_cell_embeddings, target_cell_embeddings], axis=0)
-
-        feature_type = 'gene' if modality == 'rna' else 'peak'
-        gene_or_topic = np.concatenate([
-            np.full(source_target_gene_embeddings.shape[0], feature_type),
-            np.full(source_target_topic_embeddings.shape[0], 'topic'),
-            np.full(source_target_cell_embeddings.shape[0], 'cell'),
-        ])
-        label = np.concatenate([
-            source_adata.var_names,
-            target_adata.var_names,
-            [f'topic_{i}' for i in range(source_topic_embeddings.shape[0])],
-            [f'topic_{i}' for i in range(target_topic_embeddings.shape[0])],
-            source_adata.obs_names,
-            target_adata.obs_names,
-        ])
-        source_or_target = np.concatenate([
-            np.full(source_gene_embeddings.shape[0], 'source'),
-            np.full(target_gene_embeddings.shape[0], 'target'),
-            np.full(source_topic_embeddings.shape[0], 'source'),
-            np.full(target_topic_embeddings.shape[0], 'target'),
-            np.full(source_cell_embeddings.shape[0], 'source'),
-            np.full(target_cell_embeddings.shape[0], 'target'),
-        ])
-
-        gene_topic_adata = sc.AnnData(
-            X = np.concatenate(
-                [source_target_gene_embeddings, source_target_topic_embeddings, source_target_cell_embeddings],
-                axis=0,
-            ),
-            obs = pd.DataFrame(
-                data = {
-                'gene_or_topic': gene_or_topic,
-                'source_or_target': source_or_target,
-                'label': label},
-            )
-        )
-        gene_topic_adata.obs['combination'] = gene_topic_adata.obs['source_or_target'].astype(str) + '_' + gene_topic_adata.obs['gene_or_topic'].astype(str)
-
-        ## split source and target adatas
-        source_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('source')].copy()
-        target_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('target')].copy()
-
-        if not keep_cells:
-            source_adata = source_adata[~source_adata.obs['gene_or_topic'].eq('cell')]
-            target_adata = target_adata[~target_adata.obs['gene_or_topic'].eq('cell')]
-
-        return source_adata, target_adata
-
-    ## extract topic embeddings from source and target data
-    feature_topic_adatas = {}
-    feature_topic_adatas['source_rna'], feature_topic_adatas['target_rna'] = extract_fastopic_embeddings(source_rna, target_rna, modality='rna')
-    feature_topic_adatas['source_atac'], feature_topic_adatas['target_atac'] = extract_fastopic_embeddings(source_atac, target_atac, modality='atac')
-
-    ## concat a subset of the feature topic adatas for visualization
-    '''
-    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['target_rna'], feature_topic_adatas['target_atac']], axis=0)
-    sc.pp.neighbors(concat_feature_topic_adatas, use_rep='X', n_neighbors=10)
-    sc.tl.leiden(concat_feature_topic_adatas)
-    sc.tl.umap(concat_feature_topic_adatas, min_dist=0.3)
-    umap_axes = sc.pl.umap(
-        concat_feature_topic_adatas,
-        color=['gene_or_topic', 'leiden'],
-        ncols=3,
-        wspace=0.2,
-        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':250}),
-        show=False,
-    )
-    topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
-    topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
-    n_topics = int(feature_topic_adatas['target_rna'].obs['gene_or_topic'].eq('topic').sum())
-    topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
-    for ax in np.atleast_1d(umap_axes):
-        for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
-            ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
-    plt.tight_layout(); plt.show()
-    
-    '''
-    ## ingest ATAC embeddings into RNA UMAP - TARGET DATA
-    sc.pp.neighbors(feature_topic_adatas['target_rna'], use_rep='X', n_neighbors=10)
-    sc.tl.umap(feature_topic_adatas['target_rna'], min_dist=0.3)
-    sc.tl.leiden(feature_topic_adatas['target_rna'], resolution=0.5)
-    sc.tl.ingest(feature_topic_adatas['target_atac'], feature_topic_adatas['target_rna'], embedding_method='umap', obs='leiden')
-    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['target_rna'], feature_topic_adatas['target_atac']], axis=0)
-    umap_axes = sc.pl.umap(
-        concat_feature_topic_adatas,
-        color=['gene_or_topic', 'leiden'],
-        ncols=3,
-        wspace=0.1,
-        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':350}),
-        show=False,
-    )
-    topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
-    topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
-    n_topics = int(feature_topic_adatas['target_rna'].obs['gene_or_topic'].eq('topic').sum())
-    topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
-    for ax in np.atleast_1d(umap_axes):
-        for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
-            ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
-    plt.tight_layout(); plt.show()
-
-    ## ingest ATAC embeddings into RNA UMAP - SOURCE DATA
-    sc.pp.neighbors(feature_topic_adatas['source_rna'], use_rep='X', n_neighbors=10)
-    sc.tl.umap(feature_topic_adatas['source_rna'], min_dist=0.3)
-    sc.tl.leiden(feature_topic_adatas['source_rna'], resolution=0.5)
-    sc.tl.ingest(feature_topic_adatas['source_atac'], feature_topic_adatas['source_rna'], embedding_method='umap', obs='leiden')
-    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['source_rna'], feature_topic_adatas['source_atac']], axis=0)
-    umap_axes = sc.pl.umap(
-        concat_feature_topic_adatas,
-        color=['gene_or_topic', 'leiden'],
-        ncols=3,
-        wspace=0.1,
-        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':350}),
-        show=False,
-    )
-    topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
-    topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
-    n_topics = int(feature_topic_adatas['source_rna'].obs['gene_or_topic'].eq('topic').sum())
-    topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
-    for ax in np.atleast_1d(umap_axes):
-        for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
-            ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
-    plt.tight_layout(); plt.show()
-
-    ## compare topic embeddings across datasets and modalities
-    topic_embeddings = []
-    for dat in feature_topic_adatas.values():
-        embs = dat[dat.obs['gene_or_topic'].eq('topic')].X.copy()
-        topic_embeddings.append(embs)
-
-    if \
-        (topic_embeddings[0] == topic_embeddings[2]).all() and \
-        (topic_embeddings[1] == topic_embeddings[3]).all():
-        print("Tied topic embeddings confirmed.")
-
-    topic_embeddings = np.concatenate(topic_embeddings, axis=0)
-    corr_matrix = np.corrcoef(topic_embeddings)
-    plt.figure(figsize=(5, 4))
-    sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0)
-    plt.xticks([])
-    plt.yticks([])
-    plt.tight_layout(); plt.show()
-
-    ## build shared Hallmark mouse net once
-    hallmark_human = dc.op.hallmark(organism="human")
-    map_path = os.path.join(os.environ["DATAPATH"], "gene_annotations", "human_mouse_gene_orthologs.csv")
-    map_df = (
-        pd.read_csv(map_path)
-        .rename(columns={"Gene name": "target_human", "Mouse gene name": "target"})[
-            ["target_human", "target"]
-        ]
-        .dropna()
-        .drop_duplicates()
-    )
-    hallmark_mouse_net = (
-        hallmark_human.rename(columns={"target": "target_human"})
-        .merge(map_df, on="target_human", how="inner")[["source", "target"]]
-        .drop_duplicates()
-    )
-
-    ## extract topic-by-gene weight matrix from source and target data
-    source_topic_mat, source_sorted_topics, source_net = _extract_fastopic_topic_gene_weights(
-        source_rna, hallmark_mouse_net,
-    )
-    target_topic_mat, target_sorted_topics, target_net = _extract_fastopic_topic_gene_weights(
-        target_rna, hallmark_mouse_net,
-    )
-
-    ## build LR-level sender-receiver gene sets
-    import liana as li
-    import decoupler as dc
-
-    # 1) Load ligand-receptor pairs from LIANA
-    lr_pairs = li.rs.select_resource('mouseconsensus')
-
-    # 2) Load pathway gene sets / weights from decoupler
-    #avail_resources = dc.op.show_resources()
-    #resource = dc.op.resource('HPA_secretome')
-
-
-    # 3) Generate LR-level sender-receiver gene sets
-    lr_hallmark = li.rs.generate_lr_geneset(
-        lr_pairs,
-        hallmark_mouse_net,
-        lr_sep="^",
-        weight=None
-    )
-
-    ortholog_mapper = map_df.set_index('target_human').to_dict()['target']
-    resource = dc.op.progeny(organism='human')
-    resource = resource.map(lambda x: ortholog_mapper.get(x, x) if pd.notnull(x) else x)
-
-    lr_resource = li.rs.generate_lr_geneset(
-        lr_pairs,
-        resource,
-        lr_sep="^",
-        weight=None
-    )
-
-    ## create LR genesets
-    lr_hallmark_grouped_source = lr_hallmark.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[0].explode().tolist()))
-    lr_hallmark_grouped_target = lr_hallmark.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[1].explode().tolist()))
-    lr_hallmark_grouped = pd.concat([lr_hallmark_grouped_source.rename('source_genes'), lr_hallmark_grouped_target.rename('target_genes')], axis=1)
-    lr_hallmark_grouped['all_genes'] = lr_hallmark_grouped.apply(lambda x: list(x['source_genes']) + list(x['target_genes']), axis=1)
-    lr_hallmark_grouped.index.rename('pathway', inplace=True)
-
-    lr_resource_grouped_source = lr_resource.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[0].explode().tolist()))
-    lr_resource_grouped_target = lr_resource.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[1].explode().tolist()))
-    lr_resource_grouped = pd.concat([lr_resource_grouped_source.rename('source_genes'), lr_resource_grouped_target.rename('target_genes')], axis=1)
-    lr_resource_grouped['all_genes'] = lr_resource_grouped.apply(lambda x: list(x['source_genes']) + list(x['target_genes']), axis=1)
-    lr_resource_grouped.index.rename('pathway', inplace=True)
-
-    #%% gene-set enrichment analysis
-    import gseapy as gp
-
-    def run_topic_gsea(topic_gene_weight_mat, gene_sets_dict, min_size=3, permutation_num=1000, seed=42, padj_thresh=0.05):
-        """Run gseapy prerank GSEA over a topic-by-gene weight matrix.
-
-        Each row (topic) is treated as an independent pre-ranked gene list; topic-gene
-        weights serve as the ranking statistic, not expression counts.
-
-        Parameters
-        ----------
-        topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
-        gene_sets_dict : dict {pathway: [gene, ...]}
-            Hallmark gene sets filtered to the scored gene universe.
-        min_size : int
-            Minimum gene set overlap with the ranked list to test.
-        permutation_num : int
-            Number of permutations for p-value estimation.
-
-        Returns
-        -------
-        dict with keys:
-            gsea_results_per_topic, gsea_long, gsea_long_filt, top_terms_per_topic
-        """
-        import gseapy as gp
-
-        gsea_results_per_topic = {}
-        rows = []
-
-        for topic in topic_gene_weight_mat.index:
-            rnk = (
-                topic_gene_weight_mat.loc[topic]
-                .dropna()
-                .sort_values(ascending=False)
-            )
-            pre = gp.prerank(
-                rnk=rnk,
-                gene_sets=gene_sets_dict,
-                min_size=min_size,
-                max_size=len(rnk),
-                permutation_num=permutation_num,
-                seed=seed,
-                no_plot=True,
-                outdir=None,
-                verbose=False,
-            )
-            gsea_results_per_topic[topic] = pre
-            res = pre.res2d.copy()
-            res = res.rename(columns={"Term": "pathway"})
-            res.insert(0, "topic", topic)
-            rows.append(res)
-
-        gsea_long = (
-            pd.concat(rows, ignore_index=True)
-            .rename(columns={"NOM p-val": "pval", "FDR q-val": "padj", "NES": "nes"})
-            [["topic", "pathway", "nes", "pval", "padj", "Lead_genes", "Tag %", "Gene %"]]
-            .sort_values(["topic", "padj", "nes"], ascending=[True, True, False])
-        )
-        top_terms_per_topic = gsea_long.groupby("topic", group_keys=False).head(10)
-        print(top_terms_per_topic)
-
-        gsea_long_filt = gsea_long[gsea_long["padj"].le(padj_thresh)]
-        significant_pathways_per_topic = (
-            gsea_long_filt.groupby("topic")["pathway"].apply(list).to_dict()
-        )
-        for topic_to_plot, pathways in significant_pathways_per_topic.items():
-            pre = gsea_results_per_topic[topic_to_plot]
-            for pathway in pathways:
-                row = gsea_long_filt.query("topic == @topic_to_plot and pathway == @pathway").iloc[0]
-                axes = gp.gseaplot(
-                    rank_metric=pre.ranking,
-                    term=pathway,
-                    **pre.results[pathway],
-                    ofname=None,
-                )
-                fig = axes[0].get_figure()
-                for ax in axes:
-                    ax.set_title("")
-                fig.suptitle(
-                    f"{topic_to_plot} | {pathway}\nNES={row['nes']:.2f}, adj. p={row['padj']:.2e}",
-                    fontsize=9,
-                    y=1.02,
-                )
-                plt.tight_layout(); plt.show()
-
-        return dict(
-            gsea_results_per_topic=gsea_results_per_topic,
-            gsea_long=gsea_long,
-            gsea_long_filt=gsea_long_filt,
-            top_terms_per_topic=top_terms_per_topic,
-        )
-
-    def run_topic_ora(topic_gene_weight_mat, gene_sets_dict, ora_tmin=3, padj_thresh=0.05):
-        """Run gseapy ORA for each topic using a triangle-threshold gene cutoff.
-
-        Top genes per topic are selected by a global triangle threshold applied to the
-        flattened topic-gene weight distribution.  Background is the scored gene universe
-        (columns of topic_gene_weight_mat).
-
-        Parameters
-        ----------
-        topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
-        gene_sets_dict : dict {pathway: [gene, ...]}
-            Hallmark gene sets filtered to the scored gene universe.
-
-        Returns
-        -------
-        dict with keys:
-            knee_value, top_genes_per_topic, ora_long, ora_long_filt, top_ora_terms_per_topic
-        """
-        from skimage.filters import threshold_triangle
-        import gseapy as gp
-
-        global_topic_gene_weights = (
-            topic_gene_weight_mat.melt()["value"]
-            .dropna()
-            .sort_values(ascending=False)
-            .reset_index(drop=True)
-        )
-        knee_value = threshold_triangle(global_topic_gene_weights.values)
-        knee_index = int(np.argmin(np.abs(global_topic_gene_weights.values - knee_value)))
-
-        plt.figure(figsize=(3, 3))
-        global_topic_gene_weights.plot()
-        plt.scatter(knee_index, knee_value, color='red', label=f"knee={knee_value:.2e}")
-        plt.legend(); plt.tight_layout(); plt.show()
-        plt.close()
-
-        background_genes = topic_gene_weight_mat.columns.astype(str).tolist()
-
-        top_genes_per_topic = {
-            topic: (
-                topic_gene_weight_mat.loc[topic][topic_gene_weight_mat.loc[topic].ge(knee_value)]
-                .sort_values(ascending=False)
-                .index.astype(str)
-                .tolist()
-            )
-            for topic in topic_gene_weight_mat.index
-        }
-
-        rows = []
-        for topic, top_genes in top_genes_per_topic.items():
-            if not top_genes:
-                continue
-            enr = gp.enrich(
-                gene_list=top_genes,
-                gene_sets=gene_sets_dict,
-                background=background_genes,
-                cutoff=1.0,
-                no_plot=True,
-                outdir=None,
-            )
-            res = enr.res2d.copy()
-            res.index.name = "pathway"
-            res = res.reset_index()
-            res.insert(0, "topic", topic)
-            rows.append(res)
-
-        if not rows:
-            print("No ORA results produced. Consider lowering ora_tmin.")
-            empty = pd.DataFrame()
-            return dict(
-                knee_value=knee_value,
-                top_genes_per_topic=top_genes_per_topic,
-                ora_long=empty,
-                ora_long_filt=empty,
-                top_ora_terms_per_topic=empty,
-            )
-
-        ora_long = (
-            pd.concat(rows, ignore_index=True)
-            .rename(columns={
-                "Adjusted P-value": "padj",
-                "P-value": "pval",
-                "Overlap": "overlap",
-                "Genes": "overlap_genes",
-            })
-            [["topic", "pathway", "pval", "padj", "overlap", "overlap_genes"]]
-            .sort_values(["topic", "padj"], ascending=[True, True])
-        )
-        ora_long_filt = ora_long[ora_long["padj"].le(padj_thresh)]
-        top_ora_terms_per_topic = ora_long.groupby("topic", group_keys=False).head(10)
-        print(top_ora_terms_per_topic)
-
-        return dict(
-            knee_value=knee_value,
-            top_genes_per_topic=top_genes_per_topic,
-            ora_long=ora_long,
-            ora_long_filt=ora_long_filt,
-            top_ora_terms_per_topic=top_ora_terms_per_topic,
-        )
-
-    def run_topic_ora_leiden(feature_topic_adata, gene_sets_dict, background_genes, ora_tmin=3, padj_thresh=0.05):
-
-        # Set categorical order so that 'topic' is before 'gene' in gene_or_topic
-        gene_topic_cat = pd.CategoricalDtype(['topic', 'gene'], ordered=True)
-        feature_topic_adata.obs['gene_or_topic'] = feature_topic_adata.obs['gene_or_topic'].astype(gene_topic_cat)
-        n_gene_topics_per_leiden = feature_topic_adata.obs.groupby('leiden')['gene_or_topic'].value_counts().sort_index(level=['leiden', 'gene_or_topic'])
-        
-        index_per_leiden = feature_topic_adata.obs.groupby('leiden').apply(lambda x: x.index.tolist())
-        filt_enr_per_leiden = {}
-        for leiden, index in index_per_leiden.items():
-            data = feature_topic_adata[index].copy()
-            genes = data.obs.loc[data.obs['gene_or_topic'].eq('gene'), 'label'].tolist()
-            
-            enr = gp.enrich(
-                gene_list=genes,
-                gene_sets='GO_Biological_Process_2025' if gene_sets_dict is None else gene_sets_dict,
-                background=background_genes,
-                cutoff=1.0,
-                no_plot=True,
-                outdir=None,
-            )
-            if enr.res2d is None:
-                print(f"No ORA results produced for leiden {leiden}. Consider lowering ora_tmin.")
-                continue
-
-            res = enr.res2d.copy()
-            res_filt = res[res['Adjusted P-value'].le(padj_thresh)]
-            filt_enr_per_leiden[leiden] = res_filt
-
-        return filt_enr_per_leiden, n_gene_topics_per_leiden
-            
-
-    def run_gsea_ora_overlap(gsea_long_filt, ora_long_filt):
-        """Compute per-topic Jaccard similarity between significant GSEA and ORA pathways.
-
-        Returns
-        -------
-        gsea_ora_jaccard : pd.Series
-            Per-topic Jaccard index, sorted descending.
-        """
-        gsea_hits_per_topic = (
-            gsea_long_filt.groupby("topic", group_keys=False)["pathway"].apply(np.unique)
-        )
-        ora_hits_per_topic = (
-            ora_long_filt.groupby("topic", group_keys=False)["pathway"].apply(np.unique)
-        )
-        topics_union = set(gsea_hits_per_topic.index) | set(ora_hits_per_topic.index)
-        gsea_ora_jaccard = {}
-        for topic in topics_union:
-            gsea_paths = set(gsea_hits_per_topic.get(topic, []))
-            ora_paths = set(ora_hits_per_topic.get(topic, []))
-            union_n = len(gsea_paths | ora_paths)
-            gsea_ora_jaccard[topic] = (
-                len(gsea_paths & ora_paths) / union_n if union_n > 0 else 0.0
-            )
-        gsea_ora_jaccard = pd.Series(gsea_ora_jaccard).sort_values(ascending=False)
-        print("GSEA vs. ORA Jaccard similarity:")
-        print(gsea_ora_jaccard)
-        return gsea_ora_jaccard
-
-    ## convert net DataFrame to dict {pathway: [gene, ...]} for gseapy
-    def _net_to_gene_sets_dict(net, split_source_target=False):
-        if net.columns.equals(pd.Index(['source', 'target'])):
-            return net.groupby("source")["target"].apply(list).to_dict()
-        
-        if split_source_target: # split by source/sender and target/receiver (nothing to do with source/target data)
-            combined_gene_sets = {}
-            combined_gene_sets.update({str(idx) + '_source': genes for idx, genes in net['source_genes'].to_dict().items()})
-            combined_gene_sets.update({str(idx) + '_target': genes for idx, genes in net['target_genes'].to_dict().items()})
-            return combined_gene_sets
-        else:
-            return net['all_genes'].to_dict()
-   
-
-    #source_gene_sets_dict = _net_to_gene_sets_dict(source_net)
-    #target_gene_sets_dict = _net_to_gene_sets_dict(target_net)
-
-    source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_hallmark_grouped, split_source_target=True)
-    source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_resource_grouped, split_source_target=True)
-
-    ## fetch background genes
-    background_genes = source_x1.columns.tolist()
-
-    ## run ORA
-    source_ora, source_n_gene_topics_per_leiden = run_topic_ora_leiden(feature_topic_adatas['source_rna'], source_gene_sets_dict, background_genes)
-    target_ora, target_n_gene_topics_per_leiden = run_topic_ora_leiden(feature_topic_adatas['target_rna'], target_gene_sets_dict, background_genes)
-
-    ## run GSEA
-    source_gsea = run_topic_gsea(source_topic_mat, source_gene_sets_dict)
-    target_gsea = run_topic_gsea(target_topic_mat, target_gene_sets_dict)
-
-    ## compute jaccard similarity between GSEA and ORA results
-    source_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], source_ora["ora_long_filt"])
-    target_jaccard = run_gsea_ora_overlap(target_gsea["gsea_long_filt"], target_ora["ora_long_filt"])
-
-    #gsea_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], target_gsea["gsea_long_filt"])
-    #ora_jaccard = run_gsea_ora_overlap(source_ora["ora_long_filt"], target_ora["ora_long_filt"])
-
-    shared_gsea_paths = set(source_gsea["gsea_long_filt"]['pathway']) & set(target_gsea["gsea_long_filt"]['pathway'])
-    shared_ora_paths = set(source_ora["ora_long_filt"]['pathway']) & set(target_ora["ora_long_filt"]['pathway'])
-    shared_paths = shared_gsea_paths & shared_ora_paths
-    print("Shared GSEA and ORA pathways across source and target:\n", shared_paths)
-
-
-
-    #%% analysis of linear decoder
-    from sklearn.metrics.pairwise import euclidean_distances
-    from scipy.special import softmax
-    from post_hoc_utils import topic_betas_hallmark_gsea_mouse
-
-    assert teacher_source_mgate.linear_etm_decoder
-
-    ## extract decoder parameters
-    alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
-    rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
-    rho_atac = teacher_source_mgate.rho_atac.detach().cpu().numpy()
-
-    rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
-    rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
-    rho_rna_overlap = ((np.abs(rho_rna) == np.abs(rho_rna).max(1, keepdims=True)) * rho_rna_mask).any(1).mean()
-    rho_atac_overlap = ((np.abs(rho_atac) == np.abs(rho_atac).max(1, keepdims=True)) * rho_atac_mask).any(1).mean()
-    print(f"RNA overlap: {rho_rna_overlap}, ATAC overlap: {rho_atac_overlap}")
-
-    rho_rna_mask_gain = (np.abs(rho_rna) * rho_rna_mask).sum(1) / rho_rna_mask.sum(1) / np.abs(rho_rna).mean(1)
-    rho_atac_mask_gain = (np.abs(rho_atac) * rho_atac_mask).sum(1) / rho_atac_mask.sum(1) / np.abs(rho_atac).mean(1)
-    fig, ax = plt.subplots(1, 2, figsize=(10, 5), sharex=True)
-    ax[0].hist(rho_rna_mask_gain, bins=50)
-    ax[1].hist(rho_atac_mask_gain, bins=50)
-    plt.tight_layout(); plt.show()
-
-    topk=25
-    topk_genes = []
-    for topic in range(alpha.shape[0]):
-        topk_genes_topic = pd.Series(alpha[topic]).nlargest(topk).index
-        topk_genes.append(topk_genes_topic)
-    topk_genes = np.concatenate(topk_genes)
-    top_alpha = alpha[:,topk_genes]
-    plt.figure(figsize=(10, 10))
-    plt.matshow(top_alpha, aspect='auto'); plt.colorbar()
-    plt.tight_layout(); plt.show()
-
-    pathway_names = teacher_source_mgate.pathway_names
-    source_pathway_names = [pw for pw in pathway_names if pw.endswith('source')]
-    target_pathway_names = [pw for pw in pathway_names if pw.endswith('target')]
-
-    alpha_df = pd.DataFrame(alpha, index=[f'topic_{i}' for i in range(30)], columns=pathway_names)
-    pd.concat([
-        alpha_df.abs().max(1),
-        alpha_df.abs().median(1)
-    ], axis=1).sort_values(0).plot(kind='bar')
-
-
-    # alpha = F.normalize(alpha, dim=1)
-    # rho_rna = F.normalize(rho_rna, dim=1)
-    # rho_atac = F.normalize(rho_atac, dim=1)
-    # topic_var = teacher_source_mgate.topic_var.detach().cpu().numpy()
-
-    beta_rna = alpha @ rho_rna
-    beta_atac = alpha @ rho_atac
-
-    ## derive theta from delta embeddings
-    source_theta = softmax(np.concatenate([source_rna_emb, source_atac_emb], axis=0), axis=1)
-    source_theta_df = pd.DataFrame(source_theta, index=np.concatenate([source_rna.obs_names, source_atac.obs_names]))
-
-    target_theta = softmax(np.concatenate([target_rna_emb, target_atac_emb], axis=0), axis=1)
-    target_theta_df = pd.DataFrame(target_theta, index=np.concatenate([target_rna.obs_names, target_atac.obs_names]))
-
-    ## cluster delta by leiden clusters, then apply softmax to get theta
-    source_clust_by_topic_theta = (
-        pd.DataFrame(source_rna_emb, index=source_rna.obs_names)
-        .assign(RNA_leiden=source_concat_adata.obs.loc[
-            source_concat_adata.obs['modality'].eq('rna'),
-            'leiden'
-            ].values)
-        .groupby('RNA_leiden')
-        .mean()
-        .apply(softmax, axis=1, result_type='expand')
-    )
-
-    target_clust_by_topic_theta = (
-        pd.DataFrame(target_rna_emb, index=target_rna.obs_names)
-        .assign(RNA_leiden=target_concat_adata.obs.loc[
-            target_concat_adata.obs['modality'].eq('rna'),
-            'leiden'
-            ].values)
-        .groupby('RNA_leiden')
-        .mean()
-        .apply(softmax, axis=1, result_type='expand')
-    )
-    
-    ## get top topics for each cluster and plot staircase heatmap
-    topk = 5
-    fig, axs = plt.subplots(1, 2, figsize=(10, 10))
-
-    topk_topics = []
-    topics = source_clust_by_topic_theta.columns.values
-    clusters = source_clust_by_topic_theta.max(1).sort_values(ascending=False).index
-    for cluster in clusters:
-        topk_topics_cluster = source_clust_by_topic_theta.loc[cluster].nlargest(topk).index
-        topk_topics_cluster = topk_topics_cluster[topk_topics_cluster.isin(topics)]
-        topics = topics[~np.isin(topics, topk_topics_cluster)]
-        topk_topics.append(topk_topics_cluster)
-    source_topk_topics = np.concatenate(topk_topics + [pd.Index(topics)]) # could also just keep topk_topics
-    source_clust_by_topic_theta = source_clust_by_topic_theta.loc[clusters, source_topk_topics]
-    sns.heatmap(source_clust_by_topic_theta.T, cmap='viridis', ax=axs[0])
-
-    topk_topics = []
-    topics = target_clust_by_topic_theta.columns.values
-    clusters = target_clust_by_topic_theta.max(1).sort_values(ascending=False).index
-    for cluster in clusters:
-        topk_topics_cluster = target_clust_by_topic_theta.loc[cluster].nlargest(topk).index
-        topk_topics_cluster = topk_topics_cluster[topk_topics_cluster.isin(topics)]
-        topics = topics[~np.isin(topics, topk_topics_cluster)]
-        topk_topics.append(topk_topics_cluster)
-    target_topk_topics = np.concatenate(topk_topics + [pd.Index(topics)])
-    target_clust_by_topic_theta = target_clust_by_topic_theta.loc[clusters, target_topk_topics]
-    sns.heatmap(target_clust_by_topic_theta.T, cmap='viridis', ax=axs[1])
-    plt.tight_layout(); plt.show()
-
-    ## add alpha embeddings to source and target data
-    source_alpha_embs = source_theta @ alpha
-    target_alpha_embs = target_theta @ alpha
-    source_target_adata.obsm['alpha_embs'] = np.concatenate([source_alpha_embs, target_alpha_embs], axis=0)
-
-    import liana as li
-    
-    pathways_adata = sc.AnnData(
-        source_alpha_embs,
-        obs=source_target_adata[source_target_adata.obs['source_or_target'].eq('source')].obs,
-        var=pd.DataFrame(
-            data=np.vstack([
-                [pw.split('__')[0] for pw in pathway_names],
-                ['sender' if pw.endswith('source') else 'receiver' for pw in pathway_names],
-            ]).T,
-            index=pathway_names,
-            columns=['basename', 'sender_or_receiver']),
-        obsm={'spatial': source_target_adata[source_target_adata.obs['source_or_target'].eq('source')].obsm['spatial']},
-        )
-    pathways_adata.var['paired'] = pathways_adata.var['basename'].isin(pathways_adata.var['basename'].value_counts().index[pathways_adata.var['basename'].value_counts().eq(2)])
-
-    li.ut.spatial_neighbors(pathways_adata, bandwidth=1000, set_diag=False)
-    paired_pathways_adata = pathways_adata[:,pathways_adata.var['paired']].copy()
-    sender_pathways_adata = paired_pathways_adata[:,paired_pathways_adata.var['sender_or_receiver'].eq('sender')]
-    receiver_pathways_adata = paired_pathways_adata[:,paired_pathways_adata.var['sender_or_receiver'].eq('receiver')]
-    assert np.all(sender_pathways_adata.var['basename'].values == receiver_pathways_adata.var['basename'].values)
-
-    X = pathways_adata.X.copy()
-    W = pathways_adata.obsp['spatial_connectivities']
-    plt.matshow(X.T @ W @ X, aspect='auto'); plt.colorbar()
-    plt.tight_layout(); plt.show()
-
-    S = sender_pathways_adata.X.copy()
-    R = receiver_pathways_adata.X.copy()
-    W = pathways_adata.obsp['spatial_connectivities']
-    plt.scatter(S.sum(axis=0), R.sum(axis=0)); plt.colorbar()
-
-    #S = softmax(S, axis=0)
-    #R = softmax(R, axis=0)
-
-    M = S.T @ W @ R
-    plt.matshow(M); plt.colorbar()
-
-    sc.pp.pca(pathways_adata, n_comps=50)
-    sc.external.pp.bbknn(pathways_adata, batch_key='source_or_target', use_rep='X_pca', neighbors_within_batch=10)
-    sc.tl.umap(pathways_adata, min_dist=0.3)
-    sc.pl.umap(pathways_adata, color=['source_or_target'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
-
-    ## compute mean distance between source and target for each cluster
-    source_adata = source_target_adata[source_target_adata.obs['source_or_target'].eq('source')]
-    target_adata = source_target_adata[source_target_adata.obs['source_or_target'].eq('target')]
-    mean_dists = pd.DataFrame(index=source_adata.obs['leiden'].cat.categories, columns=['multigate', 'alpha'])
-    for cluster in source_adata.obs['leiden'].cat.categories:
-        source_dat = source_adata[source_adata.obs['leiden'].eq(cluster)]
-        target_dat = target_adata[target_adata.obs['leiden'].eq(cluster)]
-        mean_dists.loc[cluster, 'multigate'] = np.mean(euclidean_distances(source_dat.X, target_dat.X)) # could replace with wasserstein distance
-        mean_dists.loc[cluster, 'alpha'] = np.mean(euclidean_distances(source_dat.obsm['alpha_embs'], target_dat.obsm['alpha_embs']))
-    mean_dists = mean_dists.sort_values(by='multigate', ascending=True)
-    mean_dists.loc['all', 'multigate'] = np.mean(euclidean_distances(source_adata.X, target_adata.X))
-    mean_dists.loc['all', 'alpha'] = np.mean(euclidean_distances(source_adata.obsm['alpha_embs'], target_adata.obsm['alpha_embs']))
-    print(mean_dists)
-
-    ## get top active topics and perform GSEA
-    top_active_cluster = mean_dists.index[0] #'5'
-    top_active_topics = source_clust_by_topic_theta.loc[top_active_cluster].nlargest(topk).index
-    top_active_gsea = topic_betas_hallmark_gsea_mouse(
-        beta_rna=beta_rna,
-        gene_names=np.asarray(source_rna.var_names).astype(str),
-        topic_indices=top_active_topics,
-        datapath=os.environ["DATAPATH"],
-    )
-    top_active_genes = top_active_gsea["top_active_genes"]
-    top_active_rna_betas = top_active_gsea["ranked_gene_indices"]
-    print("\nHallmark GSEA (mouse) — top terms per active topic:")
-    print(
-        top_active_gsea["top_terms_per_row"].loc[
-            top_active_gsea["top_terms_per_row"]['padj'].le(0.05)
-        ]
-    )
-
-    # Categorical.map(dict) looks up category values with their native dtype; string
-    # keys in lut won't match int categories and yield NaN floats mixed with RGB
-    # tuples, which breaks pandas' Index reconstruction (TypeError).
-    cluster_key = source_theta_df.obs['RNA_clusters'].astype(str)
-    unique_clusters = cluster_key.unique()
-    network_pal = sns.husl_palette(len(unique_clusters), s=0.45)
-    lut = dict(zip(unique_clusters, network_pal))
-    row_colors = cluster_key.map(lut)
-
-    cg = sns.clustermap(source_theta_df, cmap='viridis', row_colors=row_colors)
-    cg.ax_heatmap.set_yticklabels([])
-
-    alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
-    rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
-    rho_atac = teacher_source_mgate.rho_atac.detach().cpu().numpy()
-    rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
-    rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
-
-    beta_rna = alpha @ rho_rna
-    beta_atac = alpha @ rho_atac
-
-    ## topic-topic correlation
-    topic_topic_corr = np.corrcoef(alpha)
-    topic_topic_corr[np.eye(topic_topic_corr.shape[0]) == 1] = 0
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(topic_topic_corr, cmap='viridis')
-    plt.tight_layout()
-    plt.show()
-
-    ## topic norms
-    topic_norm = np.linalg.norm(alpha, axis=1)
-    beta_rna_norm = np.linalg.norm(beta_rna, axis=1)
-    beta_atac_norm = np.linalg.norm(beta_atac, axis=1)
-    fig, ax = plt.subplots(3, 1, figsize=(6, 8))
-    ax[0].bar(np.arange(alpha.shape[0]), topic_norm)
-    ax[1].bar(np.arange(beta_rna.shape[0]), beta_rna_norm)
-    ax[2].bar(np.arange(beta_atac.shape[0]), beta_atac_norm)
-    ax[0].set_title("Topic norm")
-    ax[1].set_title("Beta RNA norm")
-    ax[2].set_title("Beta ATAC norm")
-    plt.tight_layout()
-    plt.show()
-
-    ## topic & feature co-embedding
-    alpha_norm = alpha / np.linalg.norm(alpha, axis=1, keepdims=True)
-    rho_rna_norm = rho_rna / np.linalg.norm(rho_rna, axis=1, keepdims=True)
-    rho_atac_norm = rho_atac / np.linalg.norm(rho_atac, axis=1, keepdims=True)
-
-    alpha_rho_rna_adata = sc.AnnData(
-        np.concatenate([rho_rna_norm.T, alpha_norm], axis=0),
-    )
-    alpha_rho_rna_adata.obs_names = np.concatenate([[f'gp_{gp}' for gp in range(rho_rna.shape[1])], [f'topic_{topic}' for topic in range(alpha.shape[0])]])
-    alpha_rho_rna_adata.obs['gene_or_topic'] = np.concatenate([['gene'] * rho_rna.shape[1], ['topic'] * alpha.shape[0]])
-    alpha_rho_rna_adata.obs['max_abs_beta'] = list(np.abs(beta_rna).argmax(0)) + list(np.arange(alpha.shape[0]))
-
-    sc.pp.pca(alpha_rho_rna_adata, n_comps=100)
-    sc.pp.neighbors(alpha_rho_rna_adata, use_rep='X_pca', n_neighbors=30)
-    #sc.external.pp.bbknn(alpha_rho_rna_adata, batch_key='gene_or_topic', neighbors_within_batch=30)
-    sc.tl.umap(alpha_rho_rna_adata, min_dist=0.3)
-
-    topic_gene_dists = euclidean_distances(
-        alpha_rho_rna_adata.obsm['X_pca'],
-    )[:rho_rna.shape[1], -alpha.shape[0]:].argmin(axis=1)
-    alpha_rho_rna_adata.obs['topic_gene_dist'] = list(topic_gene_dists) + list(np.arange(alpha.shape[0]))
-
-    # 1. Extract coordinates and groups into a lightweight dataframe
-    df = pd.DataFrame(alpha_rho_rna_adata.obsm['X_umap'], columns=['UMAP1', 'UMAP2'], index=alpha_rho_rna_adata.obs_names)
-    df = df.join(alpha_rho_rna_adata.obs[['gene_or_topic', 'max_abs_beta']])
-
-    # 2. Plot using seaborn, adding labels for topics
-    plt.figure(figsize=(8, 6))
-    scatter = sns.scatterplot(
-        data=df, 
-        x='UMAP1', 
-        y='UMAP2', 
-        hue='gene_or_topic',   # Colors by group
-        style='gene_or_topic', # Assigns different markers by group
-        palette='Set2',
-        s=list([5] * rho_rna.shape[1]) + list([60] * alpha.shape[0]),  # Marker size
-        edgecolor='none'
-    )
-
-    # Add text labels for topics
-    topic_indices = df[df['gene_or_topic'] == 'topic'].index
-    topic_labels = [f'topic_{i}' for i in range(alpha.shape[0])]
-    for idx, label in zip(topic_indices, topic_labels):
-        plt.annotate(
-            label,
-            (df.loc[idx, 'UMAP1'], df.loc[idx, 'UMAP2']),
-            textcoords="offset points",
-            xytext=(0,5),
-            ha='center',
-            fontsize=8,
-            color='black',
-            alpha=0.8
-        )
-
-    # 3. Move the legend outside the plot
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.show()
-
-    sc.pl.umap(
-        alpha_rho_rna_adata,
-        color=['gene_or_topic', 'topic_gene_dist', 'max_abs_beta'],
-        color_map='Set2',
-        ncols=3, wspace=0.2, size=25)
-
-    #%% staircase heatmap for gene-program p-values
-
-    _gene_programs_plots_artifact_suffix = "source_mgate" if model is source_mgate else "target_mgate"
-    _gene_programs_plots_artifact_dir = "gene_programs_plots/{}".format(_gene_programs_plots_artifact_suffix)
-
-    def _log_mlflow_figure(fig, artifact_filename):
-        with tempfile.TemporaryDirectory() as _fig_tmp:
-            _path = os.path.join(_fig_tmp, artifact_filename)
-            fig.savefig(_path, format="svg", bbox_inches="tight")
-            client.log_artifact(run_id, _path, artifact_path=_gene_programs_plots_artifact_dir)
-        print(
-            "Logged {}/{} to MLflow run {}.".format(
-                _gene_programs_plots_artifact_dir, artifact_filename, run_id
-            )
-        )
-
-    def staircase_heatmap(pathway_embedding_results, adata, adata_label, plot_spatial=False, gp_name=None):
-        import seaborn as sns
-
-        cluster_gp_scores = pathway_embedding_results[adata_label].pathway_mean_by_cluster.T
-        cluster_gp_scores.columns = pd.Categorical(cluster_gp_scores.columns, ordered=True, categories=['R0', 'R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10'])
-        cluster_gp_scores = cluster_gp_scores.sort_index(axis=1)
-
-        topks = []
-        for clust in cluster_gp_scores.columns:
-            clust_p = cluster_gp_scores[clust]
-            topk_gps = clust_p.nlargest(3).index
-            topks.append(topk_gps)
-
-        topks = np.hstack(topks)
-
-        cluster_gp_scores_topks = cluster_gp_scores.loc[topks]
-
-        fig_heatmap, axs = plt.subplots(1, 2, figsize=(12, 12), sharey=True)
-        sns.heatmap(cluster_gp_scores_topks, cmap='viridis', ax=axs[0])
-        sign = np.sign(cluster_gp_scores_topks)
-        cluster_gp_scores_topks_abs = np.abs(cluster_gp_scores_topks)
-        col_min = cluster_gp_scores_topks_abs.min(axis=0)
-        col_max = cluster_gp_scores_topks_abs.max(axis=0)
-        cluster_gp_scores_topks_scaled = sign * (cluster_gp_scores_topks_abs - col_min) / (col_max - col_min)
-        sns.heatmap(cluster_gp_scores_topks_scaled, cmap='viridis', ax=axs[1])
-        plt.tight_layout()
-        _log_mlflow_figure(fig_heatmap, "staircase_gp_heatmap_{}.svg".format(adata_label))
-        plt.show()
-
-        fig_spatial = None
-        if plot_spatial:
-            top_idxs = np.stack(np.where(cluster_gp_scores_topks == cluster_gp_scores_topks.values.max())).flatten()
-            top_gp_name = cluster_gp_scores_topks.iloc[top_idxs[0]].name
-            if gp_name is not None:
-                top_gp_name = gp_name
-            top_gp_scores = pathway_embedding_results[adata_label].pathway_scores.loc[:,top_gp_name]
-            adata.obs[top_gp_name] = top_gp_scores
-            sc.pl.embedding(
-                adata,
-                basis='spatial',
-                color=['RNA_clusters', top_gp_name],
-                ncols=3,
-                wspace=0.2,
-                size=75,
-                show=False,
-            )
-            fig_spatial = plt.gcf()
-            plt.tight_layout()
-            _log_mlflow_figure(fig_spatial, "staircase_gp_spatial_{}.svg".format(adata_label))
-            plt.show()
-
-        return cluster_gp_scores, fig_heatmap, fig_spatial
-
-    def cluster_pathway_embedding_heatmap(pathway_embedding_results, adata_label, top_k_pathways=3, row_ind=None, col_ind=None, pathway_order=None):
-        import seaborn as sns
-
-        result = pathway_embedding_results[adata_label]
-        corr = result.pathway_embedding_correlation_by_cluster
-        if corr is None or corr.empty:
-            return None, None
-
-        if pathway_order is None:
-            #pathway_order = corr.abs().max(axis=1).sort_values(ascending=False).head(top_k_pathways).index
-            pathway_order = pd.Series(corr.apply(lambda x: corr.index[np.argsort(x)[:top_k_pathways]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values
-            corr_top = corr.loc[pathway_order]
-            cg = sns.clustermap(corr_top, cmap='coolwarm', center=0.0)
-            _log_mlflow_figure(cg.figure, "pathway_embedding_by_cluster_{}.svg".format(adata_label))
-        else:
-            fig, ax = plt.subplots(figsize=(8, 8))
-            corr_top = corr.loc[pathway_order]
-            corr_top = corr_top.iloc[row_ind, col_ind]
-            sns.heatmap(corr_top, cmap='coolwarm', center=0.0, ax=ax)
-            _log_mlflow_figure(fig, "pathway_embedding_by_cluster_{}.svg".format(adata_label))
-            cg=None
-
-        plt.show()
-
-        return corr_top, cg, pathway_order
-
-    # Myc_TF_target_genes_GP, Apex1_TF_target_genes_GP
-    source_rna_cluster_gp_scores, _fig_stair_heatmap_source, _fig_stair_spatial_source = staircase_heatmap(
-        pathway_embedding_results, source_rna, 'source_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
-    )
-    target_rna_cluster_gp_scores, _fig_stair_heatmap_target, _fig_stair_spatial_target = staircase_heatmap(
-        pathway_embedding_results, target_rna, 'target_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
-    )
-
-
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    import pandas as pd
-
-
-    ## remove terms from correlation matrix, e.g. TF targets
-    terms_blacklist = None #['TF_target', 'combined']
-    if terms_blacklist is not None:
-        pathway_embedding_results_cp = pathway_embedding_results.copy()
-        pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster = \
-            pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster.loc[
-                ~pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster.index.str.contains('|'.join(terms_blacklist))
-            ]
-
-    # 1) Get source corr matrix and pathway order
-    source_corr, _, pathway_order_source = cluster_pathway_embedding_heatmap(
-        pathway_embedding_results, "source_rna", top_k_pathways=2
-    )
-    source_corr = source_corr.loc[pathway_order_source]
-
-    # 2) Temporary clustermap only to extract row/col ordering
-    cg = sns.clustermap(source_corr, cmap="coolwarm", center=0.0)
-    row_ind = cg.dendrogram_row.reordered_ind
-    col_ind = cg.dendrogram_col.reordered_ind
-    plt.close(cg.figure)
-
-    # Reorder source
-    source_corr_ord = source_corr.iloc[row_ind, col_ind]
-
-    # 3) Build target using same pathway + same row/col order
-    target_corr = pathway_embedding_results["target_rna"].pathway_embedding_correlation_by_cluster
-    target_corr = target_corr.loc[pathway_order_source].iloc[row_ind, col_ind]
-
-    # 4) Overlap
-    overlap = softmax(source_corr_ord * target_corr / 5.0)
-    overlap = (overlap - overlap.min()) / (overlap.max() - overlap.min())
-    overlap_df = pd.DataFrame(overlap, index=target_corr.index, columns=target_corr.columns)
-
-    '''
-    ## rename "emb" to "topic"
-    source_corr_ord.columns = source_corr_ord.columns.str.replace('emb', 'topic')
-    target_corr.columns = target_corr.columns.str.replace('emb', 'topic')
-    overlap_df.columns = overlap_df.columns.str.replace('emb', 'topic')
-
-    ## compare with alpha
-    alpha_df_ord = alpha_df.copy()
-    alpha_df_ord.columns = alpha_df_ord.columns.str.split('__').str[0]
-    alpha_df_ord = alpha_df_ord.groupby(alpha_df_ord.columns, axis=1).mean()
-    alpha_df_ord = alpha_df_ord.loc[overlap_df.columns, overlap_df.index]
-    plt.figure(figsize=(10, 12))
-    sns.heatmap(alpha_df_ord.T, cmap='coolwarm'); plt.tight_layout(); plt.show()
-    '''
-
-    # 5) One combined figure
-    fig, axes = plt.subplots(1, 3, figsize=(24, 10), constrained_layout=True, sharey=True, sharex=True)
-    sns.heatmap(source_corr_ord, cmap="coolwarm", center=0.0, ax=axes[0], cbar=True)
-    sns.heatmap(target_corr, cmap="coolwarm", center=0.0, ax=axes[1], cbar=True)
-    sns.heatmap(overlap_df, cmap="coolwarm", ax=axes[2], cbar=True)
-    axes[0].set_title("Source data")
-    axes[1].set_title("Target data")
-    axes[2].set_title("Source-target overlap")
-    _log_mlflow_figure(fig, "pathway_embedding_triptych.svg")
-    plt.show()
-
-    ## compare with p-values
-    corr_pvals = pathway_embedding_results['source_rna'].pathway_embedding_p_values_by_cluster.copy()
-    corr_pvals = corr_pvals.loc[overlap_df.index, overlap_df.columns]
-    corr_pvals_bin = corr_pvals < 0.05
-    sns.heatmap(corr_pvals_bin, center=0.0, cbar=False); plt.show()
-
-    # Cluster-by-cluster comparison: grid of panels (scatter + linear fit per cluster)
-    from scipy.stats import pearsonr
-
-    overlap_clusters = source_rna_cluster_gp_scores.columns.intersection(target_rna_cluster_gp_scores.columns)
-    all_data = []
-    for cluster in overlap_clusters:
-        source_cluster_gp_scores = source_rna_cluster_gp_scores[cluster]
-        target_cluster_gp_scores = target_rna_cluster_gp_scores[cluster]
-        for gp in source_cluster_gp_scores.index:
-            all_data.append({
-                'source': source_cluster_gp_scores[gp],
-                'target': target_cluster_gp_scores[gp],
-                'Gene Program': gp,
-                'Cluster': cluster
-            })
-    all_data_df = pd.DataFrame(all_data)
-    import seaborn as sns
-
-    n_clust = len(overlap_clusters)
-    rna_cluster_colormaps = dict(zip(
-        source_concat_adata.obs['RNA_clusters'].cat.categories.tolist(),
-        source_concat_adata.uns['RNA_clusters_colors']
-    ))
-    if n_clust > 0:
-        ncols = int(np.ceil(n_clust / 2))
-        nrows = 2
-        fig, axes = plt.subplots(
-            nrows,
-            ncols,
-            figsize=(3.4 * ncols, 3.4 * nrows),
-            sharex=True,
-            sharey=True,
-            squeeze=False,
-        )
-        axes_flat = axes.flatten()
-        line_color = '#1a1a1a'
-        for i, cluster in enumerate(overlap_clusters):
-            ax = axes_flat[i]
-            sub = all_data_df.loc[all_data_df['Cluster'] == cluster]
-            marker_color = rna_cluster_colormaps[cluster]
-            # Compute Pearson r for this cluster
-            if len(sub) > 1:
-                pearson_r, _ = pearsonr(sub['source'], sub['target'])
-                pearson_r_str = f" (r={pearson_r:.2f})"
-            else:
-                pearson_r_str = ""
-            sns.regplot(
-                data=sub,
-                x='source',
-                y='target',
-                ax=ax,
-                ci=None,
-                scatter_kws={
-                    's': 36,
-                    'alpha': 0.75,
-                    'marker': 'x',
-                    'color': marker_color,
-                    'edgecolor': marker_color,
-                },
-                line_kws={'color': line_color, 'lw': 2, 'alpha': 0.95},
-            )
-            ax.set_title(f"{cluster}{pearson_r_str}", fontsize=10)
-            ax.grid(True, color='#dddddd', linewidth=0.5)
-        for j in range(n_clust, len(axes_flat)):
-            axes_flat[j].set_visible(False)
-        fig.suptitle('Source vs target gene program scores (per cluster)', y=1.02)
-        fig.supxlabel('source cluster GP score')
-        fig.supylabel('target cluster GP score')
-        plt.tight_layout(rect=[0.04, 0.04, 1, 0.98])
-        _log_mlflow_figure(fig, "source_vs_target_gene_program_scores_per_cluster.svg")
-        plt.show()
 
     #%% LIANA+ inflow analysis
     import liana as li
@@ -3848,7 +2728,7 @@ def main():
     plt.tight_layout()
     plt.show()
 
-    #%% embedding-to-gene modelling
+    #%% PLS embedding-to-gene modelling
     from sklearn.cross_decomposition import PLSRegression
     import decoupler as dc
     import decoupler.op
@@ -4152,255 +3032,6 @@ def main():
     save_plot_to_pdf(fig, '11_pls_source_target_correlation_heatmaps')
     plt.show()
 
-    #%% AJIVE analysis
-    from mvlearn.decomposition import AJIVE
-    import seaborn as sns
-
-    ## spatial source inference
-    teacher_spatial_source_rna_emb, teacher_spatial_source_atac_emb = run_inference(
-        teacher_source_mgate, source_graph_tf, source_gp_tf, source_x1, source_x2, device
-    )    
-    ## non-spatial source inference
-    student_non_spatial_source_rna_emb, student_non_spatial_source_atac_emb = run_inference(
-        source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
-    )
-
-    ## AJIVE analysis
-    X1 = teacher_spatial_source_rna_emb.copy()
-    X2 = student_non_spatial_source_rna_emb.copy()
-
-    U, S, V = np.linalg.svd(X1)
-    vars1 = S**2 / np.sum(S**2)
-    cumsum_vars1 = np.cumsum(vars1)
-    U, S, V = np.linalg.svd(X2)
-    vars2 = S**2 / np.sum(S**2)
-    cumsum_vars2 = np.cumsum(vars2)
-    n_plot_cps = X1.shape[1]
-    
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
-    axes[0].plot(np.arange(n_plot_cps) + 1, cumsum_vars1[:n_plot_cps], 'ro-', linewidth=2)
-    axes[1].plot(np.arange(n_plot_cps) + 1, cumsum_vars2[:n_plot_cps], 'ro-', linewidth=2)
-    axes[0].set_title('Cumulative Variance View 1')
-    axes[1].set_title('Cumulative Variance View 2')
-    axes[0].set_xlabel('Number of top singular values')
-    axes[1].set_xlabel('Number of top singular values')
-    axes[0].set_ylabel('Cumulative percent variance explained')
-    # Add grid to both plots
-    axes[0].grid(True, color='#dddddd', linewidth=0.5)
-    axes[1].grid(True, color='#dddddd', linewidth=0.5)
-    # Add horizontal line at cumsum_vars==0.9
-    axes[0].axhline(y=0.9, color='gray', linestyle='--', linewidth=1)
-    axes[1].axhline(y=0.9, color='gray', linestyle='--', linewidth=1)
-    plt.show()
-
-    ## fit AJIVE
-    source_rna_emb_list = [X1, X2]
-
-    ajive = AJIVE(
-        #init_signal_ranks=[7, 10],
-        joint_rank=None,
-        n_jobs=1)
-
-    source_rna_joint = ajive.fit_transform(source_rna_emb_list)
-
-    def plot_blocks(blocks, names):
-        n_views = len(blocks[0])
-        n_blocks = len(blocks)
-        for i in range(n_views):
-            for j in range(n_blocks):
-                plt.subplot(n_blocks, n_views, j*n_views+i+1)
-                sns.heatmap(blocks[j][i], xticklabels=False, yticklabels=False,
-                            cmap="RdBu")
-                plt.title(f"View {i}: {names[j]}")
-
-    ## plot AJIVE blocks
-    plt.figure(figsize=[15, 10])
-    plt.title('Different Views')
-    individual_mats = ajive.individual_mats_
-    Xs_inv = ajive.inverse_transform(source_rna_joint)
-    residuals = [v - X for v, X in zip(source_rna_emb_list, Xs_inv)]
-    plot_blocks([source_rna_emb_list, source_rna_joint, individual_mats, residuals],
-                ["Raw Data", "Joint", "Individual", "Noise"])
-
-    ## UMAP of AJIVE projection embeddings
-    import anndata as ad
-    obs_index = np.concatenate([source_rna.obs_names, source_rna.obs_names])
-    obs_df = pd.DataFrame(
-        {
-            "teacher_or_student": (["teacher"] * source_rna.n_obs + ["student"] * source_rna.n_obs),
-            "RNA_clusters": source_rna.obs["RNA_clusters"].tolist() + source_rna.obs["RNA_clusters"].tolist(),
-        },
-        index=obs_index
-    )
-    concat_ajive_joint = ad.AnnData(
-        X=np.concatenate([source_rna_joint[0], source_rna_joint[1]], axis=0),
-        obs=obs_df,
-    )
-    concat_individual_mats = ad.AnnData(
-        X=np.concatenate([individual_mats[0], individual_mats[1]], axis=0),
-        obs=obs_df,
-    )
-    concat_residuals = ad.AnnData(
-        X=np.concatenate([residuals[0], residuals[1]], axis=0),
-        obs=obs_df,
-    )
-    compute_concat_umap(
-        concat_ajive_joint,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    compute_concat_umap(
-        concat_individual_mats,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    compute_concat_umap(
-        concat_residuals,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-
-    sc.pl.umap(concat_ajive_joint, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
-
-    sc.pl.umap(concat_individual_mats, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
-
-    sc.pl.umap(concat_residuals, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
-
-    teacher_individual_mat = concat_individual_mats[concat_individual_mats.obs["teacher_or_student"].eq("teacher")]
-    student_individual_mat = concat_individual_mats[concat_individual_mats.obs["teacher_or_student"].eq("student")]
-
-    compute_concat_umap(
-        teacher_individual_mat,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    compute_concat_umap(
-        student_individual_mat,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    sc.pl.umap(teacher_individual_mat, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
-    sc.pl.umap(student_individual_mat, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
-
-    #%% source student & teacher analysis
-
-    corr_matrix = np.corrcoef(teacher_source_rna_emb, source_rna_emb, rowvar=False)
-    n_dims = source_rna_emb.shape[1]
-    #corr_matrix = corr_matrix[:n_dims, n_dims:]
-
-    plt.figure(figsize=(6, 6))
-    plt.matshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
-    plt.colorbar()
-    plt.title('Correlation between teacher and student source embeddings')
-    plt.show()
-
-    # Compute per-dimension Pearson correlation between teacher and student source embeddings
-    C = teacher_source_rna_emb - source_rna_emb
-    mu = C.mean(axis=0)
-    sigma = C.std(axis=0)
-    C_std = (C - mu) / (sigma + 1e-6)
-
-    from sklearn.decomposition import PCA
-    pca = PCA(n_components=n_dims)
-    pca.fit(C_std)
-    plt.plot(np.cumsum(pca.explained_variance_ratio_))
-    # Plot barcharts of the first 5 principal component loadings using seaborn as different series
-    import seaborn as sns
-
-    n_pcs = 5
-    loadings_df = pd.DataFrame(
-        pca.components_[:n_pcs].T,
-        columns=[f'PC{i+1}' for i in range(n_pcs)]
-    )
-    loadings_df['Original Dimension'] = loadings_df.index
-
-    loadings_melted = loadings_df.melt(id_vars='Original Dimension', var_name='Principal Component', value_name='Loading')
-
-    plt.figure(figsize=(14, 8))
-    sns.barplot(
-        data=loadings_melted,
-        hue='Original Dimension',
-        x='Principal Component',
-        y='Loading',
-        alpha=0.7
-    )
-    plt.xlabel('Original Dimension')
-    plt.ylabel('Component Loading Value')
-    plt.title('Barcharts of PCA Component Loadings (First 5 PCs)')
-    plt.legend(title='Principal Component')
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(8, 4))
-    plt.bar(range(n_dims), corr_sorted)
-    plt.title('Per-dimension Pearson correlation between teacher and student source embeddings')
-    plt.xticks(range(n_dims), corr_sort, rotation=45)
-    plt.ylabel('Pearson r')
-    plt.show()
-
-    ## remove top-k dimensions with largest spatial difference
-    top_k = 5
-    #keep_dims = np.arange(n_dims)[np.intersect1d(np.arange(n_dims), corr_sort[:-(top_k+1)])]
-    keep_dims = np.arange(n_dims)[np.intersect1d(np.arange(n_dims), corr_sort[top_k:])]
-
-    set_multigate_embeddings(source_rna, source_atac,
-        teacher_source_rna_emb[:, keep_dims],
-        teacher_source_atac_emb[:, keep_dims],
-        key_added="MultiGATE_teacher_trunc")
-    set_multigate_embeddings(source_rna, source_atac,
-        source_rna_emb[:, keep_dims],
-        source_atac_emb[:, keep_dims],
-        key_added="MultiGATE_trunc")
-    print("  Teacher source truncated embeddings: shape {}".format(teacher_source_rna_emb[:, keep_dims].shape))
-    print("  Student source truncated embeddings: shape {}".format(source_rna_emb[:, keep_dims].shape))
-
-    teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher_trunc")
-    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_trunc")
-    compute_concat_umap(
-        teacher_source_concat_adata,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    compute_concat_umap(
-        source_concat_adata,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-
-    # plot teacher source truncated UMAPs
-    teacher_source_trunc_umap_colors = ['modality', 'leiden', 'RNA_clusters']
-    fig, axs = plt.subplots(1, len(teacher_source_trunc_umap_colors), figsize=(18, 5))
-    for i, color in enumerate(teacher_source_trunc_umap_colors):
-        sc.pl.umap(teacher_source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
-    plt.tight_layout(); plt.show()
-
-    # plot source truncated UMAPs
-    source_trunc_umap_colors = ['modality', 'leiden', 'RNA_clusters']
-    fig, axs = plt.subplots(1, len(source_trunc_umap_colors), figsize=(18, 5))
-    for i, color in enumerate(source_trunc_umap_colors):
-        sc.pl.umap(source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
-    plt.tight_layout(); plt.show()
-
-
 
     
     #%% compare spatial graph with latent knn graph
@@ -4566,6 +3197,1272 @@ def main():
     print(f"  CSV:   {gp_link_csv_path}")
     print(f"  BEDPE: {gp_link_bedpe_path}")
 
+    
+    #%% AJIVE analysis
+    from mvlearn.decomposition import AJIVE
+    import seaborn as sns
+
+    ## spatial source inference
+    teacher_spatial_source_rna_emb, teacher_spatial_source_atac_emb = run_inference(
+        teacher_source_mgate, source_graph_tf, source_gp_tf, source_x1, source_x2, device
+    )    
+    ## non-spatial source inference
+    student_non_spatial_source_rna_emb, student_non_spatial_source_atac_emb = run_inference(
+        source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+    )
+
+    ## AJIVE analysis
+    X1 = teacher_spatial_source_rna_emb.copy()
+    X2 = student_non_spatial_source_rna_emb.copy()
+
+    U, S, V = np.linalg.svd(X1)
+    vars1 = S**2 / np.sum(S**2)
+    cumsum_vars1 = np.cumsum(vars1)
+    U, S, V = np.linalg.svd(X2)
+    vars2 = S**2 / np.sum(S**2)
+    cumsum_vars2 = np.cumsum(vars2)
+    n_plot_cps = X1.shape[1]
+    
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
+    axes[0].plot(np.arange(n_plot_cps) + 1, cumsum_vars1[:n_plot_cps], 'ro-', linewidth=2)
+    axes[1].plot(np.arange(n_plot_cps) + 1, cumsum_vars2[:n_plot_cps], 'ro-', linewidth=2)
+    axes[0].set_title('Cumulative Variance View 1')
+    axes[1].set_title('Cumulative Variance View 2')
+    axes[0].set_xlabel('Number of top singular values')
+    axes[1].set_xlabel('Number of top singular values')
+    axes[0].set_ylabel('Cumulative percent variance explained')
+    # Add grid to both plots
+    axes[0].grid(True, color='#dddddd', linewidth=0.5)
+    axes[1].grid(True, color='#dddddd', linewidth=0.5)
+    # Add horizontal line at cumsum_vars==0.9
+    axes[0].axhline(y=0.9, color='gray', linestyle='--', linewidth=1)
+    axes[1].axhline(y=0.9, color='gray', linestyle='--', linewidth=1)
+    plt.show()
+
+    ## fit AJIVE
+    source_rna_emb_list = [X1, X2]
+
+    ajive = AJIVE(
+        #init_signal_ranks=[7, 10],
+        joint_rank=None,
+        n_jobs=1)
+
+    source_rna_joint = ajive.fit_transform(source_rna_emb_list)
+
+    def plot_blocks(blocks, names):
+        n_views = len(blocks[0])
+        n_blocks = len(blocks)
+        for i in range(n_views):
+            for j in range(n_blocks):
+                plt.subplot(n_blocks, n_views, j*n_views+i+1)
+                sns.heatmap(blocks[j][i], xticklabels=False, yticklabels=False,
+                            cmap="RdBu")
+                plt.title(f"View {i}: {names[j]}")
+
+    ## plot AJIVE blocks
+    plt.figure(figsize=[15, 10])
+    plt.title('Different Views')
+    individual_mats = ajive.individual_mats_
+    Xs_inv = ajive.inverse_transform(source_rna_joint)
+    residuals = [v - X for v, X in zip(source_rna_emb_list, Xs_inv)]
+    plot_blocks([source_rna_emb_list, source_rna_joint, individual_mats, residuals],
+                ["Raw Data", "Joint", "Individual", "Noise"])
+
+    ## UMAP of AJIVE projection embeddings
+    import anndata as ad
+    obs_index = np.concatenate([source_rna.obs_names, source_rna.obs_names])
+    obs_df = pd.DataFrame(
+        {
+            "teacher_or_student": (["teacher"] * source_rna.n_obs + ["student"] * source_rna.n_obs),
+            "RNA_clusters": source_rna.obs["RNA_clusters"].tolist() + source_rna.obs["RNA_clusters"].tolist(),
+        },
+        index=obs_index
+    )
+    concat_ajive_joint = ad.AnnData(
+        X=np.concatenate([source_rna_joint[0], source_rna_joint[1]], axis=0),
+        obs=obs_df,
+    )
+    concat_individual_mats = ad.AnnData(
+        X=np.concatenate([individual_mats[0], individual_mats[1]], axis=0),
+        obs=obs_df,
+    )
+    concat_residuals = ad.AnnData(
+        X=np.concatenate([residuals[0], residuals[1]], axis=0),
+        obs=obs_df,
+    )
+    compute_concat_umap(
+        concat_ajive_joint,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    compute_concat_umap(
+        concat_individual_mats,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    compute_concat_umap(
+        concat_residuals,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+
+    sc.pl.umap(concat_ajive_joint, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+
+    sc.pl.umap(concat_individual_mats, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+
+    sc.pl.umap(concat_residuals, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+
+    teacher_individual_mat = concat_individual_mats[concat_individual_mats.obs["teacher_or_student"].eq("teacher")]
+    student_individual_mat = concat_individual_mats[concat_individual_mats.obs["teacher_or_student"].eq("student")]
+
+    compute_concat_umap(
+        teacher_individual_mat,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    compute_concat_umap(
+        student_individual_mat,
+        n_neighbors=10,
+        resolution=1.5,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    sc.pl.umap(teacher_individual_mat, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+    sc.pl.umap(student_individual_mat, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+
+
+    #%% gene-set enrichment analysis
+    import gseapy as gp
+
+    def run_topic_gsea(topic_gene_weight_mat, gene_sets_dict, min_size=3, permutation_num=1000, seed=42, padj_thresh=0.05):
+        """Run gseapy prerank GSEA over a topic-by-gene weight matrix.
+
+        Each row (topic) is treated as an independent pre-ranked gene list; topic-gene
+        weights serve as the ranking statistic, not expression counts.
+
+        Parameters
+        ----------
+        topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
+        gene_sets_dict : dict {pathway: [gene, ...]}
+            Hallmark gene sets filtered to the scored gene universe.
+        min_size : int
+            Minimum gene set overlap with the ranked list to test.
+        permutation_num : int
+            Number of permutations for p-value estimation.
+
+        Returns
+        -------
+        dict with keys:
+            gsea_results_per_topic, gsea_long, gsea_long_filt, top_terms_per_topic
+        """
+        import gseapy as gp
+
+        gsea_results_per_topic = {}
+        rows = []
+
+        for topic in topic_gene_weight_mat.index:
+            rnk = (
+                topic_gene_weight_mat.loc[topic]
+                .dropna()
+                .sort_values(ascending=False)
+            )
+            pre = gp.prerank(
+                rnk=rnk,
+                gene_sets=gene_sets_dict,
+                min_size=min_size,
+                max_size=len(rnk),
+                permutation_num=permutation_num,
+                seed=seed,
+                no_plot=True,
+                outdir=None,
+                verbose=False,
+            )
+            gsea_results_per_topic[topic] = pre
+            res = pre.res2d.copy()
+            res = res.rename(columns={"Term": "pathway"})
+            res.insert(0, "topic", topic)
+            rows.append(res)
+
+        gsea_long = (
+            pd.concat(rows, ignore_index=True)
+            .rename(columns={"NOM p-val": "pval", "FDR q-val": "padj", "NES": "nes"})
+            [["topic", "pathway", "nes", "pval", "padj", "Lead_genes", "Tag %", "Gene %"]]
+            .sort_values(["topic", "padj", "nes"], ascending=[True, True, False])
+        )
+        top_terms_per_topic = gsea_long.groupby("topic", group_keys=False).head(10)
+        print(top_terms_per_topic)
+
+        gsea_long_filt = gsea_long[gsea_long["padj"].le(padj_thresh)]
+        significant_pathways_per_topic = (
+            gsea_long_filt.groupby("topic")["pathway"].apply(list).to_dict()
+        )
+        for topic_to_plot, pathways in significant_pathways_per_topic.items():
+            pre = gsea_results_per_topic[topic_to_plot]
+            for pathway in pathways:
+                row = gsea_long_filt.query("topic == @topic_to_plot and pathway == @pathway").iloc[0]
+                axes = gp.gseaplot(
+                    rank_metric=pre.ranking,
+                    term=pathway,
+                    **pre.results[pathway],
+                    ofname=None,
+                )
+                fig = axes[0].get_figure()
+                for ax in axes:
+                    ax.set_title("")
+                fig.suptitle(
+                    f"{topic_to_plot} | {pathway}\nNES={row['nes']:.2f}, adj. p={row['padj']:.2e}",
+                    fontsize=9,
+                    y=1.02,
+                )
+                plt.tight_layout(); plt.show()
+
+        return dict(
+            gsea_results_per_topic=gsea_results_per_topic,
+            gsea_long=gsea_long,
+            gsea_long_filt=gsea_long_filt,
+            top_terms_per_topic=top_terms_per_topic,
+        )
+
+    def run_topic_ora(topic_gene_weight_mat, gene_sets_dict, ora_tmin=3, padj_thresh=0.05):
+        """Run gseapy ORA for each topic using a triangle-threshold gene cutoff.
+
+        Top genes per topic are selected by a global triangle threshold applied to the
+        flattened topic-gene weight distribution.  Background is the scored gene universe
+        (columns of topic_gene_weight_mat).
+
+        Parameters
+        ----------
+        topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
+        gene_sets_dict : dict {pathway: [gene, ...]}
+            Hallmark gene sets filtered to the scored gene universe.
+
+        Returns
+        -------
+        dict with keys:
+            knee_value, top_genes_per_topic, ora_long, ora_long_filt, top_ora_terms_per_topic
+        """
+        from skimage.filters import threshold_triangle
+        import gseapy as gp
+
+        global_topic_gene_weights = (
+            topic_gene_weight_mat.melt()["value"]
+            .dropna()
+            .sort_values(ascending=False)
+            .reset_index(drop=True)
+        )
+        knee_value = threshold_triangle(global_topic_gene_weights.values)
+        knee_index = int(np.argmin(np.abs(global_topic_gene_weights.values - knee_value)))
+
+        plt.figure(figsize=(3, 3))
+        global_topic_gene_weights.plot()
+        plt.scatter(knee_index, knee_value, color='red', label=f"knee={knee_value:.2e}")
+        plt.legend(); plt.tight_layout(); plt.show()
+        plt.close()
+
+        background_genes = topic_gene_weight_mat.columns.astype(str).tolist()
+
+        top_genes_per_topic = {
+            topic: (
+                topic_gene_weight_mat.loc[topic][topic_gene_weight_mat.loc[topic].ge(knee_value)]
+                .sort_values(ascending=False)
+                .index.astype(str)
+                .tolist()
+            )
+            for topic in topic_gene_weight_mat.index
+        }
+
+        rows = []
+        for topic, top_genes in top_genes_per_topic.items():
+            if not top_genes:
+                continue
+            enr = gp.enrich(
+                gene_list=top_genes,
+                gene_sets=gene_sets_dict,
+                background=background_genes,
+                cutoff=1.0,
+                no_plot=True,
+                outdir=None,
+            )
+            res = enr.res2d.copy()
+            res.index.name = "pathway"
+            res = res.reset_index()
+            res.insert(0, "topic", topic)
+            rows.append(res)
+
+        if not rows:
+            print("No ORA results produced. Consider lowering ora_tmin.")
+            empty = pd.DataFrame()
+            return dict(
+                knee_value=knee_value,
+                top_genes_per_topic=top_genes_per_topic,
+                ora_long=empty,
+                ora_long_filt=empty,
+                top_ora_terms_per_topic=empty,
+            )
+
+        ora_long = (
+            pd.concat(rows, ignore_index=True)
+            .rename(columns={
+                "Adjusted P-value": "padj",
+                "P-value": "pval",
+                "Overlap": "overlap",
+                "Genes": "overlap_genes",
+            })
+            [["topic", "pathway", "pval", "padj", "overlap", "overlap_genes"]]
+            .sort_values(["topic", "padj"], ascending=[True, True])
+        )
+        ora_long_filt = ora_long[ora_long["padj"].le(padj_thresh)]
+        top_ora_terms_per_topic = ora_long.groupby("topic", group_keys=False).head(10)
+        print(top_ora_terms_per_topic)
+
+        return dict(
+            knee_value=knee_value,
+            top_genes_per_topic=top_genes_per_topic,
+            ora_long=ora_long,
+            ora_long_filt=ora_long_filt,
+            top_ora_terms_per_topic=top_ora_terms_per_topic,
+        )
+
+    def run_topic_ora_leiden(feature_topic_adata, gene_sets_dict, background_genes, ora_tmin=3, padj_thresh=0.05):
+
+        # Set categorical order so that 'topic' is before 'gene' in gene_or_topic
+        gene_topic_cat = pd.CategoricalDtype(['topic', 'gene'], ordered=True)
+        feature_topic_adata.obs['gene_or_topic'] = feature_topic_adata.obs['gene_or_topic'].astype(gene_topic_cat)
+        n_gene_topics_per_leiden = feature_topic_adata.obs.groupby('leiden')['gene_or_topic'].value_counts().sort_index(level=['leiden', 'gene_or_topic'])
+        
+        index_per_leiden = feature_topic_adata.obs.groupby('leiden').apply(lambda x: x.index.tolist())
+        filt_enr_per_leiden = {}
+        for leiden, index in index_per_leiden.items():
+            data = feature_topic_adata[index].copy()
+            genes = data.obs.loc[data.obs['gene_or_topic'].eq('gene'), 'label'].tolist()
+            
+            enr = gp.enrich(
+                gene_list=genes,
+                gene_sets='GO_Biological_Process_2025' if gene_sets_dict is None else gene_sets_dict,
+                background=background_genes,
+                cutoff=1.0,
+                no_plot=True,
+                outdir=None,
+            )
+            if enr.res2d is None:
+                print(f"No ORA results produced for leiden {leiden}. Consider lowering ora_tmin.")
+                continue
+
+            res = enr.res2d.copy()
+            res_filt = res[res['Adjusted P-value'].le(padj_thresh)]
+            filt_enr_per_leiden[leiden] = res_filt
+
+        return filt_enr_per_leiden, n_gene_topics_per_leiden
+            
+
+    def run_gsea_ora_overlap(gsea_long_filt, ora_long_filt):
+        """Compute per-topic Jaccard similarity between significant GSEA and ORA pathways.
+
+        Returns
+        -------
+        gsea_ora_jaccard : pd.Series
+            Per-topic Jaccard index, sorted descending.
+        """
+        gsea_hits_per_topic = (
+            gsea_long_filt.groupby("topic", group_keys=False)["pathway"].apply(np.unique)
+        )
+        ora_hits_per_topic = (
+            ora_long_filt.groupby("topic", group_keys=False)["pathway"].apply(np.unique)
+        )
+        topics_union = set(gsea_hits_per_topic.index) | set(ora_hits_per_topic.index)
+        gsea_ora_jaccard = {}
+        for topic in topics_union:
+            gsea_paths = set(gsea_hits_per_topic.get(topic, []))
+            ora_paths = set(ora_hits_per_topic.get(topic, []))
+            union_n = len(gsea_paths | ora_paths)
+            gsea_ora_jaccard[topic] = (
+                len(gsea_paths & ora_paths) / union_n if union_n > 0 else 0.0
+            )
+        gsea_ora_jaccard = pd.Series(gsea_ora_jaccard).sort_values(ascending=False)
+        print("GSEA vs. ORA Jaccard similarity:")
+        print(gsea_ora_jaccard)
+        return gsea_ora_jaccard
+
+    ## convert net DataFrame to dict {pathway: [gene, ...]} for gseapy
+    def _net_to_gene_sets_dict(net, split_source_target=False):
+        if net.columns.equals(pd.Index(['source', 'target'])):
+            return net.groupby("source")["target"].apply(list).to_dict()
+        
+        if split_source_target: # split by source/sender and target/receiver (nothing to do with source/target data)
+            combined_gene_sets = {}
+            combined_gene_sets.update({str(idx) + '_source': genes for idx, genes in net['source_genes'].to_dict().items()})
+            combined_gene_sets.update({str(idx) + '_target': genes for idx, genes in net['target_genes'].to_dict().items()})
+            return combined_gene_sets
+        else:
+            return net['all_genes'].to_dict()
+   
+
+    #source_gene_sets_dict = _net_to_gene_sets_dict(source_net)
+    #target_gene_sets_dict = _net_to_gene_sets_dict(target_net)
+
+    source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_hallmark_grouped, split_source_target=True)
+    source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_resource_grouped, split_source_target=True)
+
+    ## fetch background genes
+    background_genes = source_x1.columns.tolist()
+
+    ## run ORA
+    source_ora, source_n_gene_topics_per_leiden = run_topic_ora_leiden(feature_topic_adatas['source_rna'], source_gene_sets_dict, background_genes)
+    target_ora, target_n_gene_topics_per_leiden = run_topic_ora_leiden(feature_topic_adatas['target_rna'], target_gene_sets_dict, background_genes)
+
+    ## run GSEA
+    source_gsea = run_topic_gsea(source_topic_mat, source_gene_sets_dict)
+    target_gsea = run_topic_gsea(target_topic_mat, target_gene_sets_dict)
+
+    ## compute jaccard similarity between GSEA and ORA results
+    source_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], source_ora["ora_long_filt"])
+    target_jaccard = run_gsea_ora_overlap(target_gsea["gsea_long_filt"], target_ora["ora_long_filt"])
+
+    #gsea_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], target_gsea["gsea_long_filt"])
+    #ora_jaccard = run_gsea_ora_overlap(source_ora["ora_long_filt"], target_ora["ora_long_filt"])
+
+    shared_gsea_paths = set(source_gsea["gsea_long_filt"]['pathway']) & set(target_gsea["gsea_long_filt"]['pathway'])
+    shared_ora_paths = set(source_ora["ora_long_filt"]['pathway']) & set(target_ora["ora_long_filt"]['pathway'])
+    shared_paths = shared_gsea_paths & shared_ora_paths
+    print("Shared GSEA and ORA pathways across source and target:\n", shared_paths)
+
+    #%% staircase heatmap for gene-program p-values
+
+    _gene_programs_plots_artifact_suffix = "source_mgate" if model is source_mgate else "target_mgate"
+    _gene_programs_plots_artifact_dir = "gene_programs_plots/{}".format(_gene_programs_plots_artifact_suffix)
+
+    def _log_mlflow_figure(fig, artifact_filename):
+        with tempfile.TemporaryDirectory() as _fig_tmp:
+            _path = os.path.join(_fig_tmp, artifact_filename)
+            fig.savefig(_path, format="svg", bbox_inches="tight")
+            client.log_artifact(run_id, _path, artifact_path=_gene_programs_plots_artifact_dir)
+        print(
+            "Logged {}/{} to MLflow run {}.".format(
+                _gene_programs_plots_artifact_dir, artifact_filename, run_id
+            )
+        )
+
+    def staircase_heatmap(pathway_embedding_results, adata, adata_label, plot_spatial=False, gp_name=None):
+        import seaborn as sns
+
+        cluster_gp_scores = pathway_embedding_results[adata_label].pathway_mean_by_cluster.T
+        cluster_gp_scores.columns = pd.Categorical(cluster_gp_scores.columns, ordered=True, categories=['R0', 'R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10'])
+        cluster_gp_scores = cluster_gp_scores.sort_index(axis=1)
+
+        topks = []
+        for clust in cluster_gp_scores.columns:
+            clust_p = cluster_gp_scores[clust]
+            topk_gps = clust_p.nlargest(3).index
+            topks.append(topk_gps)
+
+        topks = np.hstack(topks)
+
+        cluster_gp_scores_topks = cluster_gp_scores.loc[topks]
+
+        fig_heatmap, axs = plt.subplots(1, 2, figsize=(12, 12), sharey=True)
+        sns.heatmap(cluster_gp_scores_topks, cmap='viridis', ax=axs[0])
+        sign = np.sign(cluster_gp_scores_topks)
+        cluster_gp_scores_topks_abs = np.abs(cluster_gp_scores_topks)
+        col_min = cluster_gp_scores_topks_abs.min(axis=0)
+        col_max = cluster_gp_scores_topks_abs.max(axis=0)
+        cluster_gp_scores_topks_scaled = sign * (cluster_gp_scores_topks_abs - col_min) / (col_max - col_min)
+        sns.heatmap(cluster_gp_scores_topks_scaled, cmap='viridis', ax=axs[1])
+        plt.tight_layout()
+        _log_mlflow_figure(fig_heatmap, "staircase_gp_heatmap_{}.svg".format(adata_label))
+        plt.show()
+
+        fig_spatial = None
+        if plot_spatial:
+            top_idxs = np.stack(np.where(cluster_gp_scores_topks == cluster_gp_scores_topks.values.max())).flatten()
+            top_gp_name = cluster_gp_scores_topks.iloc[top_idxs[0]].name
+            if gp_name is not None:
+                top_gp_name = gp_name
+            top_gp_scores = pathway_embedding_results[adata_label].pathway_scores.loc[:,top_gp_name]
+            adata.obs[top_gp_name] = top_gp_scores
+            sc.pl.embedding(
+                adata,
+                basis='spatial',
+                color=['RNA_clusters', top_gp_name],
+                ncols=3,
+                wspace=0.2,
+                size=75,
+                show=False,
+            )
+            fig_spatial = plt.gcf()
+            plt.tight_layout()
+            _log_mlflow_figure(fig_spatial, "staircase_gp_spatial_{}.svg".format(adata_label))
+            plt.show()
+
+        return cluster_gp_scores, fig_heatmap, fig_spatial
+
+    def cluster_pathway_embedding_heatmap(pathway_embedding_results, adata_label, top_k_pathways=3, row_ind=None, col_ind=None, pathway_order=None):
+        import seaborn as sns
+
+        result = pathway_embedding_results[adata_label]
+        corr = result.pathway_embedding_correlation_by_cluster
+        if corr is None or corr.empty:
+            return None, None
+
+        if pathway_order is None:
+            #pathway_order = corr.abs().max(axis=1).sort_values(ascending=False).head(top_k_pathways).index
+            pathway_order = pd.Series(corr.apply(lambda x: corr.index[np.argsort(x)[:top_k_pathways]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values
+            corr_top = corr.loc[pathway_order]
+            cg = sns.clustermap(corr_top, cmap='coolwarm', center=0.0)
+            _log_mlflow_figure(cg.figure, "pathway_embedding_by_cluster_{}.svg".format(adata_label))
+        else:
+            fig, ax = plt.subplots(figsize=(8, 8))
+            corr_top = corr.loc[pathway_order]
+            corr_top = corr_top.iloc[row_ind, col_ind]
+            sns.heatmap(corr_top, cmap='coolwarm', center=0.0, ax=ax)
+            _log_mlflow_figure(fig, "pathway_embedding_by_cluster_{}.svg".format(adata_label))
+            cg=None
+
+        plt.show()
+
+        return corr_top, cg, pathway_order
+
+    # Myc_TF_target_genes_GP, Apex1_TF_target_genes_GP
+    source_rna_cluster_gp_scores, _fig_stair_heatmap_source, _fig_stair_spatial_source = staircase_heatmap(
+        pathway_embedding_results, source_rna, 'source_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
+    )
+    target_rna_cluster_gp_scores, _fig_stair_heatmap_target, _fig_stair_spatial_target = staircase_heatmap(
+        pathway_embedding_results, target_rna, 'target_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
+    )
+
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import pandas as pd
+
+
+    ## remove terms from correlation matrix, e.g. TF targets
+    terms_blacklist = None #['TF_target', 'combined']
+    if terms_blacklist is not None:
+        pathway_embedding_results_cp = pathway_embedding_results.copy()
+        pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster = \
+            pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster.loc[
+                ~pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster.index.str.contains('|'.join(terms_blacklist))
+            ]
+
+    # 1) Get source corr matrix and pathway order
+    source_corr, _, pathway_order_source = cluster_pathway_embedding_heatmap(
+        pathway_embedding_results, "source_rna", top_k_pathways=2
+    )
+    source_corr = source_corr.loc[pathway_order_source]
+
+    # 2) Temporary clustermap only to extract row/col ordering
+    cg = sns.clustermap(source_corr, cmap="coolwarm", center=0.0)
+    row_ind = cg.dendrogram_row.reordered_ind
+    col_ind = cg.dendrogram_col.reordered_ind
+    plt.close(cg.figure)
+
+    # Reorder source
+    source_corr_ord = source_corr.iloc[row_ind, col_ind]
+
+    # 3) Build target using same pathway + same row/col order
+    target_corr = pathway_embedding_results["target_rna"].pathway_embedding_correlation_by_cluster
+    target_corr = target_corr.loc[pathway_order_source].iloc[row_ind, col_ind]
+
+    # 4) Overlap
+    overlap = softmax(source_corr_ord * target_corr / 5.0)
+    overlap = (overlap - overlap.min()) / (overlap.max() - overlap.min())
+    overlap_df = pd.DataFrame(overlap, index=target_corr.index, columns=target_corr.columns)
+
+    '''
+    ## rename "emb" to "topic"
+    source_corr_ord.columns = source_corr_ord.columns.str.replace('emb', 'topic')
+    target_corr.columns = target_corr.columns.str.replace('emb', 'topic')
+    overlap_df.columns = overlap_df.columns.str.replace('emb', 'topic')
+
+    ## compare with alpha
+    alpha_df_ord = alpha_df.copy()
+    alpha_df_ord.columns = alpha_df_ord.columns.str.split('__').str[0]
+    alpha_df_ord = alpha_df_ord.groupby(alpha_df_ord.columns, axis=1).mean()
+    alpha_df_ord = alpha_df_ord.loc[overlap_df.columns, overlap_df.index]
+    plt.figure(figsize=(10, 12))
+    sns.heatmap(alpha_df_ord.T, cmap='coolwarm'); plt.tight_layout(); plt.show()
+    '''
+
+    # 5) One combined figure
+    fig, axes = plt.subplots(1, 3, figsize=(24, 10), constrained_layout=True, sharey=True, sharex=True)
+    sns.heatmap(source_corr_ord, cmap="coolwarm", center=0.0, ax=axes[0], cbar=True)
+    sns.heatmap(target_corr, cmap="coolwarm", center=0.0, ax=axes[1], cbar=True)
+    sns.heatmap(overlap_df, cmap="coolwarm", ax=axes[2], cbar=True)
+    axes[0].set_title("Source data")
+    axes[1].set_title("Target data")
+    axes[2].set_title("Source-target overlap")
+    _log_mlflow_figure(fig, "pathway_embedding_triptych.svg")
+    plt.show()
+
+    ## compare with p-values
+    corr_pvals = pathway_embedding_results['source_rna'].pathway_embedding_p_values_by_cluster.copy()
+    corr_pvals = corr_pvals.loc[overlap_df.index, overlap_df.columns]
+    corr_pvals_bin = corr_pvals < 0.05
+    sns.heatmap(corr_pvals_bin, center=0.0, cbar=False); plt.show()
+
+    # Cluster-by-cluster comparison: grid of panels (scatter + linear fit per cluster)
+    from scipy.stats import pearsonr
+
+    overlap_clusters = source_rna_cluster_gp_scores.columns.intersection(target_rna_cluster_gp_scores.columns)
+    all_data = []
+    for cluster in overlap_clusters:
+        source_cluster_gp_scores = source_rna_cluster_gp_scores[cluster]
+        target_cluster_gp_scores = target_rna_cluster_gp_scores[cluster]
+        for gp in source_cluster_gp_scores.index:
+            all_data.append({
+                'source': source_cluster_gp_scores[gp],
+                'target': target_cluster_gp_scores[gp],
+                'Gene Program': gp,
+                'Cluster': cluster
+            })
+    all_data_df = pd.DataFrame(all_data)
+    import seaborn as sns
+
+    n_clust = len(overlap_clusters)
+    rna_cluster_colormaps = dict(zip(
+        source_concat_adata.obs['RNA_clusters'].cat.categories.tolist(),
+        source_concat_adata.uns['RNA_clusters_colors']
+    ))
+    if n_clust > 0:
+        ncols = int(np.ceil(n_clust / 2))
+        nrows = 2
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(3.4 * ncols, 3.4 * nrows),
+            sharex=True,
+            sharey=True,
+            squeeze=False,
+        )
+        axes_flat = axes.flatten()
+        line_color = '#1a1a1a'
+        for i, cluster in enumerate(overlap_clusters):
+            ax = axes_flat[i]
+            sub = all_data_df.loc[all_data_df['Cluster'] == cluster]
+            marker_color = rna_cluster_colormaps[cluster]
+            # Compute Pearson r for this cluster
+            if len(sub) > 1:
+                pearson_r, _ = pearsonr(sub['source'], sub['target'])
+                pearson_r_str = f" (r={pearson_r:.2f})"
+            else:
+                pearson_r_str = ""
+            sns.regplot(
+                data=sub,
+                x='source',
+                y='target',
+                ax=ax,
+                ci=None,
+                scatter_kws={
+                    's': 36,
+                    'alpha': 0.75,
+                    'marker': 'x',
+                    'color': marker_color,
+                    'edgecolor': marker_color,
+                },
+                line_kws={'color': line_color, 'lw': 2, 'alpha': 0.95},
+            )
+            ax.set_title(f"{cluster}{pearson_r_str}", fontsize=10)
+            ax.grid(True, color='#dddddd', linewidth=0.5)
+        for j in range(n_clust, len(axes_flat)):
+            axes_flat[j].set_visible(False)
+        fig.suptitle('Source vs target gene program scores (per cluster)', y=1.02)
+        fig.supxlabel('source cluster GP score')
+        fig.supylabel('target cluster GP score')
+        plt.tight_layout(rect=[0.04, 0.04, 1, 0.98])
+        _log_mlflow_figure(fig, "source_vs_target_gene_program_scores_per_cluster.svg")
+        plt.show()
+
+    #%% FASTopic analysis
+
+    import decoupler as dc
+    import decoupler.op
+
+    ## load from disk, after FASTopic analysis
+    source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_with_fastopic.h5ad"))
+    source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned_with_fastopic.h5ad"))
+    target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_fastopic.h5ad"))
+    target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_fastopic.h5ad"))
+
+    ## extract fastopic results
+    def _extract_fastopic_topic_gene_weights(adata, net):
+        """Build the topic-by-gene weight matrix from FASTopic obsm/uns/varm keys.
+
+        Returns
+        -------
+        topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
+            Topics ordered by descending global weight, cleaned of inf/NaN columns.
+        sorted_topics : np.ndarray
+            Topic indices in descending global-weight order.
+        net : pd.DataFrame
+            Hallmark net filtered to genes present in topic_gene_weight_mat.
+        """
+        topic_global_weights = adata.uns['fastopic']['global_weights'].copy()
+        topic_by_genes = adata.varm['fastopic_genes_topic_weights'].T.copy()
+        topic_by_genes_df = pd.DataFrame(
+            topic_by_genes,
+            columns=adata.var_names,
+            index=[f'topic_{i}' for i in range(len(topic_by_genes))],
+        )
+        sorted_topics = np.flip(np.argsort(topic_global_weights))
+
+        plt.figure(figsize=(12, 5))
+        plt.plot(topic_by_genes_df.index[sorted_topics], topic_global_weights[sorted_topics], marker='o')
+        plt.xticks(rotation=45); plt.tight_layout(); plt.show()
+
+        topic_gene_weight_mat = topic_by_genes_df.loc[[f"topic_{i}" for i in sorted_topics]].copy()
+        topic_gene_weight_mat = topic_gene_weight_mat.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="any")
+
+        net_filtered = net[net["target"].isin(topic_gene_weight_mat.columns)].copy()
+        if net_filtered.empty:
+            raise ValueError("No Hallmark mouse genes overlap with topic-gene weight columns.")
+
+        return topic_gene_weight_mat, sorted_topics, net_filtered
+
+    def extract_fastopic_embeddings(source_adata, target_adata, modality, do_procrustes=False, keep_cells=False):
+
+        ## extract gene and topic embeddings from source and target data
+        source_gene_embeddings = source_adata.varm['fastopic_gene_embeddings'].copy()
+        target_gene_embeddings = target_adata.varm['fastopic_gene_embeddings'].copy()
+        source_topic_embeddings = source_adata.uns['fastopic']['topic_embeddings'].copy()
+        target_topic_embeddings = target_adata.uns['fastopic']['topic_embeddings'].copy()
+        source_cell_embeddings = source_adata.obsm['MultiGATE_source_aligned'].copy()
+        target_cell_embeddings = target_adata.obsm['MultiGATE_source_aligned'].copy()
+
+        if do_procrustes:
+            from scipy.spatial import procrustes
+            source_gene_embeddings, target_gene_embeddings, disparity = procrustes(source_gene_embeddings, target_gene_embeddings)
+            source_topic_embeddings, target_topic_embeddings, disparity = procrustes(source_topic_embeddings, target_topic_embeddings)
+
+        ## form sinlge adata object
+        source_target_gene_embeddings = np.concatenate([source_gene_embeddings, target_gene_embeddings], axis=0)
+        source_target_topic_embeddings = np.concatenate([source_topic_embeddings, target_topic_embeddings], axis=0)
+        source_target_cell_embeddings = np.concatenate([source_cell_embeddings, target_cell_embeddings], axis=0)
+
+        feature_type = 'gene' if modality == 'rna' else 'peak'
+        gene_or_topic = np.concatenate([
+            np.full(source_target_gene_embeddings.shape[0], feature_type),
+            np.full(source_target_topic_embeddings.shape[0], 'topic'),
+            np.full(source_target_cell_embeddings.shape[0], 'cell'),
+        ])
+        label = np.concatenate([
+            source_adata.var_names,
+            target_adata.var_names,
+            [f'topic_{i}' for i in range(source_topic_embeddings.shape[0])],
+            [f'topic_{i}' for i in range(target_topic_embeddings.shape[0])],
+            source_adata.obs_names,
+            target_adata.obs_names,
+        ])
+        source_or_target = np.concatenate([
+            np.full(source_gene_embeddings.shape[0], 'source'),
+            np.full(target_gene_embeddings.shape[0], 'target'),
+            np.full(source_topic_embeddings.shape[0], 'source'),
+            np.full(target_topic_embeddings.shape[0], 'target'),
+            np.full(source_cell_embeddings.shape[0], 'source'),
+            np.full(target_cell_embeddings.shape[0], 'target'),
+        ])
+
+        gene_topic_adata = sc.AnnData(
+            X = np.concatenate(
+                [source_target_gene_embeddings, source_target_topic_embeddings, source_target_cell_embeddings],
+                axis=0,
+            ),
+            obs = pd.DataFrame(
+                data = {
+                'gene_or_topic': gene_or_topic,
+                'source_or_target': source_or_target,
+                'label': label},
+            )
+        )
+        gene_topic_adata.obs['combination'] = gene_topic_adata.obs['source_or_target'].astype(str) + '_' + gene_topic_adata.obs['gene_or_topic'].astype(str)
+
+        ## split source and target adatas
+        source_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('source')].copy()
+        target_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('target')].copy()
+
+        if not keep_cells:
+            source_adata = source_adata[~source_adata.obs['gene_or_topic'].eq('cell')]
+            target_adata = target_adata[~target_adata.obs['gene_or_topic'].eq('cell')]
+
+        return source_adata, target_adata
+
+    ## extract topic embeddings from source and target data
+    feature_topic_adatas = {}
+    feature_topic_adatas['source_rna'], feature_topic_adatas['target_rna'] = extract_fastopic_embeddings(source_rna, target_rna, modality='rna')
+    feature_topic_adatas['source_atac'], feature_topic_adatas['target_atac'] = extract_fastopic_embeddings(source_atac, target_atac, modality='atac')
+
+    ## concat a subset of the feature topic adatas for visualization
+    '''
+    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['target_rna'], feature_topic_adatas['target_atac']], axis=0)
+    sc.pp.neighbors(concat_feature_topic_adatas, use_rep='X', n_neighbors=10)
+    sc.tl.leiden(concat_feature_topic_adatas)
+    sc.tl.umap(concat_feature_topic_adatas, min_dist=0.3)
+    umap_axes = sc.pl.umap(
+        concat_feature_topic_adatas,
+        color=['gene_or_topic', 'leiden'],
+        ncols=3,
+        wspace=0.2,
+        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':250}),
+        show=False,
+    )
+    topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
+    topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
+    n_topics = int(feature_topic_adatas['target_rna'].obs['gene_or_topic'].eq('topic').sum())
+    topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
+    for ax in np.atleast_1d(umap_axes):
+        for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
+            ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
+    plt.tight_layout(); plt.show()
+    
+    '''
+    ## ingest ATAC embeddings into RNA UMAP - TARGET DATA
+    sc.pp.neighbors(feature_topic_adatas['target_rna'], use_rep='X', n_neighbors=10)
+    sc.tl.umap(feature_topic_adatas['target_rna'], min_dist=0.3)
+    sc.tl.leiden(feature_topic_adatas['target_rna'], resolution=0.5)
+    sc.tl.ingest(feature_topic_adatas['target_atac'], feature_topic_adatas['target_rna'], embedding_method='umap', obs='leiden')
+    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['target_rna'], feature_topic_adatas['target_atac']], axis=0)
+    umap_axes = sc.pl.umap(
+        concat_feature_topic_adatas,
+        color=['gene_or_topic', 'leiden'],
+        ncols=3,
+        wspace=0.1,
+        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':350}),
+        show=False,
+    )
+    topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
+    topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
+    n_topics = int(feature_topic_adatas['target_rna'].obs['gene_or_topic'].eq('topic').sum())
+    topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
+    for ax in np.atleast_1d(umap_axes):
+        for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
+            ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
+    plt.tight_layout(); plt.show()
+
+    ## ingest ATAC embeddings into RNA UMAP - SOURCE DATA
+    sc.pp.neighbors(feature_topic_adatas['source_rna'], use_rep='X', n_neighbors=10)
+    sc.tl.umap(feature_topic_adatas['source_rna'], min_dist=0.3)
+    sc.tl.leiden(feature_topic_adatas['source_rna'], resolution=0.5)
+    sc.tl.ingest(feature_topic_adatas['source_atac'], feature_topic_adatas['source_rna'], embedding_method='umap', obs='leiden')
+    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['source_rna'], feature_topic_adatas['source_atac']], axis=0)
+    umap_axes = sc.pl.umap(
+        concat_feature_topic_adatas,
+        color=['gene_or_topic', 'leiden'],
+        ncols=3,
+        wspace=0.1,
+        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':350}),
+        show=False,
+    )
+    topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
+    topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
+    n_topics = int(feature_topic_adatas['source_rna'].obs['gene_or_topic'].eq('topic').sum())
+    topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
+    for ax in np.atleast_1d(umap_axes):
+        for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
+            ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
+    plt.tight_layout(); plt.show()
+
+    ## compare topic embeddings across datasets and modalities
+    topic_embeddings = []
+    for dat in feature_topic_adatas.values():
+        embs = dat[dat.obs['gene_or_topic'].eq('topic')].X.copy()
+        topic_embeddings.append(embs)
+
+    if \
+        (topic_embeddings[0] == topic_embeddings[2]).all() and \
+        (topic_embeddings[1] == topic_embeddings[3]).all():
+        print("Tied topic embeddings confirmed.")
+
+    topic_embeddings = np.concatenate(topic_embeddings, axis=0)
+    corr_matrix = np.corrcoef(topic_embeddings)
+    plt.figure(figsize=(5, 4))
+    sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0)
+    plt.xticks([])
+    plt.yticks([])
+    plt.tight_layout(); plt.show()
+
+    ## build shared Hallmark mouse net once
+    hallmark_human = dc.op.hallmark(organism="human")
+    map_path = os.path.join(os.environ["DATAPATH"], "gene_annotations", "human_mouse_gene_orthologs.csv")
+    map_df = (
+        pd.read_csv(map_path)
+        .rename(columns={"Gene name": "target_human", "Mouse gene name": "target"})[
+            ["target_human", "target"]
+        ]
+        .dropna()
+        .drop_duplicates()
+    )
+    hallmark_mouse_net = (
+        hallmark_human.rename(columns={"target": "target_human"})
+        .merge(map_df, on="target_human", how="inner")[["source", "target"]]
+        .drop_duplicates()
+    )
+
+    ## extract topic-by-gene weight matrix from source and target data
+    source_topic_mat, source_sorted_topics, source_net = _extract_fastopic_topic_gene_weights(
+        source_rna, hallmark_mouse_net,
+    )
+    target_topic_mat, target_sorted_topics, target_net = _extract_fastopic_topic_gene_weights(
+        target_rna, hallmark_mouse_net,
+    )
+
+    ## build LR-level sender-receiver gene sets
+    import liana as li
+    import decoupler as dc
+
+    # 1) Load ligand-receptor pairs from LIANA
+    lr_pairs = li.rs.select_resource('mouseconsensus')
+
+    # 2) Load pathway gene sets / weights from decoupler
+    #avail_resources = dc.op.show_resources()
+    #resource = dc.op.resource('HPA_secretome')
+
+
+    # 3) Generate LR-level sender-receiver gene sets
+    lr_hallmark = li.rs.generate_lr_geneset(
+        lr_pairs,
+        hallmark_mouse_net,
+        lr_sep="^",
+        weight=None
+    )
+
+    ortholog_mapper = map_df.set_index('target_human').to_dict()['target']
+    resource = dc.op.progeny(organism='human')
+    resource = resource.map(lambda x: ortholog_mapper.get(x, x) if pd.notnull(x) else x)
+
+    lr_resource = li.rs.generate_lr_geneset(
+        lr_pairs,
+        resource,
+        lr_sep="^",
+        weight=None
+    )
+
+    ## create LR genesets
+    lr_hallmark_grouped_source = lr_hallmark.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[0].explode().tolist()))
+    lr_hallmark_grouped_target = lr_hallmark.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[1].explode().tolist()))
+    lr_hallmark_grouped = pd.concat([lr_hallmark_grouped_source.rename('source_genes'), lr_hallmark_grouped_target.rename('target_genes')], axis=1)
+    lr_hallmark_grouped['all_genes'] = lr_hallmark_grouped.apply(lambda x: list(x['source_genes']) + list(x['target_genes']), axis=1)
+    lr_hallmark_grouped.index.rename('pathway', inplace=True)
+
+    lr_resource_grouped_source = lr_resource.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[0].explode().tolist()))
+    lr_resource_grouped_target = lr_resource.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[1].explode().tolist()))
+    lr_resource_grouped = pd.concat([lr_resource_grouped_source.rename('source_genes'), lr_resource_grouped_target.rename('target_genes')], axis=1)
+    lr_resource_grouped['all_genes'] = lr_resource_grouped.apply(lambda x: list(x['source_genes']) + list(x['target_genes']), axis=1)
+    lr_resource_grouped.index.rename('pathway', inplace=True)
+
+    #%% analysis of linear decoder
+    from sklearn.metrics.pairwise import euclidean_distances
+    from scipy.special import softmax
+    from post_hoc_utils import topic_betas_hallmark_gsea_mouse
+
+    assert teacher_source_mgate.linear_etm_decoder
+
+    ## extract decoder parameters
+    alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
+    rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
+    rho_atac = teacher_source_mgate.rho_atac.detach().cpu().numpy()
+
+    rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
+    rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
+    rho_rna_overlap = ((np.abs(rho_rna) == np.abs(rho_rna).max(1, keepdims=True)) * rho_rna_mask).any(1).mean()
+    rho_atac_overlap = ((np.abs(rho_atac) == np.abs(rho_atac).max(1, keepdims=True)) * rho_atac_mask).any(1).mean()
+    print(f"RNA overlap: {rho_rna_overlap}, ATAC overlap: {rho_atac_overlap}")
+
+    rho_rna_mask_gain = (np.abs(rho_rna) * rho_rna_mask).sum(1) / rho_rna_mask.sum(1) / np.abs(rho_rna).mean(1)
+    rho_atac_mask_gain = (np.abs(rho_atac) * rho_atac_mask).sum(1) / rho_atac_mask.sum(1) / np.abs(rho_atac).mean(1)
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5), sharex=True)
+    ax[0].hist(rho_rna_mask_gain, bins=50)
+    ax[1].hist(rho_atac_mask_gain, bins=50)
+    plt.tight_layout(); plt.show()
+
+    topk=25
+    topk_genes = []
+    for topic in range(alpha.shape[0]):
+        topk_genes_topic = pd.Series(alpha[topic]).nlargest(topk).index
+        topk_genes.append(topk_genes_topic)
+    topk_genes = np.concatenate(topk_genes)
+    top_alpha = alpha[:,topk_genes]
+    plt.figure(figsize=(10, 10))
+    plt.matshow(top_alpha, aspect='auto'); plt.colorbar()
+    plt.tight_layout(); plt.show()
+
+    pathway_names = teacher_source_mgate.pathway_names
+    source_pathway_names = [pw for pw in pathway_names if pw.endswith('source')]
+    target_pathway_names = [pw for pw in pathway_names if pw.endswith('target')]
+
+    alpha_df = pd.DataFrame(alpha, index=[f'topic_{i}' for i in range(30)], columns=pathway_names)
+    pd.concat([
+        alpha_df.abs().max(1),
+        alpha_df.abs().median(1)
+    ], axis=1).sort_values(0).plot(kind='bar')
+
+
+    # alpha = F.normalize(alpha, dim=1)
+    # rho_rna = F.normalize(rho_rna, dim=1)
+    # rho_atac = F.normalize(rho_atac, dim=1)
+    # topic_var = teacher_source_mgate.topic_var.detach().cpu().numpy()
+
+    beta_rna = alpha @ rho_rna
+    beta_atac = alpha @ rho_atac
+
+    ## derive theta from delta embeddings
+    source_theta = softmax(np.concatenate([source_rna_emb, source_atac_emb], axis=0), axis=1)
+    source_theta_df = pd.DataFrame(source_theta, index=np.concatenate([source_rna.obs_names, source_atac.obs_names]))
+
+    target_theta = softmax(np.concatenate([target_rna_emb, target_atac_emb], axis=0), axis=1)
+    target_theta_df = pd.DataFrame(target_theta, index=np.concatenate([target_rna.obs_names, target_atac.obs_names]))
+
+    ## cluster delta by leiden clusters, then apply softmax to get theta
+    source_clust_by_topic_theta = (
+        pd.DataFrame(source_rna_emb, index=source_rna.obs_names)
+        .assign(RNA_leiden=source_concat_adata.obs.loc[
+            source_concat_adata.obs['modality'].eq('rna'),
+            'leiden'
+            ].values)
+        .groupby('RNA_leiden')
+        .mean()
+        .apply(softmax, axis=1, result_type='expand')
+    )
+
+    target_clust_by_topic_theta = (
+        pd.DataFrame(target_rna_emb, index=target_rna.obs_names)
+        .assign(RNA_leiden=target_concat_adata.obs.loc[
+            target_concat_adata.obs['modality'].eq('rna'),
+            'leiden'
+            ].values)
+        .groupby('RNA_leiden')
+        .mean()
+        .apply(softmax, axis=1, result_type='expand')
+    )
+    
+    ## get top topics for each cluster and plot staircase heatmap
+    topk = 5
+    fig, axs = plt.subplots(1, 2, figsize=(10, 10))
+
+    topk_topics = []
+    topics = source_clust_by_topic_theta.columns.values
+    clusters = source_clust_by_topic_theta.max(1).sort_values(ascending=False).index
+    for cluster in clusters:
+        topk_topics_cluster = source_clust_by_topic_theta.loc[cluster].nlargest(topk).index
+        topk_topics_cluster = topk_topics_cluster[topk_topics_cluster.isin(topics)]
+        topics = topics[~np.isin(topics, topk_topics_cluster)]
+        topk_topics.append(topk_topics_cluster)
+    source_topk_topics = np.concatenate(topk_topics + [pd.Index(topics)]) # could also just keep topk_topics
+    source_clust_by_topic_theta = source_clust_by_topic_theta.loc[clusters, source_topk_topics]
+    sns.heatmap(source_clust_by_topic_theta.T, cmap='viridis', ax=axs[0])
+
+    topk_topics = []
+    topics = target_clust_by_topic_theta.columns.values
+    clusters = target_clust_by_topic_theta.max(1).sort_values(ascending=False).index
+    for cluster in clusters:
+        topk_topics_cluster = target_clust_by_topic_theta.loc[cluster].nlargest(topk).index
+        topk_topics_cluster = topk_topics_cluster[topk_topics_cluster.isin(topics)]
+        topics = topics[~np.isin(topics, topk_topics_cluster)]
+        topk_topics.append(topk_topics_cluster)
+    target_topk_topics = np.concatenate(topk_topics + [pd.Index(topics)])
+    target_clust_by_topic_theta = target_clust_by_topic_theta.loc[clusters, target_topk_topics]
+    sns.heatmap(target_clust_by_topic_theta.T, cmap='viridis', ax=axs[1])
+    plt.tight_layout(); plt.show()
+
+    ## add alpha embeddings to source and target data
+    source_alpha_embs = source_theta @ alpha
+    target_alpha_embs = target_theta @ alpha
+    source_target_adata.obsm['alpha_embs'] = np.concatenate([source_alpha_embs, target_alpha_embs], axis=0)
+
+    import liana as li
+    
+    pathways_adata = sc.AnnData(
+        source_alpha_embs,
+        obs=source_target_adata[source_target_adata.obs['source_or_target'].eq('source')].obs,
+        var=pd.DataFrame(
+            data=np.vstack([
+                [pw.split('__')[0] for pw in pathway_names],
+                ['sender' if pw.endswith('source') else 'receiver' for pw in pathway_names],
+            ]).T,
+            index=pathway_names,
+            columns=['basename', 'sender_or_receiver']),
+        obsm={'spatial': source_target_adata[source_target_adata.obs['source_or_target'].eq('source')].obsm['spatial']},
+        )
+    pathways_adata.var['paired'] = pathways_adata.var['basename'].isin(pathways_adata.var['basename'].value_counts().index[pathways_adata.var['basename'].value_counts().eq(2)])
+
+    li.ut.spatial_neighbors(pathways_adata, bandwidth=1000, set_diag=False)
+    paired_pathways_adata = pathways_adata[:,pathways_adata.var['paired']].copy()
+    sender_pathways_adata = paired_pathways_adata[:,paired_pathways_adata.var['sender_or_receiver'].eq('sender')]
+    receiver_pathways_adata = paired_pathways_adata[:,paired_pathways_adata.var['sender_or_receiver'].eq('receiver')]
+    assert np.all(sender_pathways_adata.var['basename'].values == receiver_pathways_adata.var['basename'].values)
+
+    X = pathways_adata.X.copy()
+    W = pathways_adata.obsp['spatial_connectivities']
+    plt.matshow(X.T @ W @ X, aspect='auto'); plt.colorbar()
+    plt.tight_layout(); plt.show()
+
+    S = sender_pathways_adata.X.copy()
+    R = receiver_pathways_adata.X.copy()
+    W = pathways_adata.obsp['spatial_connectivities']
+    plt.scatter(S.sum(axis=0), R.sum(axis=0)); plt.colorbar()
+
+    #S = softmax(S, axis=0)
+    #R = softmax(R, axis=0)
+
+    M = S.T @ W @ R
+    plt.matshow(M); plt.colorbar()
+
+    sc.pp.pca(pathways_adata, n_comps=50)
+    sc.external.pp.bbknn(pathways_adata, batch_key='source_or_target', use_rep='X_pca', neighbors_within_batch=10)
+    sc.tl.umap(pathways_adata, min_dist=0.3)
+    sc.pl.umap(pathways_adata, color=['source_or_target'], ncols=3, wspace=0.2, size=25)
+    plt.tight_layout(); plt.show()
+
+    ## compute mean distance between source and target for each cluster
+    source_adata = source_target_adata[source_target_adata.obs['source_or_target'].eq('source')]
+    target_adata = source_target_adata[source_target_adata.obs['source_or_target'].eq('target')]
+    mean_dists = pd.DataFrame(index=source_adata.obs['leiden'].cat.categories, columns=['multigate', 'alpha'])
+    for cluster in source_adata.obs['leiden'].cat.categories:
+        source_dat = source_adata[source_adata.obs['leiden'].eq(cluster)]
+        target_dat = target_adata[target_adata.obs['leiden'].eq(cluster)]
+        mean_dists.loc[cluster, 'multigate'] = np.mean(euclidean_distances(source_dat.X, target_dat.X)) # could replace with wasserstein distance
+        mean_dists.loc[cluster, 'alpha'] = np.mean(euclidean_distances(source_dat.obsm['alpha_embs'], target_dat.obsm['alpha_embs']))
+    mean_dists = mean_dists.sort_values(by='multigate', ascending=True)
+    mean_dists.loc['all', 'multigate'] = np.mean(euclidean_distances(source_adata.X, target_adata.X))
+    mean_dists.loc['all', 'alpha'] = np.mean(euclidean_distances(source_adata.obsm['alpha_embs'], target_adata.obsm['alpha_embs']))
+    print(mean_dists)
+
+    ## get top active topics and perform GSEA
+    top_active_cluster = mean_dists.index[0] #'5'
+    top_active_topics = source_clust_by_topic_theta.loc[top_active_cluster].nlargest(topk).index
+    top_active_gsea = topic_betas_hallmark_gsea_mouse(
+        beta_rna=beta_rna,
+        gene_names=np.asarray(source_rna.var_names).astype(str),
+        topic_indices=top_active_topics,
+        datapath=os.environ["DATAPATH"],
+    )
+    top_active_genes = top_active_gsea["top_active_genes"]
+    top_active_rna_betas = top_active_gsea["ranked_gene_indices"]
+    print("\nHallmark GSEA (mouse) — top terms per active topic:")
+    print(
+        top_active_gsea["top_terms_per_row"].loc[
+            top_active_gsea["top_terms_per_row"]['padj'].le(0.05)
+        ]
+    )
+
+    # Categorical.map(dict) looks up category values with their native dtype; string
+    # keys in lut won't match int categories and yield NaN floats mixed with RGB
+    # tuples, which breaks pandas' Index reconstruction (TypeError).
+    cluster_key = source_theta_df.obs['RNA_clusters'].astype(str)
+    unique_clusters = cluster_key.unique()
+    network_pal = sns.husl_palette(len(unique_clusters), s=0.45)
+    lut = dict(zip(unique_clusters, network_pal))
+    row_colors = cluster_key.map(lut)
+
+    cg = sns.clustermap(source_theta_df, cmap='viridis', row_colors=row_colors)
+    cg.ax_heatmap.set_yticklabels([])
+
+    alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
+    rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
+    rho_atac = teacher_source_mgate.rho_atac.detach().cpu().numpy()
+    rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
+    rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
+
+    beta_rna = alpha @ rho_rna
+    beta_atac = alpha @ rho_atac
+
+    ## topic-topic correlation
+    topic_topic_corr = np.corrcoef(alpha)
+    topic_topic_corr[np.eye(topic_topic_corr.shape[0]) == 1] = 0
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(topic_topic_corr, cmap='viridis')
+    plt.tight_layout()
+    plt.show()
+
+    ## topic norms
+    topic_norm = np.linalg.norm(alpha, axis=1)
+    beta_rna_norm = np.linalg.norm(beta_rna, axis=1)
+    beta_atac_norm = np.linalg.norm(beta_atac, axis=1)
+    fig, ax = plt.subplots(3, 1, figsize=(6, 8))
+    ax[0].bar(np.arange(alpha.shape[0]), topic_norm)
+    ax[1].bar(np.arange(beta_rna.shape[0]), beta_rna_norm)
+    ax[2].bar(np.arange(beta_atac.shape[0]), beta_atac_norm)
+    ax[0].set_title("Topic norm")
+    ax[1].set_title("Beta RNA norm")
+    ax[2].set_title("Beta ATAC norm")
+    plt.tight_layout()
+    plt.show()
+
+    ## topic & feature co-embedding
+    alpha_norm = alpha / np.linalg.norm(alpha, axis=1, keepdims=True)
+    rho_rna_norm = rho_rna / np.linalg.norm(rho_rna, axis=1, keepdims=True)
+    rho_atac_norm = rho_atac / np.linalg.norm(rho_atac, axis=1, keepdims=True)
+
+    alpha_rho_rna_adata = sc.AnnData(
+        np.concatenate([rho_rna_norm.T, alpha_norm], axis=0),
+    )
+    alpha_rho_rna_adata.obs_names = np.concatenate([[f'gp_{gp}' for gp in range(rho_rna.shape[1])], [f'topic_{topic}' for topic in range(alpha.shape[0])]])
+    alpha_rho_rna_adata.obs['gene_or_topic'] = np.concatenate([['gene'] * rho_rna.shape[1], ['topic'] * alpha.shape[0]])
+    alpha_rho_rna_adata.obs['max_abs_beta'] = list(np.abs(beta_rna).argmax(0)) + list(np.arange(alpha.shape[0]))
+
+    sc.pp.pca(alpha_rho_rna_adata, n_comps=100)
+    sc.pp.neighbors(alpha_rho_rna_adata, use_rep='X_pca', n_neighbors=30)
+    #sc.external.pp.bbknn(alpha_rho_rna_adata, batch_key='gene_or_topic', neighbors_within_batch=30)
+    sc.tl.umap(alpha_rho_rna_adata, min_dist=0.3)
+
+    topic_gene_dists = euclidean_distances(
+        alpha_rho_rna_adata.obsm['X_pca'],
+    )[:rho_rna.shape[1], -alpha.shape[0]:].argmin(axis=1)
+    alpha_rho_rna_adata.obs['topic_gene_dist'] = list(topic_gene_dists) + list(np.arange(alpha.shape[0]))
+
+    # 1. Extract coordinates and groups into a lightweight dataframe
+    df = pd.DataFrame(alpha_rho_rna_adata.obsm['X_umap'], columns=['UMAP1', 'UMAP2'], index=alpha_rho_rna_adata.obs_names)
+    df = df.join(alpha_rho_rna_adata.obs[['gene_or_topic', 'max_abs_beta']])
+
+    # 2. Plot using seaborn, adding labels for topics
+    plt.figure(figsize=(8, 6))
+    scatter = sns.scatterplot(
+        data=df, 
+        x='UMAP1', 
+        y='UMAP2', 
+        hue='gene_or_topic',   # Colors by group
+        style='gene_or_topic', # Assigns different markers by group
+        palette='Set2',
+        s=list([5] * rho_rna.shape[1]) + list([60] * alpha.shape[0]),  # Marker size
+        edgecolor='none'
+    )
+
+    # Add text labels for topics
+    topic_indices = df[df['gene_or_topic'] == 'topic'].index
+    topic_labels = [f'topic_{i}' for i in range(alpha.shape[0])]
+    for idx, label in zip(topic_indices, topic_labels):
+        plt.annotate(
+            label,
+            (df.loc[idx, 'UMAP1'], df.loc[idx, 'UMAP2']),
+            textcoords="offset points",
+            xytext=(0,5),
+            ha='center',
+            fontsize=8,
+            color='black',
+            alpha=0.8
+        )
+
+    # 3. Move the legend outside the plot
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.show()
+
+    sc.pl.umap(
+        alpha_rho_rna_adata,
+        color=['gene_or_topic', 'topic_gene_dist', 'max_abs_beta'],
+        color_map='Set2',
+        ncols=3, wspace=0.2, size=25)
 
     #%% ── Save outputs ─────────────────────────────────────────────────────────
     if args.save_h5ad:
@@ -4594,7 +4491,6 @@ def main():
             )
         )
     return source_rna, source_atac, target_rna, target_atac, pathway_embedding_results
-
 #%%
 if __name__ == "__main__":
     main()
