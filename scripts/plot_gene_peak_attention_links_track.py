@@ -65,6 +65,21 @@ def _parse_args() -> argparse.Namespace:
         default=3.0,
         help="CoolBox track height for the GTF track.",
     )
+    p.add_argument(
+        "--fig-width-inches",
+        type=float,
+        default=14.0,
+        help=(
+            "Final saved figure width in inches; height is rescaled to keep "
+            "aspect ratio. Pass 0 to keep CoolBox's native width."
+        ),
+    )
+    p.add_argument(
+        "--pad-inches",
+        type=float,
+        default=0.25,
+        help="Padding around the saved figure (in inches).",
+    )
     args = p.parse_args()
 
     if args.padding_bp < 0:
@@ -141,21 +156,82 @@ def _derive_region(path: Path, padding_bp: int) -> str:
     return f"{chrom}:{start}-{end}"
 
 
-def _save_or_show(plot_result, out_path: Path | None) -> None:
+def _resolve_figure(plot_result):
     import matplotlib.pyplot as plt
+
+    if hasattr(plot_result, "savefig"):
+        return plot_result
+    if isinstance(plot_result, tuple) and plot_result and hasattr(plot_result[0], "savefig"):
+        return plot_result[0]
+    return plt.gcf()
+
+
+def _unclip_text_artists(fig) -> None:
+    """Let GTF gene labels at axis edges render beyond the axes clip box."""
+    for ax in fig.get_axes():
+        for txt in ax.texts:
+            txt.set_clip_on(False)
+
+
+def _clamp_offscreen_text_to_xlim(fig, *, edge_margin_frac: float = 0.02) -> None:
+    """Clamp text artists whose x position is outside their axes' xlim.
+
+    pyGenomeTracks/CoolBox's GTF track places gene labels at the gene midpoint,
+    which can fall far outside the plotted region for long genes (e.g. Pde10a).
+    With ``clip_on=False`` such labels are technically rendered, but they sit
+    so far off-canvas that ``Figure.get_tightbbox`` (and ``bbox_inches='tight'``)
+    blow the saved page width up to the label's coordinate. Clamping the
+    x-position back inside the axes keeps the label visible at the edge of the
+    track while preventing runaway horizontal expansion.
+    """
+    for ax in fig.get_axes():
+        x0, x1 = ax.get_xlim()
+        if not (x0 < x1):
+            continue
+        span = x1 - x0
+        if span <= 0:
+            continue
+        margin = span * edge_margin_frac
+        lo = x0 + margin
+        hi = x1 - margin
+        for txt in ax.texts:
+            tx, ty = txt.get_position()
+            try:
+                tx_f = float(tx)
+            except (TypeError, ValueError):
+                continue
+            new_tx = tx_f
+            if tx_f < x0:
+                new_tx = lo
+            elif tx_f > x1:
+                new_tx = hi
+            if new_tx != tx_f:
+                txt.set_position((new_tx, ty))
+
+
+def _save_or_show(
+    plot_result,
+    out_path: Path | None,
+    *,
+    fig_width_inches: float | None = None,
+    pad_inches: float = 0.25,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    fig = _resolve_figure(plot_result)
+    _unclip_text_artists(fig)
+    _clamp_offscreen_text_to_xlim(fig)
+
+    if fig_width_inches is not None:
+        _, current_h = fig.get_size_inches()
+        fig.set_size_inches(fig_width_inches, current_h)
 
     if out_path is None:
         plt.show()
         return
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if hasattr(plot_result, "savefig"):
-        fig = plot_result
-    elif isinstance(plot_result, tuple) and plot_result and hasattr(plot_result[0], "savefig"):
-        fig = plot_result[0]
-    else:
-        fig = plt.gcf()
-    fig.savefig(out_path, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight", pad_inches=pad_inches)
 
 
 def _check_coolbox_cli_dependencies() -> None:
@@ -314,7 +390,13 @@ def main() -> None:
         + TrackHeight(args.gtf_height)
     )
     plot_result = frame.plot(region)
-    _save_or_show(plot_result, args.out)
+    fig_width = args.fig_width_inches if args.fig_width_inches and args.fig_width_inches > 0 else None
+    _save_or_show(
+        plot_result,
+        args.out,
+        fig_width_inches=fig_width,
+        pad_inches=args.pad_inches,
+    )
 
     print(f"Plotted region: {region}")
     if args.out is not None:

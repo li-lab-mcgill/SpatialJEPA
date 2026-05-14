@@ -521,6 +521,289 @@ def save_gene_peak_links_bedpe(
     return out_path
 
 
+def _draw_signed_arcs_on_axes(
+    ax,
+    gp_link_df: pd.DataFrame,
+    *,
+    weight_col: str,
+    pos_color: str,
+    neg_color: str,
+    max_abs_weight: Optional[float] = None,
+    min_alpha: float = 0.10,
+    max_alpha: float = 0.85,
+    n_arc_points: int = 200,
+) -> None:
+    """Draw peak->TSS semi-elliptical arcs on a single matplotlib axes.
+
+    Each arc's color is set by the sign of ``weight_col`` (positive: ``pos_color``,
+    negative: ``neg_color``), and its transparency scales with ``|weight|`` so
+    that the largest absolute weight reaches ``max_alpha`` and the smallest
+    reaches ``min_alpha``.
+    """
+    if weight_col not in gp_link_df.columns:
+        raise KeyError(f"gp_link_df is missing required column: {weight_col!r}")
+
+    if gp_link_df.empty:
+        return
+
+    weights = gp_link_df[weight_col].astype(float).to_numpy()
+    if max_abs_weight is None:
+        max_abs_weight = float(np.nanmax(np.abs(weights))) if weights.size else 1.0
+    if not np.isfinite(max_abs_weight) or max_abs_weight <= 0:
+        max_abs_weight = 1.0
+
+    peak_mids = (gp_link_df["peak_start"].astype(float) + gp_link_df["peak_end"].astype(float)) / 2.0
+    tss_vals = gp_link_df["tss"].astype(float)
+    diameters_all = (peak_mids - tss_vals).abs().to_numpy()
+    max_diameter = float(diameters_all.max()) if diameters_all.size else 1.0
+    if max_diameter <= 0:
+        max_diameter = 1.0
+
+    theta = np.linspace(0.0, np.pi, n_arc_points)
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
+
+    for peak_mid, tss, weight in zip(peak_mids.to_numpy(), tss_vals.to_numpy(), weights):
+        if not (np.isfinite(peak_mid) and np.isfinite(tss) and np.isfinite(weight)):
+            continue
+        color = pos_color if weight > 0 else neg_color
+        alpha_raw = abs(weight) / max_abs_weight
+        alpha = min_alpha + (max_alpha - min_alpha) * float(np.clip(alpha_raw, 0.0, 1.0))
+
+        left, right = (peak_mid, tss) if peak_mid <= tss else (tss, peak_mid)
+        center = (left + right) / 2.0
+        diameter = right - left
+        height = (diameter / max_diameter) ** 0.3 if diameter > 0 else 0.0
+
+        xs = center + (diameter / 2.0) * cos_theta
+        ys = height * sin_theta
+        ax.fill(xs, ys, color=color, alpha=alpha, edgecolor="none", linewidth=0.0)
+
+
+def plot_signed_arcs_stacked(
+    gp_link_dfs,
+    *,
+    pls_cmp: str,
+    gene: str,
+    out_path: Union[str, Path],
+    pos_color: str = "#1f77b4",
+    neg_color: str = "#cc4c02",
+    fig_width_inches: float = 12.0,
+    panel_height_inches: float = 2.0,
+    gene_panel_height_inches: float = 0.5,
+    padding_bp: int = 10000,
+    share_alpha_scale: bool = True,
+    title: Optional[str] = None,
+):
+    """Stack one or more arc panels (e.g. source on top, target below) sharing a
+    genomic x-axis, with a gene-body strip at the bottom.
+
+    Parameters
+    ----------
+    gp_link_dfs
+        Mapping of panel label → ``gp_link_df`` (the output of
+        ``select_gene_peak_link_df``). Each df must contain
+        ``peak_start``, ``peak_end``, ``tss``, ``peak_chr``, ``chr``,
+        ``start``, ``end``, ``strand``, ``Gene``, and
+        ``f"{pls_cmp}_peak_weight"``.
+    pls_cmp
+        PLS component label used to locate the peak weight column.
+    gene
+        Gene symbol the links anchor on (used in the gene-body strip).
+    out_path
+        Destination PDF/PNG path.
+    pos_color, neg_color
+        Colors for arcs associated with positive / negative PLS peak weights.
+    share_alpha_scale
+        If True, scale alpha jointly across all panels using the global max
+        ``|weight|``; otherwise each panel rescales independently.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch, Rectangle
+    from matplotlib.ticker import FuncFormatter
+
+    if not gp_link_dfs:
+        raise ValueError("gp_link_dfs must contain at least one entry.")
+
+    weight_col = f"{pls_cmp}_peak_weight"
+
+    chrom_values = set()
+    lows: list[float] = []
+    highs: list[float] = []
+    for df in gp_link_dfs.values():
+        if df.empty:
+            continue
+        if weight_col not in df.columns:
+            raise KeyError(f"gp_link_df is missing required column: {weight_col!r}")
+        chrom_values.update(df["peak_chr"].astype(str).unique())
+        chrom_values.update(df["chr"].astype(str).unique())
+        # Only arc anchors (peak ± TSS) drive the x-range so a long gene body
+        # cannot saturate the figure. The gene-body strip is clipped to this
+        # window below.
+        lows.extend(df["peak_start"].astype(float).tolist())
+        lows.extend(df["tss"].astype(float).tolist())
+        highs.extend(df["peak_end"].astype(float).tolist())
+        highs.extend(df["tss"].astype(float).tolist())
+
+    if not lows or not highs:
+        raise ValueError("All provided gp_link_dfs are empty; nothing to plot.")
+    if len(chrom_values) > 1:
+        raise ValueError(
+            f"Expected all links on a single chromosome, got: {sorted(chrom_values)}"
+        )
+    chrom = next(iter(chrom_values))
+    x_min = max(0.0, float(min(lows)) - float(padding_bp))
+    x_max = float(max(highs)) + float(padding_bp)
+
+    if share_alpha_scale:
+        per_panel_max = [
+            float(df[weight_col].abs().max()) if not df.empty else 0.0
+            for df in gp_link_dfs.values()
+        ]
+        global_max = max(per_panel_max) if per_panel_max else 0.0
+        max_abs_weight_per_panel = {
+            label: (global_max if global_max > 0 else 1.0)
+            for label in gp_link_dfs
+        }
+    else:
+        max_abs_weight_per_panel = {
+            label: (float(df[weight_col].abs().max()) if not df.empty else 1.0)
+            for label, df in gp_link_dfs.items()
+        }
+
+    n_panels = len(gp_link_dfs)
+    height_ratios = [1.0] * n_panels + [
+        max(0.1, gene_panel_height_inches / max(0.01, panel_height_inches))
+    ]
+    fig_height = panel_height_inches * n_panels + gene_panel_height_inches + 0.9
+    fig, axes = plt.subplots(
+        n_panels + 1,
+        1,
+        figsize=(fig_width_inches, fig_height),
+        gridspec_kw=dict(height_ratios=height_ratios, hspace=0.18),
+        sharex=True,
+        constrained_layout=True,
+    )
+    if not isinstance(axes, (list, np.ndarray)):
+        axes = [axes]
+    else:
+        axes = list(axes)
+
+    for ax, (label, df) in zip(axes[:n_panels], gp_link_dfs.items()):
+        _draw_signed_arcs_on_axes(
+            ax,
+            df,
+            weight_col=weight_col,
+            pos_color=pos_color,
+            neg_color=neg_color,
+            max_abs_weight=max_abs_weight_per_panel[label],
+        )
+        ax.set_ylim(0, 1.10)
+        ax.set_yticks([])
+        ax.set_xlim(x_min, x_max)
+        ax.set_title(str(label), loc="left", fontsize=11, pad=2)
+        for spine in ("top", "right", "left"):
+            ax.spines[spine].set_visible(False)
+        ax.tick_params(axis="x", labelbottom=False)
+
+    # Gene-body strip at the bottom (shared x-axis). The full gene span is
+    # clipped to the visible window so a long gene body cannot dominate the
+    # figure; truncated edges are marked with a small chevron.
+    ax_gene = axes[-1]
+    first_df = next(df for df in gp_link_dfs.values() if not df.empty)
+    if "start" in first_df.columns and "end" in first_df.columns:
+        gene_start = float(pd.to_numeric(first_df["start"], errors="coerce").iloc[0])
+        gene_end = float(pd.to_numeric(first_df["end"], errors="coerce").iloc[0])
+    else:
+        gene_start = float(first_df["tss"].iloc[0])
+        gene_end = gene_start + 1.0
+
+    strand_vals = first_df["strand"].astype(str) if "strand" in first_df.columns else pd.Series([""])
+    strand = strand_vals.iloc[0] if len(strand_vals) else ""
+
+    clipped_start = max(gene_start, x_min)
+    clipped_end = min(gene_end, x_max)
+    truncated_left = gene_start < x_min
+    truncated_right = gene_end > x_max
+    rect_h = 0.5
+    rect_y0 = 0.25
+    if clipped_end > clipped_start:
+        ax_gene.add_patch(
+            Rectangle(
+                (clipped_start, rect_y0),
+                clipped_end - clipped_start,
+                rect_h,
+                facecolor="#cc4c02",
+                edgecolor="black",
+                alpha=0.6,
+                linewidth=0.5,
+            )
+        )
+
+    # Chevron markers at clipped edges to signal the gene continues off-axis.
+    chevron_y = rect_y0 + rect_h / 2.0
+    if truncated_left and clipped_end > clipped_start:
+        ax_gene.annotate(
+            "", xy=(x_min, chevron_y),
+            xytext=(x_min + (x_max - x_min) * 0.012, chevron_y),
+            arrowprops=dict(arrowstyle="-|>", color="black", lw=0.8),
+        )
+    if truncated_right and clipped_end > clipped_start:
+        ax_gene.annotate(
+            "", xy=(x_max, chevron_y),
+            xytext=(x_max - (x_max - x_min) * 0.012, chevron_y),
+            arrowprops=dict(arrowstyle="-|>", color="black", lw=0.8),
+        )
+
+    # Strand indicator: tiny arrow inside the visible portion of the gene body.
+    if strand in {"+", "-"} and clipped_end > clipped_start:
+        strand_marker = "▶" if strand == "+" else "◀"
+        ax_gene.text(
+            (clipped_start + clipped_end) / 2.0,
+            rect_y0 + rect_h + 0.08,
+            strand_marker,
+            ha="center", va="bottom", fontsize=8, color="black",
+        )
+
+    label_margin = (x_max - x_min) * 0.01
+    raw_label_x = (clipped_start + clipped_end) / 2.0
+    label_x = float(np.clip(raw_label_x, x_min + label_margin, x_max - label_margin))
+    ax_gene.text(
+        label_x, rect_y0 + rect_h / 2.0, gene,
+        ha="center", va="center", fontsize=10, fontweight="bold", color="black",
+    )
+    ax_gene.set_xlim(x_min, x_max)
+    ax_gene.set_ylim(0, 1)
+    ax_gene.set_yticks([])
+    for spine in ("top", "right", "left"):
+        ax_gene.spines[spine].set_visible(False)
+    ax_gene.set_xlabel(f"{chrom} (bp)")
+    ax_gene.xaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v / 1000:,.0f} Kb"))
+
+    legend_handles = [
+        Patch(facecolor=pos_color, edgecolor="none", alpha=0.7, label=f"{weight_col} > 0"),
+        Patch(facecolor=neg_color, edgecolor="none", alpha=0.7, label=f"{weight_col} < 0"),
+    ]
+    axes[0].legend(
+        handles=legend_handles,
+        loc="upper right",
+        fontsize=8,
+        frameon=False,
+    )
+
+    if title:
+        fig.suptitle(title, fontsize=12)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, bbox_inches="tight")
+    return fig
+
+
 __all__ = [
     "GMMThresholdResult",
     "add_gene_and_peak_columns",
@@ -537,6 +820,7 @@ __all__ = [
     "parse_peak",
     "plot_attention_distribution",
     "plot_distance_distribution",
+    "plot_signed_arcs_stacked",
     "save_attention_outputs",
     "save_gene_peak_links_bedpe",
 ]

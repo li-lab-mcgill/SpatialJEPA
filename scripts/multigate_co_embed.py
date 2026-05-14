@@ -46,6 +46,7 @@ import argparse
 import json
 import os
 import random
+import shlex
 import shutil
 import sys
 import tempfile
@@ -3114,7 +3115,10 @@ def main():
         )
     
     #%% attention matrix analysis
-    from gene_peak_attention_utils import save_gene_peak_links_bedpe
+    from gene_peak_attention_utils import (
+        plot_signed_arcs_stacked,
+        save_gene_peak_links_bedpe,
+    )
     from post_hoc_utils import gene_peak_attention_links_from_att_lgp
 
     '''
@@ -3166,12 +3170,11 @@ def main():
         pls_target_rna_coef_df,
         pls_target_atac_coef_df,
     )
-
-    # Keep the existing downstream source-focused plotting code unchanged.
-    gene_peak_attention_links = source_gene_peak_attention_links
-    attention_analysis_summary = source_attention_analysis_summary
-    all_pls_scores_df = source_all_pls_scores_df
-    all_pls_scores_grouped_df = source_all_pls_scores_grouped_df
+    merged_pls_scores_grouped_df = pd.merge(
+        source_all_pls_scores_grouped_df.head(20),
+        target_all_pls_scores_grouped_df.head(20),
+        on=['index','gene'], suffixes=('source','target')
+    )
 
     print("Source PLS-weighted gene-peak attention links:")
     print(source_all_pls_scores_df.head(5))
@@ -3214,8 +3217,8 @@ def main():
         gene,
     )
     ## create 'peak' scores out of peak set
-    source_peak_scores = source_atac[:, source_gp_link_df['Peak']].X.multiply(source_gp_link_df['PLS_0_peak_weight']).sum(axis=1)
-    target_peak_scores = target_atac[:, target_gp_link_df['Peak']].X.multiply(target_gp_link_df['PLS_0_peak_weight']).sum(axis=1)
+    source_peak_scores = source_atac[:, source_gp_link_df['Peak']].X.multiply(source_gp_link_df[f'{pls_cmp}_peak_weight']).sum(axis=1)
+    target_peak_scores = target_atac[:, target_gp_link_df['Peak']].X.multiply(target_gp_link_df[f'{pls_cmp}_peak_weight']).sum(axis=1)
     source_atac.obs[f'{gene}-linked peaks'] = source_peak_scores
     target_atac.obs[f'{gene}-linked peaks'] = target_peak_scores
 
@@ -3238,20 +3241,112 @@ def main():
 
     gp_link_prefix = f"source_gene_peak_links_{safe_pls_cmp}_{safe_gene}"
     gp_link_csv_path = os.path.join(source_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.csv")
-    gp_link_bedpe_path = os.path.join(source_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.bedpe")
+    source_bedpe = os.path.join(source_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.bedpe")
     source_gp_link_df.to_csv(gp_link_csv_path, index=False)
-    save_gene_peak_links_bedpe(source_gp_link_df, gp_link_bedpe_path, score_col="Attention")
+    save_gene_peak_links_bedpe(source_gp_link_df, source_bedpe, score_col="Attention")
 
     gp_link_prefix = f"target_gene_peak_links_{safe_pls_cmp}_{safe_gene}"
     gp_link_csv_path = os.path.join(target_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.csv")
-    gp_link_bedpe_path = os.path.join(target_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.bedpe")
+    target_bedpe = os.path.join(target_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.bedpe")
     target_gp_link_df.to_csv(gp_link_csv_path, index=False)
-    save_gene_peak_links_bedpe(target_gp_link_df, gp_link_bedpe_path, score_col="Attention")
+    save_gene_peak_links_bedpe(target_gp_link_df, target_bedpe, score_col="Attention")
+
+    ## Plot signed-weight arcs (blue = positive {pls_cmp}_peak_weight, orange = negative;
+    ## transparency scales with |peak_weight|). Produces per-domain figures plus a
+    ## single stacked figure with source on top and target below, sharing genomic coordinates.
+    signed_arcs_out_dir = f"{os.getenv('OUTPATH')}/MultiGATE/attention_analysis"
+    source_signed_arcs_pdf = os.path.join(
+        signed_arcs_out_dir, f"source_gene_peak_links_signed_{safe_pls_cmp}_{safe_gene}.pdf"
+    )
+    target_signed_arcs_pdf = os.path.join(
+        signed_arcs_out_dir, f"target_gene_peak_links_signed_{safe_pls_cmp}_{safe_gene}.pdf"
+    )
+    stacked_signed_arcs_pdf = os.path.join(
+        signed_arcs_out_dir, f"stacked_gene_peak_links_signed_{safe_pls_cmp}_{safe_gene}.pdf"
+    )
+
+    plot_signed_arcs_stacked(
+        {"Source": source_gp_link_df},
+        pls_cmp=pls_cmp,
+        gene=gene,
+        out_path=source_signed_arcs_pdf,
+        title=f"{gene} — {pls_cmp} (source)",
+    )
+    plt.show()
+    plot_signed_arcs_stacked(
+        {"Target": target_gp_link_df},
+        pls_cmp=pls_cmp,
+        gene=gene,
+        out_path=target_signed_arcs_pdf,
+        title=f"{gene} — {pls_cmp} (target)",
+    )
+    plt.show()
+    plot_signed_arcs_stacked(
+        {"Source": source_gp_link_df, "Target": target_gp_link_df},
+        pls_cmp=pls_cmp,
+        gene=gene,
+        out_path=stacked_signed_arcs_pdf,
+        title=f"{gene} — {pls_cmp}",
+    )
+    plt.show()
+    print(f"Saved signed-arc plots:\n {source_signed_arcs_pdf}\n {target_signed_arcs_pdf}\n {stacked_signed_arcs_pdf}")
 
     # Plot the saved BEDPE with CoolBox (run from MultiGATE/; env needs bgzip, tabix, pairix).
+    # Need environment with CoolBox installed. (e.g. torch_env_py39)
     # Use the BEDPE path printed above as --links; pass a sorted, tabix-indexed .gtf.bgz as --gtf (or set $DATAPATH).
-    # python scripts/plot_gene_peak_attention_links_track.py --links gp_link_bedpe_path --gtf "$DATAPATH/gene_annotations/gencode.vM25.chr_patch_hapl_scaff.annotation.sorted.gtf.bgz" --out "$OUTPATH/MultiGATE/attention_analysis/gene_peak_links.pdf"
+    # python scripts/plot_gene_peak_attention_links_track.py --links gp_link_bedpe_path --gtf "$DATAPATH/gene_annotations/gencode.vM25.chr_patch_hapl_scaff.annotation.sorted.gtf.bgz" --out "$OUTPATH/MultiGATE/attention_analysis/source_gene_peak_links.pdf"
+    # Write a bash script to file, with commands for both source and target plotting
 
+    plot_script_path = os.path.join(os.path.dirname(__file__), "plot_gene_peak_attention_links_track.py")
+    bash_script_path = os.path.join(f"{os.getenv('OUTPATH')}/MultiGATE/attention_analysis", "run_plot_gene_peak_attention_links.sh")
+
+    # Fill in these file paths with your actual .bedpe, .gtf.bgz (tabix-indexed), and output paths
+    gtf_bgz = f"{os.getenv('DATAPATH')}/gene_annotations/gencode.vM25.chr_patch_hapl_scaff.annotation.sorted.gtf.bgz"
+    out_dir = f"{os.getenv('OUTPATH')}/MultiGATE/attention_analysis"
+    multigate_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    source_signed_csv = os.path.splitext(source_bedpe)[0] + ".csv"
+    target_signed_csv = os.path.splitext(target_bedpe)[0] + ".csv"
+
+    bash_script_contents = f"""#!/bin/bash
+
+# Activate environment
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate torch_env_py39
+
+# Plot source gene-peak links
+python {plot_script_path} --links "{source_bedpe}" --gtf "{gtf_bgz}" --out "{out_dir}/source_gene_peak_links.pdf"
+
+# Plot target gene-peak links
+python {plot_script_path} --links "{target_bedpe}" --gtf "{gtf_bgz}" --out "{out_dir}/target_gene_peak_links.pdf"
+
+# Signed-arc PDFs (matplotlib; same stem as the .bedpe/.csv above). Not produced by CoolBox.
+cd {shlex.quote(multigate_root)}
+python - <<'PY'
+import matplotlib
+matplotlib.use("Agg")
+import pandas as pd
+from gene_peak_attention_utils import plot_signed_arcs_stacked
+_src_csv = {repr(source_signed_csv)}
+_tgt_csv = {repr(target_signed_csv)}
+_pls = {repr(pls_cmp)}
+_gene = {repr(gene)}
+src = pd.read_csv(_src_csv)
+tgt = pd.read_csv(_tgt_csv)
+plot_signed_arcs_stacked({{"Source": src}}, pls_cmp=_pls, gene=_gene, out_path={repr(source_signed_arcs_pdf)}, title={repr(f"{gene} — {pls_cmp} (source)")})
+plot_signed_arcs_stacked({{"Target": tgt}}, pls_cmp=_pls, gene=_gene, out_path={repr(target_signed_arcs_pdf)}, title={repr(f"{gene} — {pls_cmp} (target)")})
+plot_signed_arcs_stacked({{"Source": src, "Target": tgt}}, pls_cmp=_pls, gene=_gene, out_path={repr(stacked_signed_arcs_pdf)}, title={repr(f"{gene} — {pls_cmp}")})
+print("Saved signed-arc plots:")
+print({repr(source_signed_arcs_pdf)})
+print({repr(target_signed_arcs_pdf)})
+print({repr(stacked_signed_arcs_pdf)})
+PY
+"""
+
+    with open(bash_script_path, "w") as f:
+        f.write(bash_script_contents)
+
+    print(f"\nBash script written to:\n {bash_script_path}")
+    print(f'Bash command to run:\n bash {bash_script_path}')
 
     #%% AJIVE analysis
     from mvlearn.decomposition import AJIVE
