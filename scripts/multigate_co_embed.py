@@ -4485,6 +4485,7 @@ def main():
     
     #%% attention matrix analysis
     from post_hoc_utils import run_gene_peak_attention_tutorial
+    from gene_peak_attention_utils import save_gene_peak_links_bedpe
 
     # Find the artifact path for the attention matrix
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -4550,9 +4551,20 @@ def main():
     gp_link_df = gene_peak_attention_links.loc[
         gene_peak_attention_links['Gene'].eq(gene) &
         (gene_peak_attention_links['Peak'].isin(peaks))
-    ]
+    ].copy()
     gp_link_df[f'{pls_cmp}_gene_weight'] = pls_source_rna_coef_df.loc[pls_cmp, gene]
     gp_link_df = pd.merge(gp_link_df, pls_source_atac_coef_df.loc[pls_cmp, peaks].rename(f'{pls_cmp}_peak_weight'), left_on='Peak', right_index=True, how='inner')
+
+    safe_pls_cmp = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in str(pls_cmp))
+    safe_gene = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in str(gene))
+    gp_link_prefix = f"gene_peak_links_{safe_pls_cmp}_{safe_gene}"
+    gp_link_csv_path = os.path.join(attention_analysis_summary["output_dir"], f"{gp_link_prefix}.csv")
+    gp_link_bedpe_path = os.path.join(attention_analysis_summary["output_dir"], f"{gp_link_prefix}.bedpe")
+    gp_link_df.to_csv(gp_link_csv_path, index=False)
+    save_gene_peak_links_bedpe(gp_link_df, gp_link_bedpe_path, score_col="Attention")
+    print("Saved selected gene-peak links:")
+    print(f"  CSV:   {gp_link_csv_path}")
+    print(f"  BEDPE: {gp_link_bedpe_path}")
 
 
     #%% ── Save outputs ─────────────────────────────────────────────────────────

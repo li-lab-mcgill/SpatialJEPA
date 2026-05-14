@@ -432,6 +432,95 @@ def save_attention_outputs(
         f.write(f"{float(threshold)}\n")
 
 
+def save_gene_peak_links_bedpe(
+    gp_link_df: pd.DataFrame,
+    output_path: Union[str, Path],
+    *,
+    score_col: str = "Attention",
+) -> Path:
+    """
+    Save selected gene-peak links as BEDPE for CoolBox Arcs.
+
+    The peak interval is BEDPE end 1. The gene endpoint is a 1 bp interval
+    anchored at the GTF-style 1-based TSS, converted to BED-style
+    ``[tss - 1, tss]`` coordinates.
+    """
+    required_cols = {
+        "Gene",
+        "Peak",
+        "peak_chr",
+        "peak_start",
+        "peak_end",
+        "chr",
+        "tss",
+        "strand",
+        score_col,
+    }
+    missing = sorted(required_cols.difference(gp_link_df.columns))
+    if missing:
+        raise ValueError(f"gp_link_df is missing required columns: {missing}")
+    if gp_link_df.empty:
+        raise ValueError("gp_link_df is empty; no BEDPE links to save.")
+
+    out = gp_link_df.copy()
+    numeric_cols = ["peak_start", "peak_end", "tss", score_col]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    invalid = {
+        col: int(out[col].isna().sum())
+        for col in ["peak_chr", "peak_start", "peak_end", "chr", "tss", "strand", score_col]
+        if out[col].isna().any()
+    }
+    for col in ["peak_chr", "chr", "strand"]:
+        empty = out[col].astype(str).str.strip().eq("")
+        if empty.any():
+            invalid[col] = invalid.get(col, 0) + int(empty.sum())
+    if invalid:
+        raise ValueError(f"gp_link_df contains invalid BEDPE fields: {invalid}")
+
+    if (out["peak_start"] < 0).any():
+        raise ValueError("BEDPE peak_start values must be non-negative.")
+    if (out["peak_end"] <= out["peak_start"]).any():
+        raise ValueError("BEDPE peak_end values must be greater than peak_start.")
+    if (out["tss"] <= 0).any():
+        raise ValueError("TSS values must be positive 1-based coordinates.")
+    if (out[score_col] < 0).any():
+        raise ValueError(f"{score_col} values must be non-negative for CoolBox score scaling.")
+
+    strand_values = set(out["strand"].astype(str))
+    invalid_strands = sorted(strand_values.difference({"+", "-", "."}))
+    if invalid_strands:
+        raise ValueError(f"Unexpected strand values for BEDPE: {invalid_strands}")
+
+    name = (
+        out["Gene"].astype(str).str.replace(r"[\t\r\n]+", "_", regex=True)
+        + "|"
+        + out["Peak"].astype(str).str.replace(r"[\t\r\n]+", "_", regex=True)
+    )
+    bedpe = pd.DataFrame(
+        {
+            "chrom1": out["peak_chr"].astype(str),
+            "start1": out["peak_start"].astype(np.int64),
+            "end1": out["peak_end"].astype(np.int64),
+            "chrom2": out["chr"].astype(str),
+            "start2": (out["tss"] - 1).astype(np.int64),
+            "end2": out["tss"].astype(np.int64),
+            "name": name,
+            "score": out[score_col].astype(float),
+            "strand1": ".",
+            "strand2": out["strand"].astype(str),
+        }
+    )
+    if bedpe.empty:
+        raise ValueError("No BEDPE rows were generated.")
+
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    bedpe.to_csv(out_path, sep="\t", header=False, index=False)
+    return out_path
+
+
 __all__ = [
     "GMMThresholdResult",
     "add_gene_and_peak_columns",
@@ -449,4 +538,5 @@ __all__ = [
     "plot_attention_distribution",
     "plot_distance_distribution",
     "save_attention_outputs",
+    "save_gene_peak_links_bedpe",
 ]
