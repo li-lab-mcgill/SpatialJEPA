@@ -1156,7 +1156,8 @@ def run_inference(mgate, graph_tf, gp_tf, x1_df, x2_df, device):
 
     rna_emb  = outputs[5].detach().cpu().numpy()
     atac_emb = outputs[6].detach().cpu().numpy()
-    return rna_emb, atac_emb
+    att_lgp = outputs[9][0]
+    return rna_emb, atac_emb, att_lgp
 
 def _concat_obs_to_barcode(concat_obs: pd.Index, modality: str) -> np.ndarray:
     suffix = "_rna" if modality == "rna" else "_atac"
@@ -1825,21 +1826,21 @@ def main():
     #%% ── Inference, by dataset ────────────────────────────────────────────────────────────
 
     ## (teacher) source inference
-    teacher_source_rna_emb, teacher_source_atac_emb = run_inference(
+    teacher_source_rna_emb, teacher_source_atac_emb, _ = run_inference(
         teacher_source_mgate, source_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, teacher_source_rna_emb, teacher_source_atac_emb, key_added="MultiGATE_teacher")
     print("  Teacher source embeddings: shape {}".format(teacher_source_rna_emb.shape))
     
     ## (student) source inference
-    source_rna_emb, source_atac_emb = run_inference(
+    source_rna_emb, source_atac_emb, _ = run_inference(
         source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
     print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
     ## nonspatial source inference
-    nonspatial_source_rna_emb, nonspatial_source_atac_emb = run_inference(
+    nonspatial_source_rna_emb, nonspatial_source_atac_emb, _ = run_inference(
         nonspatial_source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, nonspatial_source_rna_emb, nonspatial_source_atac_emb, key_added="MultiGATE_nonspatial")
@@ -1904,7 +1905,7 @@ def main():
     if args.target_model:
 
         ## student target inference
-        target_rna_emb, target_atac_emb = run_inference(
+        target_rna_emb, target_atac_emb, _ = run_inference(
             target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
         )
         set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
@@ -1945,28 +1946,28 @@ def main():
     model = source_mgate
 
     ## (teacher) source inference
-    teacher_source_rna_emb, teacher_source_atac_emb = run_inference(
+    teacher_source_rna_emb, teacher_source_atac_emb, teacher_source_att_lgp = run_inference(
         model, source_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, teacher_source_rna_emb, teacher_source_atac_emb, key_added="MultiGATE_teacher")
     print("  Teacher source embeddings: shape {}".format(teacher_source_rna_emb.shape))
     
     ## (student) source inference
-    source_rna_emb, source_atac_emb = run_inference(
+    source_rna_emb, source_atac_emb, source_att_lgp = run_inference(
         model, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
     print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
     ## (target) inference
-    target_rna_emb, target_atac_emb = run_inference(
+    target_rna_emb, target_atac_emb, target_att_lgp = run_inference(
         model, target_graph_tf, target_gp_tf, target_x1, target_x2, device
     )
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
     ## nonspatial source inference
-    nonspatial_source_rna_emb, nonspatial_source_atac_emb = run_inference(
+    nonspatial_source_rna_emb, nonspatial_source_atac_emb, nonspatial_source_att_lgp = run_inference(
         nonspatial_source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
     set_multigate_embeddings(source_rna, source_atac, nonspatial_source_rna_emb, nonspatial_source_atac_emb, key_added="MultiGATE_nonspatial")
@@ -3093,9 +3094,9 @@ def main():
 
     all_pls_scores_df.sort_values('mean_rank', inplace=True)
     all_pls_scores_grouped_df = all_pls_scores_df.reset_index().groupby(['index', 'gene']).agg(
-        mean_rank=('mean_rank', 'mean'),
+        mean_min_rank=('mean_rank', 'min'),
         n_links=('mean_rank', 'count'),
-    ).sort_values('mean_rank')
+    ).sort_values('mean_min_rank')
 
     print(all_pls_scores_df.head(5))
     print(all_pls_scores_grouped_df.head(10))
@@ -3105,13 +3106,13 @@ def main():
     gene = 'Zic1'
     peaks = gene_peak_attention_links[gene_peak_attention_links['Gene'] == gene]['Peak'].values
 
+    # DORC plot and annotate the marker corresponding to 'gene'
     plt.figure(figsize=(2.5, 3))
     value_counts = gene_peak_attention_links['Gene'].value_counts(ascending=True)
     ax = value_counts.plot(marker='.', color='black')
     plt.xlabel('Genes')
     plt.ylabel('Number of peaks')
 
-    # DORC plot and annotate the marker corresponding to 'gene'
     if gene in value_counts.index:
         y = value_counts[gene]
         x = list(value_counts.index).index(gene)
