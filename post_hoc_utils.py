@@ -266,3 +266,41 @@ def topic_betas_hallmark_gsea_mouse(
         "top_terms_per_row": top_terms_per_row,
     }
 
+
+def gene_peak_attention_links_from_att_lgp(att_lgp, adata_rna, adata_atac):
+    """
+    Convert MGATE GP attention (torch sparse ``Att_lgp`` layer 0) to a scipy COO matrix,
+    run ``run_gene_peak_attention_tutorial``, and return the thresholded gene–peak link table.
+
+    Returns
+    -------
+    (gene_peak_attention_links, attention_analysis_summary)
+        A ``pandas.DataFrame`` of thresholded links and the summary dict from
+        ``run_gene_peak_attention_tutorial`` (includes ``output_dir``).
+    """
+
+    t = att_lgp.coalesce()
+    idx = t.indices().detach().cpu().numpy()
+    vals = t.values().detach().cpu().numpy()
+    peak_gene_attention = sp.coo_matrix(
+        (vals, (idx[0], idx[1])), shape=tuple(t.shape)
+    )
+
+    attention_analysis_summary = run_gene_peak_attention_tutorial(
+        peak_gene_attention=peak_gene_attention,
+        adata_rna=adata_rna,
+        adata_atac=adata_atac,
+    )
+
+    gene_peak_attention_links = pd.read_csv(
+        os.path.join(attention_analysis_summary['output_dir'], 'merged_df_threshold.csv')
+    )
+    gene_peak_attention_links = gene_peak_attention_links.loc[
+        gene_peak_attention_links['chr'].str.startswith('chr')
+    ]
+    gene_peak_attention_links = gene_peak_attention_links.drop_duplicates(
+        subset=['Gene', 'Peak', 'Attention', 'gene_idx', 'peak_idx']
+    )
+    assert gene_peak_attention_links[['Gene', 'Peak']].value_counts().le(1).all()
+
+    return gene_peak_attention_links, attention_analysis_summary

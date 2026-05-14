@@ -1159,6 +1159,73 @@ def run_inference(mgate, graph_tf, gp_tf, x1_df, x2_df, device):
     att_lgp = outputs[9][0]
     return rna_emb, atac_emb, att_lgp
 
+
+def score_gene_peak_attention_links_by_pls(gene_peak_attention_links, rna_coef_df, atac_coef_df):
+    """Rank gene-peak attention links by paired RNA/ATAC PLS coefficient ranks."""
+    rna_coef_ranked_df = rna_coef_df.abs().rank(1, ascending=False).div(rna_coef_df.shape[1])
+    atac_coef_ranked_df = atac_coef_df.abs().rank(1, ascending=False).div(atac_coef_df.shape[1])
+
+    missing_genes = sorted(set(gene_peak_attention_links["Gene"]) - set(rna_coef_ranked_df.columns))
+    missing_peaks = sorted(set(gene_peak_attention_links["Peak"]) - set(atac_coef_ranked_df.columns))
+    if missing_genes or missing_peaks:
+        raise KeyError(
+            "PLS coefficient tables do not cover all attention links: "
+            "{} missing genes, {} missing peaks.".format(len(missing_genes), len(missing_peaks))
+        )
+
+    pls_score_rows = []
+    for gene, peak in gene_peak_attention_links[["Gene", "Peak"]].values:
+        rna_pls_scores = rna_coef_ranked_df.loc[:, gene]
+        atac_pls_scores = atac_coef_ranked_df.loc[:, peak]
+        pls_scores = pd.merge(
+            rna_pls_scores,
+            atac_pls_scores,
+            left_index=True,
+            right_index=True,
+            how="inner",
+        )
+        pls_scores["mean_rank"] = pls_scores.mean(axis=1)
+        pls_scores.rename(columns={gene: "gene_rank", peak: "peak_rank"}, inplace=True)
+        pls_score_rows.append(pls_scores.assign(gene=gene, peak=peak))
+
+    all_pls_scores_df = pd.concat(pls_score_rows, ignore_index=False)
+    all_pls_scores_df.sort_values("mean_rank", inplace=True)
+    all_pls_scores_grouped_df = (
+        all_pls_scores_df
+        .reset_index()
+        .groupby(["index", "gene"])
+        .agg(
+            mean_min_rank=("mean_rank", "min"),
+            n_links=("mean_rank", "count"),
+        )
+        .sort_values("mean_min_rank")
+    )
+    return all_pls_scores_df, all_pls_scores_grouped_df
+
+
+def select_gene_peak_link_df(gene_peak_attention_links, rna_coef_df, atac_coef_df, pls_cmp, gene):
+    """Select one gene's peak links and annotate them with domain-specific PLS weights."""
+    peaks = gene_peak_attention_links.loc[
+        gene_peak_attention_links["Gene"].eq(gene),
+        "Peak",
+    ].values
+
+    gp_link_df = gene_peak_attention_links.loc[
+        gene_peak_attention_links["Gene"].eq(gene)
+        & gene_peak_attention_links["Peak"].isin(peaks)
+    ].copy()
+
+    gp_link_df[f"{pls_cmp}_gene_weight"] = rna_coef_df.loc[pls_cmp, gene]
+    gp_link_df = pd.merge(
+        gp_link_df,
+        atac_coef_df.loc[pls_cmp, peaks].rename(f"{pls_cmp}_peak_weight"),
+        left_on="Peak",
+        right_index=True,
+        how="inner",
+    )
+    return gp_link_df, peaks
+
+
 def _concat_obs_to_barcode(concat_obs: pd.Index, modality: str) -> np.ndarray:
     suffix = "_rna" if modality == "rna" else "_atac"
     idx = pd.Index(concat_obs).astype(str)
@@ -2765,7 +2832,8 @@ def main():
     def run_pls_embedding_to_gene_plots(
         adata, full_adata=None, umap_title=None, save_plots=False, plot_prefix='',
         umap_plot_prefix=None, spatial_leiden_plot_prefix=None,
-        n_components=9, basis='spatial', weights_plot_type='staircase', top_n_genes=5, heatmap_cmap='YlGn'
+        n_components=9, basis='spatial', weights_plot_type='staircase', top_n_genes=5, heatmap_cmap='YlGn',
+        censor_gene_from_plot=None
     ):
         # X = pathway_embedding_results['source_rna'].pathway_scores.to_numpy()
         X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
@@ -2846,9 +2914,12 @@ def main():
                 lambda x: x.nlargest(top_n_genes).index, axis=1, result_type='reduce'
             ).explode().unique()
             pls_coef_df_sorted = pls_coef_df.loc[:, top_genes_sort]
+            pls_coef_df_sorted_plot = pls_coef_df_sorted.copy()
+            if censor_gene_from_plot is not None:
+                pls_coef_df_sorted_plot = pls_coef_df_sorted_plot.loc[:, ~pls_coef_df_sorted_plot.columns.isin(censor_gene_from_plot)]
 
             fig = plt.figure(figsize=(4.25, 9))
-            sns.heatmap(pls_coef_df_sorted.T.abs(), cmap=heatmap_cmap, cbar=True)
+            sns.heatmap(pls_coef_df_sorted_plot.T.abs(), cmap=heatmap_cmap, cbar=True)
             plt.tight_layout()
             if save_plots:
                 save_plot_to_pdf(fig, f"{plot_prefix}_pls_weights_heatmap_staircase")
@@ -2888,7 +2959,7 @@ def main():
 
     ## train PLS models on source and target data
     pls_source_rna, pls_source_rna_coef_df, _ = run_pls_embedding_to_gene_plots(source_rna, save_plots=False, plot_prefix='01_source_rna_pls')
-    pls_target_rna, pls_target_rna_coef_df, _ = run_pls_embedding_to_gene_plots(target_rna, save_plots=False, plot_prefix='02_target_rna_pls')
+    pls_target_rna, pls_target_rna_coef_df, _ = run_pls_embedding_to_gene_plots(target_rna, save_plots=False, plot_prefix='02_target_rna_pls', censor_gene_from_plot=['C530008M17Rik'])
     pls_source_atac, pls_source_atac_coef_df, _ = run_pls_embedding_to_gene_plots(source_atac, save_plots=False, plot_prefix='03_source_atac_pls')
     pls_target_atac, pls_target_atac_coef_df, _ = run_pls_embedding_to_gene_plots(target_atac, save_plots=False, plot_prefix='04_target_atac_pls')
 
@@ -3043,9 +3114,10 @@ def main():
         )
     
     #%% attention matrix analysis
-    from post_hoc_utils import run_gene_peak_attention_tutorial
     from gene_peak_attention_utils import save_gene_peak_links_bedpe
+    from post_hoc_utils import gene_peak_attention_links_from_att_lgp
 
+    '''
     # Find the artifact path for the attention matrix
     with tempfile.TemporaryDirectory() as tmp_dir:
         attention_artifact_path = "matrices/source_peak_gene_attention.npz"
@@ -3074,74 +3146,112 @@ def main():
     gene_peak_attention_links = gene_peak_attention_links.loc[gene_peak_attention_links['chr'].str.startswith('chr')]
     gene_peak_attention_links = gene_peak_attention_links.drop_duplicates(subset=['Gene', 'Peak', 'Attention', 'gene_idx', 'peak_idx'])
     assert gene_peak_attention_links[['Gene', 'Peak']].value_counts().le(1).all()
+    '''
+
+    source_gene_peak_attention_links, source_attention_analysis_summary = gene_peak_attention_links_from_att_lgp(
+        source_att_lgp, source_rna, source_atac
+    )
+    target_gene_peak_attention_links, target_attention_analysis_summary = gene_peak_attention_links_from_att_lgp(
+        target_att_lgp, target_rna, target_atac
+    )
 
     ## find high PLS-weighted gene-peak attention links
-    try:
-        pls_source_rna_coef_ranked_df = pls_source_rna_coef_df.abs().rank(1, ascending=False)
-        pls_source_atac_coef_ranked_df = pls_source_atac_coef_df.abs().rank(1, ascending=False)
-    except:
-        print("Need to run PLS regression")
+    source_all_pls_scores_df, source_all_pls_scores_grouped_df = score_gene_peak_attention_links_by_pls(
+        source_gene_peak_attention_links,
+        pls_source_rna_coef_df,
+        pls_source_atac_coef_df,
+    )
+    target_all_pls_scores_df, target_all_pls_scores_grouped_df = score_gene_peak_attention_links_by_pls(
+        target_gene_peak_attention_links,
+        pls_target_rna_coef_df,
+        pls_target_atac_coef_df,
+    )
 
-    all_pls_scores_df = pd.DataFrame()
-    for gene, peak in gene_peak_attention_links[['Gene', 'Peak']].values:
-        rna_pls_scores = pls_source_rna_coef_ranked_df.loc[:, gene]
-        atac_pls_scores = pls_source_atac_coef_ranked_df.loc[:, peak]
-        pls_scores = pd.merge(rna_pls_scores, atac_pls_scores, left_index=True, right_index=True, how='inner')
-        pls_scores['mean_rank'] = pls_scores.mean(axis=1)
-        pls_scores.rename(columns={gene: 'gene_rank', peak: 'peak_rank'}, inplace=True)
-        pls_scores_df = pls_scores.assign(gene=gene, peak=peak)
-        all_pls_scores_df = pd.concat([all_pls_scores_df, pls_scores_df])
+    # Keep the existing downstream source-focused plotting code unchanged.
+    gene_peak_attention_links = source_gene_peak_attention_links
+    attention_analysis_summary = source_attention_analysis_summary
+    all_pls_scores_df = source_all_pls_scores_df
+    all_pls_scores_grouped_df = source_all_pls_scores_grouped_df
 
-    all_pls_scores_df.sort_values('mean_rank', inplace=True)
-    all_pls_scores_grouped_df = all_pls_scores_df.reset_index().groupby(['index', 'gene']).agg(
-        mean_min_rank=('mean_rank', 'min'),
-        n_links=('mean_rank', 'count'),
-    ).sort_values('mean_min_rank')
-
-    print(all_pls_scores_df.head(5))
-    print(all_pls_scores_grouped_df.head(10))
+    print("Source PLS-weighted gene-peak attention links:")
+    print(source_all_pls_scores_df.head(5))
+    print(source_all_pls_scores_grouped_df.head(10))
+    print("Target PLS-weighted gene-peak attention links:")
+    print(target_all_pls_scores_df.head(5))
+    print(target_all_pls_scores_grouped_df.head(10))
 
     ## select PLS-gene combinations
-    pls_cmp = 'PLS_2'
-    gene = 'Zic1'
-    peaks = gene_peak_attention_links[gene_peak_attention_links['Gene'] == gene]['Peak'].values
+    pls_cmp = 'PLS_0'
+    gene = 'Pde10a'
 
     # DORC plot and annotate the marker corresponding to 'gene'
     plt.figure(figsize=(2.5, 3))
-    value_counts = gene_peak_attention_links['Gene'].value_counts(ascending=True)
+    value_counts = source_gene_peak_attention_links['Gene'].value_counts(ascending=True)
     ax = value_counts.plot(marker='.', color='black')
     plt.xlabel('Genes')
     plt.ylabel('Number of peaks')
-
     if gene in value_counts.index:
         y = value_counts[gene]
         x = list(value_counts.index).index(gene)
         ax.plot(x, y, 'ro', markersize=8, label=gene)
-        ax.annotate(gene, (x, y), xytext=(0, 10), textcoords='offset points', ha='center', va='bottom', fontsize=9, color='red', fontweight='bold')
+        ax.annotate(gene, (x, y), xytext=(-25, 8), textcoords='offset points', ha='center', va='bottom', fontsize=9, color='red', fontweight='bold')
     plt.show()
+    assert source_gene_peak_attention_links['Gene'].value_counts(ascending=True).equals(target_gene_peak_attention_links['Gene'].value_counts(ascending=True))
 
     ## isolate gene-peak link df
-    gp_link_df = gene_peak_attention_links.loc[
-        gene_peak_attention_links['Gene'].eq(gene) &
-        (gene_peak_attention_links['Peak'].isin(peaks))
-    ].copy()
-    gp_link_df[f'{pls_cmp}_gene_weight'] = pls_source_rna_coef_df.loc[pls_cmp, gene]
-    gp_link_df = pd.merge(gp_link_df, pls_source_atac_coef_df.loc[pls_cmp, peaks].rename(f'{pls_cmp}_peak_weight'), left_on='Peak', right_index=True, how='inner')
+    source_gp_link_df, source_peaks = select_gene_peak_link_df(
+        source_gene_peak_attention_links,
+        pls_source_rna_coef_df,
+        pls_source_atac_coef_df,
+        pls_cmp,
+        gene,
+    )
+    target_gp_link_df, target_peaks = select_gene_peak_link_df(
+        target_gene_peak_attention_links,
+        pls_target_rna_coef_df,
+        pls_target_atac_coef_df,
+        pls_cmp,
+        gene,
+    )
+    ## create 'peak' scores out of peak set
+    source_peak_scores = source_atac[:, source_gp_link_df['Peak']].X.multiply(source_gp_link_df['PLS_0_peak_weight']).sum(axis=1)
+    target_peak_scores = target_atac[:, target_gp_link_df['Peak']].X.multiply(target_gp_link_df['PLS_0_peak_weight']).sum(axis=1)
+    source_atac.obs[f'{gene}-linked peaks'] = source_peak_scores
+    target_atac.obs[f'{gene}-linked peaks'] = target_peak_scores
 
+    ## spatial plots of selected gene-peak links
+    fig, ax = plt.subplots(2, 2, figsize=(6, 6))
+    sc.pl.embedding(source_rna, basis='spatial', color=gene, size=60, ax=ax[0, 0], show=False)
+    sc.pl.embedding(target_rna, basis='spatial', color=gene, size=60, ax=ax[0, 1], show=False)
+    sc.pl.embedding(source_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, vmax=0.08, ax=ax[1, 0], show=False)
+    sc.pl.embedding(target_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, vmax=0.10, ax=ax[1, 1], show=False)
+    fig.suptitle(f'{gene} - {pls_cmp}')
+    ax[0, 0].set_title('Source gene'); ax[0, 0].set_xlabel(''); ax[0, 0].set_ylabel('')
+    ax[0, 1].set_title('Target gene'); ax[0, 1].set_xlabel(''); ax[0, 1].set_ylabel('')
+    ax[1, 0].set_title('Source peaks'); ax[1, 0].set_xlabel(''); ax[1, 0].set_ylabel('')
+    ax[1, 1].set_title('Target peaks'); ax[1, 1].set_xlabel(''); ax[1, 1].set_ylabel('')
+    plt.tight_layout(); plt.show()
+
+    ## save gene-peak links
     safe_pls_cmp = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in str(pls_cmp))
     safe_gene = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in str(gene))
-    gp_link_prefix = f"gene_peak_links_{safe_pls_cmp}_{safe_gene}"
-    gp_link_csv_path = os.path.join(attention_analysis_summary["output_dir"], f"{gp_link_prefix}.csv")
-    gp_link_bedpe_path = os.path.join(attention_analysis_summary["output_dir"], f"{gp_link_prefix}.bedpe")
-    gp_link_df.to_csv(gp_link_csv_path, index=False)
-    save_gene_peak_links_bedpe(gp_link_df, gp_link_bedpe_path, score_col="Attention")
-    print("Saved selected gene-peak links:")
-    print(f"  CSV:   {gp_link_csv_path}")
-    print(f"  BEDPE: {gp_link_bedpe_path}")
+
+    gp_link_prefix = f"source_gene_peak_links_{safe_pls_cmp}_{safe_gene}"
+    gp_link_csv_path = os.path.join(source_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.csv")
+    gp_link_bedpe_path = os.path.join(source_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.bedpe")
+    source_gp_link_df.to_csv(gp_link_csv_path, index=False)
+    save_gene_peak_links_bedpe(source_gp_link_df, gp_link_bedpe_path, score_col="Attention")
+
+    gp_link_prefix = f"target_gene_peak_links_{safe_pls_cmp}_{safe_gene}"
+    gp_link_csv_path = os.path.join(target_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.csv")
+    gp_link_bedpe_path = os.path.join(target_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.bedpe")
+    target_gp_link_df.to_csv(gp_link_csv_path, index=False)
+    save_gene_peak_links_bedpe(target_gp_link_df, gp_link_bedpe_path, score_col="Attention")
 
     # Plot the saved BEDPE with CoolBox (run from MultiGATE/; env needs bgzip, tabix, pairix).
     # Use the BEDPE path printed above as --links; pass a sorted, tabix-indexed .gtf.bgz as --gtf (or set $DATAPATH).
     # python scripts/plot_gene_peak_attention_links_track.py --links gp_link_bedpe_path --gtf "$DATAPATH/gene_annotations/gencode.vM25.chr_patch_hapl_scaff.annotation.sorted.gtf.bgz" --out "$OUTPATH/MultiGATE/attention_analysis/gene_peak_links.pdf"
+
 
     #%% AJIVE analysis
     from mvlearn.decomposition import AJIVE
