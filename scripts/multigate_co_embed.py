@@ -2846,7 +2846,7 @@ def main():
         ax[1].get_legend().remove()
     plt.tight_layout(); plt.show()
 
-    x1 = adata.obsm['MultiGATE']
+    x1 = adata.obsm['MultiGATE_source_aligned']
     x2 = nmf.X
     x1 = rankdata(x1, axis=0)
     x2 = rankdata(x2, axis=0)
@@ -2858,7 +2858,7 @@ def main():
     topk=3
     corrs_order = pd.Series(corrs_df.apply(lambda x: corrs_df.index[np.argsort(x)[:topk]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values.tolist()
     corr_top = corrs_df.loc[corrs_order]
-    cg = sns.clustermap(corr_top, cmap='coolwarm', center=0.0, vmax=0.4, figsize=(5, 3))
+    cg = sns.clustermap(corr_top, cmap='coolwarm', center=0.0, vmax=0.4, figsize=(6, 4))
     cg.ax_heatmap.set_xlabel('MultiGATE dimensions')
     plt.show()
 
@@ -2867,6 +2867,21 @@ def main():
 
     ## compare ARI between NMF leiden and source, target and nonspatial-source leiden
     from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+    ## teacher source ARI
+    nmf = source_liana_results['nmf'].copy()
+    teacher_source_leiden = teacher_source_concat_adata[
+            teacher_source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
+            teacher_source_concat_adata.obs['modality'].eq('rna')
+            ].obs['leiden']
+    teacher_source_leiden.index = teacher_source_leiden.index.str.split("_").str[0]
+    teacher_source_leiden = teacher_source_leiden.loc[nmf.obs_names]
+    nmf_leiden = nmf.obs['leiden']
+    assert teacher_source_leiden.index.equals(nmf_leiden.index)
+    teacher_source_ari = adjusted_rand_score(teacher_source_leiden, nmf_leiden)
+    teacher_source_nmi = normalized_mutual_info_score(teacher_source_leiden, nmf_leiden)
+    print(f'Adjusted Rand Score: {teacher_source_ari:.2f}')
+    print(f'Normalized Mutual Information Score: {teacher_source_nmi:.2f}')
 
     ## source ARI
     nmf = source_liana_results['nmf'].copy()
@@ -2961,10 +2976,10 @@ def main():
 
     ## compare ARI and NMI between source, target and nonspatial-source
     ari_nmi_df = pd.DataFrame({
-        'ARI': [source_ari, target_ari, nonspatial_source_ari, ingested_nonspatial_source_ari],
-        'NMI': [source_nmi, target_nmi, nonspatial_source_nmi, ingested_nonspatial_source_nmi]
-    }, index=['Source', 'Target', 'Nsp Source', 'Nsp Source$^\dagger$'])
-    ari_nmi_df.plot(kind='bar', rot=30, cmap='Set2', figsize=(4.5, 3)); plt.show()
+        'ARI': [teacher_source_ari, source_ari, target_ari, nonspatial_source_ari, ingested_nonspatial_source_ari],
+        'NMI': [teacher_source_nmi, source_nmi, target_nmi, nonspatial_source_nmi, ingested_nonspatial_source_nmi]
+    }, index=['Teach. Source', 'Source', 'Target', 'Nsp Source', 'Nsp Source$^\dagger$'])
+    ari_nmi_df.plot(kind='bar', rot=30, cmap='Set2', figsize=(5, 2.5)); plt.show()
 
     ## plot UMAP of source, target, nonspatial-source and ingested nonspatial-source
     fig, axs = plt.subplots(2, 2, figsize=(10, 10))
