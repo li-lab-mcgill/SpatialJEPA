@@ -112,6 +112,12 @@ def save_figure_pdf_vector_raster(fig, filepath, dpi=300):
     finally:
         fonttools_logger.setLevel(prev_level)
 
+def save_plot_to_pdf(fig, filename, save_dir="/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis", dpi=300):
+    """Save figure as a fast-rendering PDF with heavy plot layers rasterized."""
+    filepath = os.path.join(save_dir, f"{filename}.pdf")
+    save_figure_pdf_vector_raster(fig, filepath, dpi=dpi)
+    print(f"Saved: {filepath}")
+    plt.close(fig)
 
 #%%
 
@@ -2476,6 +2482,32 @@ def main():
     import gc
     from sklearn.model_selection import StratifiedShuffleSplit
 
+    def make_full_spatial_nmf_plot_adata(nmf, full_adata, spatial_key="spatial", preserve_obs_cols=None):
+        nmf_scores = nmf.X.toarray() if sp.issparse(nmf.X) else np.asarray(nmf.X)
+        nmf_scores_df = pd.DataFrame(
+            nmf_scores,
+            index=nmf.obs_names,
+            columns=nmf.var_names,
+        )
+
+        full_obs = full_adata.obs.copy()
+        overlapping_score_cols = full_obs.columns.intersection(nmf_scores_df.columns)
+        if len(overlapping_score_cols) > 0:
+            full_obs = full_obs.drop(columns=overlapping_score_cols)
+        full_obs = full_obs.join(nmf_scores_df, how='left')
+
+        preserve_obs_cols = set(preserve_obs_cols or [])
+        for col in nmf.obs.columns:
+            if col in preserve_obs_cols and col in full_obs.columns:
+                continue
+            full_obs[col] = nmf.obs[col].reindex(full_obs.index)
+
+        return sc.AnnData(
+            X=np.zeros((full_adata.n_obs, 1)),
+            obs=full_obs,
+            obsm={spatial_key: full_adata.obsm[spatial_key].copy()},
+        )
+
     def liana_spatial_analysis(
         adata,
         subsample_n=5000,
@@ -2625,7 +2657,20 @@ def main():
         sc.tl.umap(nmf, min_dist=0.5)
         sc.pl.umap(nmf, color=[cell_type_col, 'leiden'], size=25, ncols=2)
 
-        sc.pl.embedding(nmf, basis=spatial_key, color=[cell_type_col, 'leiden'], size=s, ncols=2)
+        nmf_spatial = make_full_spatial_nmf_plot_adata(
+            nmf,
+            adata,
+            spatial_key=spatial_key,
+            preserve_obs_cols=[cell_type_col],
+        )
+        sc.pl.embedding(
+            nmf_spatial,
+            basis=spatial_key,
+            color=[cell_type_col, 'leiden'],
+            size=s,
+            ncols=2,
+            na_color='darkgray',
+        )
 
         stratified_subsample_applied = False
         if subsample_n is not None and subsample_n < nmf.n_obs:
@@ -2670,6 +2715,7 @@ def main():
             "adata": adata,
             "lrdata": lrdata,
             "nmf": nmf,
+            "nmf_spatial": nmf_spatial,
             "fused_I": fused_I,
             "svgs": svgs,
             "lr_loadings": lr_loadings,
@@ -2791,6 +2837,15 @@ def main():
     from scipy.stats import rankdata
     adata = source_liana_results['adata'].copy()
     nmf = source_liana_results['nmf'].copy()
+    nmf_spatial = source_liana_results['nmf_spatial'].copy()
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    sc.pl.embedding(nmf_spatial, basis='spatial', color='leiden', s=80, na_color='lightgray', na_in_legend=False, ax=ax[0], show=False)
+    sc.pl.embedding(nmf, basis='umap', color='leiden', s=60, ax=ax[1], show=False)
+    if ax[1].get_legend() is not None:
+        ax[1].get_legend().remove()
+    plt.tight_layout(); plt.show()
+
     x1 = adata.obsm['MultiGATE']
     x2 = nmf.X
     x1 = rankdata(x1, axis=0)
@@ -2830,6 +2885,16 @@ def main():
 
     ## target ARI
     nmf = target_liana_results['nmf'].copy()
+    adata = target_liana_results['adata'].copy()
+    nmf_spatial = target_liana_results['nmf_spatial'].copy()
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    sc.pl.embedding(nmf_spatial, basis='spatial', color='leiden', s=80, na_color='lightgray', na_in_legend=False, ax=ax[0], show=False)
+    sc.pl.embedding(nmf, basis='umap', color='leiden', s=60, ax=ax[1], show=False)
+    if ax[1].get_legend() is not None:
+        ax[1].get_legend().remove()
+    plt.tight_layout(); plt.show()
+
     target_leiden = target_concat_adata[
             #target_concat_adata.obs['source_obs_names'].str.split("_").str[0].isin(nmf.obs_names) &
             target_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
@@ -2915,13 +2980,6 @@ def main():
     import decoupler as dc
     import decoupler.op
     import liana as li
-
-    def save_plot_to_pdf(fig, filename, save_dir="/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis", dpi=300):
-        """Save figure as a fast-rendering PDF with heavy plot layers rasterized."""
-        filepath = os.path.join(save_dir, f"{filename}.pdf")
-        save_figure_pdf_vector_raster(fig, filepath, dpi=dpi)
-        print(f"Saved: {filepath}")
-        plt.close(fig)
 
     def run_pls_embedding_to_gene_plots(
         adata, full_adata=None, umap_title=None, save_plots=False, plot_prefix='',
