@@ -85,6 +85,34 @@ mpl.rcParams.update({
     'figure.titlesize': 18,
 })
 
+
+def rasterize_heavy_pdf_artists(fig):
+    """Rasterize dense artists while keeping text and axes vector in PDFs."""
+    for ax in fig.get_axes():
+        for artist in ax.collections:
+            artist.set_rasterized(True)
+        for artist in ax.images:
+            artist.set_rasterized(True)
+
+
+def save_figure_pdf_vector_raster(fig, filepath, dpi=300):
+    """Save a PDF with dense layers rasterized and text/axes vector (TrueType fonts)."""
+    import logging
+
+    rasterize_heavy_pdf_artists(fig)
+    d = os.path.dirname(filepath)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    fonttools_logger = logging.getLogger("fontTools")
+    prev_level = fonttools_logger.level
+    fonttools_logger.setLevel(logging.WARNING)
+    try:
+        with plt.rc_context({"pdf.fonttype": 42, "ps.fonttype": 42}):
+            fig.savefig(filepath, format="pdf", dpi=dpi, bbox_inches="tight")
+    finally:
+        fonttools_logger.setLevel(prev_level)
+
+
 #%%
 
 from dotenv import dotenv_values, load_dotenv
@@ -1464,12 +1492,12 @@ def main():
     #%% ── MLflow setup ────────────────────────────────────────────────────────
     #bash /home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/scripts/start_mlflow_services.sh all
 
-    #args.run_name = '20260505_190037' #'20260402_153455'
-    #args.stage2_run_name = '20260402_153455_stage2_20260402_165006'
-    #sqlite_tracking_uri = "sqlite:////home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db"
-    #postgres_tracking_uri = "http://127.0.0.1:5000"
-    #args.tracking_uri = postgres_tracking_uri
-    ## args.target_model = "zero_shot" # for zero-shot co-embedding if stage2 model is not available
+    args.run_name = '20260505_190037' #'20260402_153455'
+    args.stage2_run_name = '20260402_153455_stage2_20260402_165006'
+    sqlite_tracking_uri = "sqlite:////home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db"
+    postgres_tracking_uri = "http://127.0.0.1:5000"
+    args.tracking_uri = postgres_tracking_uri
+    args.target_model = "zero_shot" # for zero-shot co-embedding if stage2 model is not available
 
     #lsof /home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db
     #curl -i http://127.0.0.1:5000
@@ -1577,12 +1605,6 @@ def main():
         output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     print("Output directory:", output_dir)
-
-    #  ── Extract logged model metrics ──────────────────────────────────────
-    model_metrics_df = extract_logged_model_metrics(client, run_id, run_name=args.run_name)
-    model_metrics_df = model_metrics_df.loc[model_metrics_df['step'].eq(model_metrics_df['step'].max())]
-    model_metrics_df.drop(columns=['run_id', 'run_name', 'timestamp', 'logged_at', 'step'], inplace=True)
-    # columns now: metric_group, domain, metric_name, value
 
     # ── GTF path ────────────────────────────────────────────────────────────
     gtf_path = os.path.join(
@@ -1870,11 +1892,12 @@ def main():
     )
     target_rna_ct.obs['celltypist_predictions'] = cleaned_labels
 
-    sc.tl.umap(target_rna_ct, min_dist=0.3, spread=1.0)
+    sc.tl.umap(target_rna_ct)
+
     ax = sc.pl.embedding(
         target_rna_ct, color='celltypist_predictions', basis='umap', size=40, show=False
     )
-    plt.gcf().set_size_inches(5, 4)
+    plt.gcf().set_size_inches(6, 5)
     # Force legend into a single column so all labels align on the same axis
     handles, labels = ax.get_legend_handles_labels()
     ax.legend(
@@ -1884,6 +1907,13 @@ def main():
         bbox_to_anchor=(1, 0.5),
         ncol=1,
         frameon=False,
+    )
+    save_figure_pdf_vector_raster(
+        plt.gcf(),
+        os.path.join(
+            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+            "target_rna_umap_celltypist_predictions.pdf",
+        ),
     )
     plt.show()
 
@@ -1897,7 +1927,7 @@ def main():
     teacher_source_rna_emb, teacher_source_atac_emb, _ = run_inference(
         teacher_source_mgate, source_graph_tf, source_gp_tf, source_x1, source_x2, device
     )
-    set_multigate_embeddings(source_rna, source_atac, teacher_source_rna_emb, teacher_source_atac_emb, key_added="MultiGATE_teacher")
+    set_multigate_embeddings(source_rna, source_atac, teacher_source_rna_emb, teacher_source_atac_emb, key_added="MultiGATE_full_teacher")
     print("  Teacher source embeddings: shape {}".format(teacher_source_rna_emb.shape))
     
     ## (student) source inference
@@ -1915,7 +1945,7 @@ def main():
     print("  Nonspatial source embeddings: shape {}".format(nonspatial_source_rna_emb.shape))
 
     # Plot source/target concat UMAPs with the same helper as training script.
-    teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_teacher")
+    teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_full_teacher")
     source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
     nonspatial_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_nonspatial")
 
@@ -1953,22 +1983,49 @@ def main():
     teacher_source_umap_colors = ['modality', 'RNA_clusters', 'ATAC_clusters']
     fig, axs = plt.subplots(1, len(teacher_source_umap_colors), figsize=(18, 5))
     for i, color in enumerate(teacher_source_umap_colors):
-        sc.pl.umap(teacher_source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
-    plt.tight_layout(); plt.show()
+        sc.pl.umap(teacher_source_concat_adata, color=color, ncols=3, wspace=0.1, size=25, ax=axs[i], show=False)
+        axs[i].set_xlabel(''); axs[i].set_ylabel('')
+    plt.tight_layout()
+    save_figure_pdf_vector_raster(
+        fig,
+        os.path.join(
+            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+            "teacher_source_concat_umap.pdf",
+        ),
+    )
+    plt.show()
 
     # plot source UMAPs
     source_umap_colors = ['modality', 'RNA_clusters', 'ATAC_clusters']
     fig, axs = plt.subplots(1, len(source_umap_colors), figsize=(18, 5))
     for i, color in enumerate(source_umap_colors):
-        sc.pl.umap(source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
-    plt.tight_layout(); plt.show()
+        sc.pl.umap(source_concat_adata, color=color, ncols=3, wspace=0.1, size=25, ax=axs[i], show=False)
+        axs[i].set_xlabel(''); axs[i].set_ylabel('')
+    plt.tight_layout()
+    save_figure_pdf_vector_raster(
+        fig,
+        os.path.join(
+            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+            "source_concat_umap.pdf",
+        ),
+    )
+    plt.show()
 
     # plot nonspatial source UMAPs
     nonspatial_source_umap_colors = ['modality', 'RNA_clusters', 'ATAC_clusters']
     fig, axs = plt.subplots(1, len(nonspatial_source_umap_colors), figsize=(18, 5))
     for i, color in enumerate(nonspatial_source_umap_colors):
-        sc.pl.umap(nonspatial_source_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
-    plt.tight_layout(); plt.show()
+        sc.pl.umap(nonspatial_source_concat_adata, color=color, ncols=3, wspace=0.1, size=25, ax=axs[i], show=False)
+        axs[i].set_xlabel(''); axs[i].set_ylabel('')
+    plt.tight_layout()
+    save_figure_pdf_vector_raster(
+        fig,
+        os.path.join(
+            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+            "nonspatial_source_concat_umap.pdf",
+        ),
+    )
+    plt.show()
 
     if args.target_model:
 
@@ -1995,6 +2052,7 @@ def main():
         for i, color in enumerate(target_umap_colors):
             ax = axs[i]
             sc.pl.umap(target_concat_adata, color=color, size=25, ax=ax, show=False)
+            ax.set_xlabel(''); ax.set_ylabel('')
             
             # Force legend into a single column
             handles, labels = ax.get_legend_handles_labels()
@@ -2007,7 +2065,15 @@ def main():
                     ncol=1,
                     frameon=False,
                 )
-        plt.tight_layout(); plt.show()
+        plt.tight_layout()
+        save_figure_pdf_vector_raster(
+            fig,
+            os.path.join(
+                "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+                "target_test_concat_umap.pdf",
+            ),
+        )
+        plt.show()
 
     #%% Inference, all same model (except nonspatial source inference)
 
@@ -2298,7 +2364,41 @@ def main():
 
     #%% compute scib metrics for OT-aligned and nonspatial data, and plot model metrics
 
-    ## OT-aligned data
+
+    #  ── Extract logged model metrics ──────────────────────────────────────
+    model_metrics_df = extract_logged_model_metrics(client, run_id, run_name=args.run_name)
+    model_metrics_df = model_metrics_df.loc[model_metrics_df['step'].eq(model_metrics_df['step'].max())]
+    model_metrics_df.drop(columns=['run_id', 'run_name', 'timestamp', 'logged_at', 'step'], inplace=True)
+    # columns now: metric_group, domain, metric_name, value
+
+    ## scib metrics of full teacher data
+    teacher_source_scib_metrics = compute_scib_metrics_for_domain(
+        rna_adata=source_rna,
+        atac_adata=source_atac,
+        domain_name="source",
+        label_key="RNA_clusters",
+        scib_n_jobs=1,
+        embedding_key="MultiGATE_full_teacher",
+    )
+    ## scib metrics of source data
+    source_scib_metrics = compute_scib_metrics_for_domain(
+        rna_adata=source_rna,
+        atac_adata=source_atac,
+        domain_name="source",
+        label_key="RNA_clusters",
+        scib_n_jobs=1,
+        embedding_key="MultiGATE_source_aligned",
+    )
+    ## scib metrics of target data (non-OT-aligned)
+    target_scib_metrics = compute_scib_metrics_for_domain(
+        rna_adata=target_rna,
+        atac_adata=target_atac,
+        domain_name="target",
+        label_key="celltypist_predictions",
+        scib_n_jobs=1,
+        embedding_key="MultiGATE",
+    )
+    ## scib metrics of OT-aligned data
     target_ot_scib_metrics = compute_scib_metrics_for_domain(
         rna_adata=target_rna,
         atac_adata=target_atac,
@@ -2307,8 +2407,7 @@ def main():
         scib_n_jobs=1,
         embedding_key="MultiGATE_source_aligned",
     )
-
-    ## nonspatial data
+    ## scib metrics of nonspatial data
     source_nonspatial_scib_metrics = compute_scib_metrics_for_domain(
         rna_adata=source_rna,
         atac_adata=source_atac,
@@ -2329,6 +2428,9 @@ def main():
         ]
         return pd.DataFrame(rows, columns=["domain", "metric_name", "value"])
 
+    teacher_source_scib_metrics_df = _scib_metrics_to_df(teacher_source_scib_metrics, domain="teacher_source")
+    source_scib_metrics_df = _scib_metrics_to_df(source_scib_metrics, domain="source")
+    target_scib_metrics_df = _scib_metrics_to_df(target_scib_metrics, domain="target")
     target_ot_scib_metrics_df = _scib_metrics_to_df(target_ot_scib_metrics, domain="target_ot")
     source_nonspatial_scib_metrics_df = _scib_metrics_to_df(source_nonspatial_scib_metrics, domain="source_nonspatial")
 
@@ -2336,15 +2438,13 @@ def main():
     # extract_logged_model_metrics / parse_metric_domain_and_name.
     # metric_group is only present in the MLflow rows; fill NaN for the new rows.
     model_metrics_df = pd.concat(
-        [model_metrics_df, target_ot_scib_metrics_df, source_nonspatial_scib_metrics_df],
+        #[model_metrics_df, teacher_source_scib_metrics_df, target_ot_scib_metrics_df, source_nonspatial_scib_metrics_df],
+        [teacher_source_scib_metrics_df, source_scib_metrics_df, target_scib_metrics_df, target_ot_scib_metrics_df, source_nonspatial_scib_metrics_df],
         ignore_index=True,
     )
 
     model_metrics_df = model_metrics_df.loc[model_metrics_df['metric_name'].isin(['silhouette_label', 'ilisi', 'bio_conservation', 'total'])]
     model_metrics_df['metric_name'] = model_metrics_df['metric_name'].replace({'bio_conservation': 'bio_cons.', 'silhouette_label': 'silhouette'})
-    
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
 
     #ax = sns.barplot(data=model_metrics_df, y='metric_name', x='value', hue='domain', orient='h')
     #ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=1, borderaxespad=0.)
@@ -2352,13 +2452,23 @@ def main():
     #ax.set_ylabel('')
 
     ax = sns.barplot(data=model_metrics_df, y='value', x='metric_name', hue='domain', palette='Set2', orient='v')
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
     ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=2, borderaxespad=0.)
-    plt.gcf().set_size_inches(4, 5.5)
+    plt.gcf().set_size_inches(5, 7)
     ax.set_xticklabels(ax.get_xticklabels(), rotation=30)
     ax.set_xlabel(''); ax.set_ylabel('')    
     
     # Place legend on top of the plot
-    plt.tight_layout(); plt.show()
+    plt.tight_layout()
+    save_figure_pdf_vector_raster(
+        plt.gcf(),
+        os.path.join(
+            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+            "scib_metrics_barplot.pdf",
+        ),
+    )
+    plt.show()
 
 
     #%% LIANA+ inflow analysis
@@ -2566,6 +2676,7 @@ def main():
             "factor_scores": factor_scores
         }
 
+    '''
     ## map ATAC peaks to genes
     gpnet = source_atac.uns['gene_peak_Net'].copy()
     gpmap = gpnet.groupby("Gene", sort=True)["Peak"].unique()
@@ -2641,6 +2752,7 @@ def main():
     source_fusion = source_rna.copy()
     source_fusion.X = source_fusion.layers['fusion_scores'].copy()
     del source_rna.layers['fusion_scores']
+    '''
 
     ## format combined_gp_dict to adapt to LIANA+
     resource = li.rs.select_resource('mouseconsensus')
@@ -2804,29 +2916,10 @@ def main():
     import decoupler.op
     import liana as li
 
-    def rasterize_heavy_pdf_artists(fig):
-        """Rasterize dense artists while keeping text and axes vector in PDFs."""
-        for ax in fig.get_axes():
-            for artist in ax.collections:
-                artist.set_rasterized(True)
-            for artist in ax.images:
-                artist.set_rasterized(True)
-
     def save_plot_to_pdf(fig, filename, save_dir="/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis", dpi=300):
         """Save figure as a fast-rendering PDF with heavy plot layers rasterized."""
-        import logging
-        import os
-        os.makedirs(save_dir, exist_ok=True)
         filepath = os.path.join(save_dir, f"{filename}.pdf")
-        rasterize_heavy_pdf_artists(fig)
-        fonttools_logger = logging.getLogger('fontTools')
-        fonttools_level = fonttools_logger.level
-        fonttools_logger.setLevel(logging.WARNING)
-        try:
-            with plt.rc_context({'pdf.fonttype': 42, 'ps.fonttype': 42}):
-                fig.savefig(filepath, format='pdf', dpi=dpi, bbox_inches='tight')
-        finally:
-            fonttools_logger.setLevel(fonttools_level)
+        save_figure_pdf_vector_raster(fig, filepath, dpi=dpi)
         print(f"Saved: {filepath}")
         plt.close(fig)
 
