@@ -2858,7 +2858,14 @@ def main():
     topk=3
     corrs_order = pd.Series(corrs_df.apply(lambda x: corrs_df.index[np.argsort(x)[:topk]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values.tolist()
     corr_top = corrs_df.loc[corrs_order]
-    cg = sns.clustermap(corr_top, cmap='coolwarm', center=0.0, vmax=0.4, figsize=(6, 4))
+    cg = sns.clustermap(
+        corr_top,
+        cmap='coolwarm',
+        center=0.0,
+        figsize=(7, 4),
+        cbar_kws={'orientation': 'horizontal'},
+        cbar_pos=(0.25, 1.05, 0.55, 0.03),
+    )
     cg.ax_heatmap.set_xlabel('MultiGATE dimensions')
     plt.show()
 
