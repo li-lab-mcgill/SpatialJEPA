@@ -179,6 +179,7 @@ import ot
 
 import MultiGATE
 from MultiGATE.model_MultiGATE import MGATE
+from evals_utils import foscttm_moscot
 
 print("Using MultiGATE module:", MultiGATE.__file__)
 
@@ -2377,6 +2378,63 @@ def main():
     model_metrics_df.drop(columns=['run_id', 'run_name', 'timestamp', 'logged_at', 'step'], inplace=True)
     # columns now: metric_group, domain, metric_name, value
 
+    ## calculate FOSCTTM scores
+    def _mean_foscttm_for_embedding(rna_adata, atac_adata, embedding_key, domain):
+        if rna_adata.n_obs != atac_adata.n_obs:
+            raise ValueError(
+                "FOSCTTM for domain '{}' requires paired RNA/ATAC rows; "
+                "got {} RNA cells and {} ATAC cells.".format(
+                    domain,
+                    rna_adata.n_obs,
+                    atac_adata.n_obs,
+                )
+            )
+        missing_keys = [
+            label
+            for label, adata in (("RNA", rna_adata), ("ATAC", atac_adata))
+            if embedding_key not in adata.obsm
+        ]
+        if missing_keys:
+            raise KeyError(
+                "Missing obsm['{}'] for {} in domain '{}'.".format(
+                    embedding_key,
+                    "/".join(missing_keys),
+                    domain,
+                )
+            )
+        foscttm_full = foscttm_moscot(
+            np.asarray(rna_adata.obsm[embedding_key]),
+            np.asarray(atac_adata.obsm[embedding_key]),
+        )
+        return float(np.asarray(foscttm_full).mean())
+
+    foscttm_metric_specs = [
+        ("teacher_source", source_rna, source_atac, "MultiGATE_full_teacher"),
+        ("source", source_rna, source_atac, "MultiGATE_source_aligned"),
+        ("target", target_rna, target_atac, "MultiGATE"),
+        ("target_ot", target_rna, target_atac, "MultiGATE_source_aligned"),
+        ("source_nonspatial", source_rna, source_atac, "MultiGATE_nonspatial"),
+    ]
+    foscttm_metrics_df = pd.DataFrame(
+        [
+            {
+                "domain": domain,
+                "metric_name": "foscttm",
+                "value": _mean_foscttm_for_embedding(
+                    rna_adata,
+                    atac_adata,
+                    embedding_key,
+                    domain,
+                ),
+            }
+            for domain, rna_adata, atac_adata, embedding_key in foscttm_metric_specs
+        ],
+        columns=["domain", "metric_name", "value"],
+    )
+
+    ## convert FOSCTTM scores to 1 - FOSCTTM, such that the higher the better
+    foscttm_metrics_df['value'] = 1 - foscttm_metrics_df['value']
+
     ## scib metrics of full teacher data
     teacher_source_scib_metrics = compute_scib_metrics_for_domain(
         rna_adata=source_rna,
@@ -2445,28 +2503,63 @@ def main():
     # metric_group is only present in the MLflow rows; fill NaN for the new rows.
     model_metrics_df = pd.concat(
         #[model_metrics_df, teacher_source_scib_metrics_df, target_ot_scib_metrics_df, source_nonspatial_scib_metrics_df],
-        [teacher_source_scib_metrics_df, source_scib_metrics_df, target_scib_metrics_df, target_ot_scib_metrics_df, source_nonspatial_scib_metrics_df],
+        [
+            teacher_source_scib_metrics_df,
+            source_scib_metrics_df,
+            target_scib_metrics_df,
+            target_ot_scib_metrics_df,
+            source_nonspatial_scib_metrics_df,
+            foscttm_metrics_df,
+        ],
         ignore_index=True,
     )
 
-    model_metrics_df = model_metrics_df.loc[model_metrics_df['metric_name'].isin(['silhouette_label', 'ilisi', 'bio_conservation', 'total'])]
-    model_metrics_df['metric_name'] = model_metrics_df['metric_name'].replace({'bio_conservation': 'bio_cons.', 'silhouette_label': 'silhouette'})
+    model_metrics_df = model_metrics_df.loc[model_metrics_df['metric_name'].isin(['foscttm', 'ilisi', 'bio_conservation', 'total'])]
+    model_metrics_df['metric_name'] = model_metrics_df['metric_name'].replace({
+        'bio_conservation': 'bio_cons.',
+        'foscttm': '1-FOSCTTM',
+        'ilisi': 'iLISI',
+    })
+    metric_sort_order = ['1-FOSCTTM', 'iLISI', 'bio_cons.', 'total']
+    model_metrics_df = model_metrics_df.set_index('metric_name').loc[metric_sort_order].reset_index()
 
     #ax = sns.barplot(data=model_metrics_df, y='metric_name', x='value', hue='domain', orient='h')
     #ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=1, borderaxespad=0.)
     #plt.gcf().set_size_inches(4, 5)
     #ax.set_ylabel('')
 
-    ax = sns.barplot(data=model_metrics_df, y='value', x='metric_name', hue='domain', palette='Set2', orient='v')
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=2, borderaxespad=0.)
-    plt.gcf().set_size_inches(5, 7)
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=30)
-    ax.set_xlabel(''); ax.set_ylabel('')    
+    g = sns.catplot(
+        data=model_metrics_df, y='value', x='metric_name', hue='domain', palette='Set2', col='metric_name',
+        col_wrap=2, kind="bar", height=4, aspect=.6, sharey=False, sharex=False, legend=False
+    )
+    g.set_titles("")
+    g.set(xlabel="", ylabel="")
+    for ax in g.axes.flat:
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
+        # Add a light gray frame around each bar
+        for patch in ax.patches:
+            patch.set_edgecolor('#cccccc')  # light gray
+            patch.set_linewidth(1)
+        # Adjust y-axis limits to better capture the range of values
+        bars = [p.get_height() for p in ax.patches if p.get_height() > 0]
+        if bars:
+            min_val = min(bars)
+            max_val = max(bars)
+            margin = (max_val - min_val) * 0.2
+            if margin == 0:
+                margin = min_val * 0.1
+            ax.set_ylim(
+                bottom=max(0, min_val - margin),
+                top=max_val + margin,
+            )
     
-    # Place legend on top of the plot
+    handles, labels = g.axes.flat[0].get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    g.fig.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=2, borderaxespad=0.)
+    g.fig.set_size_inches(6, 4.5)
     plt.tight_layout()
+
+    # Place legend on top of the plot
     save_figure_pdf_vector_raster(
         plt.gcf(),
         os.path.join(

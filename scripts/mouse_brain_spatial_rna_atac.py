@@ -1418,7 +1418,7 @@ def compute_scib_metrics_for_domain(
         embedding_obsm_keys=["multigate_latent"],
         bio_conservation_metrics=BioConservation(
             isolated_labels=False,
-            nmi_ari_cluster_labels_leiden=False,
+            nmi_ari_cluster_labels_leiden=True,
             nmi_ari_cluster_labels_kmeans=False,
             silhouette_label=True,
             clisi_knn=False,
