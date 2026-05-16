@@ -3009,6 +3009,33 @@ def main():
         n_components=9, basis='spatial', weights_plot_type='staircase', top_n_genes=5, heatmap_cmap='YlGn',
         censor_gene_from_plot=None
     ):
+        def join_obs_preserving_n_obs(base_obs, values_df):
+            base_obs = base_obs.copy()
+            values_df = values_df.copy()
+
+            overlapping_cols = base_obs.columns.intersection(values_df.columns)
+            if len(overlapping_cols) > 0:
+                base_obs = base_obs.drop(columns=overlapping_cols)
+
+            if base_obs.index.equals(values_df.index) and len(base_obs) == len(values_df):
+                for col in values_df.columns:
+                    base_obs[col] = values_df[col].to_numpy()
+                return base_obs
+
+            if not values_df.index.is_unique:
+                values_df = values_df[~values_df.index.duplicated(keep='first')]
+
+            for col in values_df.columns:
+                base_obs[col] = base_obs.index.map(values_df[col])
+            return base_obs
+
+        def copy_full_obsm(full_adata):
+            return {
+                key: value.copy()
+                for key, value in full_adata.obsm.items()
+                if len(value) == full_adata.n_obs
+            }
+
         # X = pathway_embedding_results['source_rna'].pathway_scores.to_numpy()
         X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
         Z = adata.obsm['MultiGATE_source_aligned'].copy()
@@ -3023,18 +3050,18 @@ def main():
 
         if full_adata is not None:
             # Reindex onto the full cell set; cells filtered out get NaN and are
-            # rendered as na_color ('lightgray') to form a spatial background.
-            full_obs = full_adata.obs.copy().join(pls_df, how='left')
+            # rendered as na_color ('darkgray') to form a spatial background.
+            full_obs = join_obs_preserving_n_obs(full_adata.obs, pls_df)
             adata_pls = sc.AnnData(
                 X=np.zeros((full_adata.n_obs, 1)),
                 obs=full_obs,
-                obsm={'spatial': full_adata.obsm['spatial'].copy()},
+                obsm=copy_full_obsm(full_adata),
             )
         else:
             adata_pls = adata.copy()
-            adata_pls.obs = adata_pls.obs.merge(pls_df, left_index=True, right_index=True)
+            adata_pls.obs = join_obs_preserving_n_obs(adata_pls.obs, pls_df)
 
-        if 'X_umap' in adata.obsm and 'leiden' in adata.obs:
+        if 'X_umap' in adata_pls.obsm and 'leiden' in adata_pls.obs:
             sc.pl.umap(adata_pls, color='leiden', size=25, show=False)
             if umap_title is not None:
                 plt.gca().set_title(umap_title)
@@ -3131,6 +3158,58 @@ def main():
 
         return pls, pls_coef_df, pls_coef_df_sorted
 
+    def get_liana_lrdata(adata, cell_type_col, lr_pairs):
+
+        adata.X = adata.layers["SCT_data"].copy()
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+
+        li.ut.spatial_neighbors(adata=adata, bandwidth=40, spatial_key='spatial')
+        sq.gr.spatial_autocorr(adata, mode='moran', use_raw=False, show_progress_bar=True)
+        svgs = adata.uns['moranI'].index[(adata.uns['moranI']['pval_norm_fdr_bh'] < 0.05) & (adata.uns['moranI']['I'] > 0.01)]
+        adata = adata[:, svgs]
+
+        lrdata = li.mt.inflow(
+            adata,
+            groupby=cell_type_col,
+            resource = lr_pairs,
+            use_raw=False,
+        )
+        lrdata.var['interaction'] = lrdata.var_names.str.split('^').to_series().apply(lambda x: f'{x[1]}^{x[2]}').values
+        return lrdata
+
+    def build_lrdata_aggregated_by_genesets(lrdata, unique_geneset_per_lr, umap_title=None, save_plots=False, plot_prefix=''):
+        """Aggregate LIANA inflow by hallmark geneset; mutates lrdata.var with geneset columns."""
+        lrdata.var = lrdata.var.merge(
+            unique_geneset_per_lr, left_on='interaction', right_index=True, how='left'
+        )
+        geneset_cols = unique_geneset_per_lr.columns
+        geneset_cols = list(geneset_cols[geneset_cols.isin(lrdata.var.columns)])
+        liana_by_geneset = lrdata.var[geneset_cols].fillna(0)
+        if not liana_by_geneset.values.any():
+            print('No expression in LIANA genesets, returning None')
+            return None
+
+        X_genesets = lrdata.X @ sp.csr_matrix(liana_by_geneset.values)
+        lrdata_genesets = sc.AnnData(
+            X=X_genesets,
+            obs=lrdata.obs,
+            var=pd.DataFrame(index=liana_by_geneset.columns),
+            obsm={'spatial': lrdata.obsm['spatial'].copy()},
+        )
+        sc.pp.filter_cells(lrdata_genesets, min_genes=3)
+        sc.pp.filter_genes(lrdata_genesets, min_cells=2)
+
+        sc.pp.neighbors(lrdata_genesets, use_rep='X', metric='cosine')
+        sc.tl.umap(lrdata_genesets)
+        sc.tl.leiden(lrdata_genesets, resolution=0.03)
+
+        lrdata_genesets.obsm['MultiGATE_source_aligned'] = lrdata[
+            lrdata_genesets.obs_names
+        ].obsm['MultiGATE_source_aligned'].copy()
+        lrdata_genesets.obsm['spatial'] = lrdata[lrdata_genesets.obs_names].obsm['spatial'].copy()
+        return lrdata_genesets
+
     ## train PLS models on source and target data
     pls_source_rna, pls_source_rna_coef_df, _ = run_pls_embedding_to_gene_plots(source_rna, save_plots=False, plot_prefix='01_source_rna_pls')
     pls_target_rna, pls_target_rna_coef_df, _ = run_pls_embedding_to_gene_plots(target_rna, save_plots=False, plot_prefix='02_target_rna_pls', censor_gene_from_plot=['C530008M17Rik'])
@@ -3155,26 +3234,6 @@ def main():
     fig.tight_layout()
     plt.show()
     save_plot_to_pdf(fig, '11_pls_source_target_correlation_heatmaps')
-
-    def get_liana_lrdata(adata, cell_type_col, lr_pairs):
-
-        adata.X = adata.layers["SCT_data"].copy()
-        sc.pp.normalize_total(adata, target_sum=1e4)
-        sc.pp.log1p(adata)
-
-        li.ut.spatial_neighbors(adata=adata, bandwidth=40, spatial_key='spatial')
-        sq.gr.spatial_autocorr(adata, mode='moran', use_raw=False, show_progress_bar=True)
-        svgs = adata.uns['moranI'].index[(adata.uns['moranI']['pval_norm_fdr_bh'] < 0.05) & (adata.uns['moranI']['I'] > 0.01)]
-        adata = adata[:, svgs]
-
-        lrdata = li.mt.inflow(
-            adata,
-            groupby=cell_type_col,
-            resource = lr_pairs,
-            use_raw=False,
-        )
-        lrdata.var['interaction'] = lrdata.var_names.str.split('^').to_series().apply(lambda x: f'{x[1]}^{x[2]}').values
-        return lrdata
 
     ## build shared Hallmark mouse net once
     hallmark_human = dc.op.hallmark(organism="human")
@@ -3208,56 +3267,24 @@ def main():
     pls_source_rna_liana, pls_source_rna_liana_coef_df, _ = run_pls_embedding_to_gene_plots(lrdata_source_rna, save_plots=True, plot_prefix='05_source_rna_liana_pls')
     pls_target_rna_liana, pls_target_rna_liana_coef_df, _ = run_pls_embedding_to_gene_plots(lrdata_target_rna, save_plots=True, plot_prefix='06_target_rna_liana_pls')
 
-    def build_lrdata_aggregated_by_genesets(lrdata, unique_geneset_per_lr, umap_title=None, save_plots=False, plot_prefix=''):
-        """Aggregate LIANA inflow by hallmark geneset; mutates lrdata.var with geneset columns."""
-        lrdata.var = lrdata.var.merge(
-            unique_geneset_per_lr, left_on='interaction', right_index=True, how='left'
-        )
-        geneset_cols = unique_geneset_per_lr.columns
-        geneset_cols = list(geneset_cols[geneset_cols.isin(lrdata.var.columns)])
-        liana_by_geneset = lrdata.var[geneset_cols].fillna(0)
-        if not liana_by_geneset.values.any():
-            print('No expression in LIANA genesets, returning None')
-            return None
-        
-        X_genesets = lrdata.X @ sp.csr_matrix(liana_by_geneset.values)
-        lrdata_genesets = sc.AnnData(
-            X=X_genesets,
-            obs=lrdata.obs,
-            var=pd.DataFrame(index=liana_by_geneset.columns),
-            obsm={'spatial': lrdata.obsm['spatial'].copy()},
-        )
-        sc.pp.filter_cells(lrdata_genesets, min_genes=3)
-        sc.pp.filter_genes(lrdata_genesets, min_cells=2)
-
-        sc.pp.neighbors(lrdata_genesets, use_rep='X', metric='cosine')
-        sc.tl.umap(lrdata_genesets)
-        sc.tl.leiden(lrdata_genesets, resolution=0.03)
-
-        lrdata_genesets.obsm['MultiGATE_source_aligned'] = lrdata[
-            lrdata_genesets.obs_names
-        ].obsm['MultiGATE_source_aligned'].copy()
-        lrdata_genesets.obsm['spatial'] = lrdata[lrdata_genesets.obs_names].obsm['spatial'].copy()
-        return lrdata_genesets
-
     unique_geneset_per_lr = lr_geneset.groupby('interaction')['source'].unique().map(list).rename('genesets')
     unique_geneset_per_lr = unique_geneset_per_lr.explode().str.get_dummies().groupby(level=0).max()
 
     # Capture full spatial layout before filter_cells removes any cells, so
     # filtered-out cells can be rendered as a gray background in spatial plots.
-    full_spatial_obsm_df_source = sc.AnnData(
-        X=np.zeros((lrdata_source_rna.n_obs, 1)),
-        obs=lrdata_source_rna.obs.copy(),
-        obsm={'spatial': lrdata_source_rna.obsm['spatial'].copy()},
-    )
-    full_spatial_obsm_df_target = sc.AnnData(
-        X=np.zeros((lrdata_target_rna.n_obs, 1)),
-        obs=lrdata_target_rna.obs.copy(),
-        obsm={
-            'spatial': lrdata_target_rna.obsm['spatial'].copy(),
-            'X_umap': lrdata_target_rna.obsm['X_umap'].copy(),
-        },
-    )
+    def make_full_pls_plot_reference(adata):
+        return sc.AnnData(
+            X=np.zeros((adata.n_obs, 1)),
+            obs=adata.obs.copy(),
+            obsm={
+                key: adata.obsm[key].copy()
+                for key in ['spatial', 'X_umap']
+                if key in adata.obsm
+            },
+        )
+
+    full_spatial_obsm_df_source = make_full_pls_plot_reference(lrdata_source_rna)
+    full_spatial_obsm_df_target = make_full_pls_plot_reference(lrdata_target_rna)
 
     lrdata_source_rna_genesets = build_lrdata_aggregated_by_genesets(
         lrdata_source_rna, unique_geneset_per_lr
@@ -3269,7 +3296,7 @@ def main():
     if lrdata_source_rna_genesets is not None:
         pls_lrdata_source_rna_genesets, _, _ = run_pls_embedding_to_gene_plots(
             lrdata_source_rna_genesets,
-            None, # full_spatial_obsm_df_source,
+            full_spatial_obsm_df_source,
             umap_title='source RNA LIANA (geneset aggregate)',
             umap_plot_prefix='07_source_rna_liana_geneset',
             weights_plot_type='barplot',
@@ -3279,7 +3306,7 @@ def main():
     if lrdata_target_rna_genesets is not None:
         pls_lrdata_target_rna_genesets, _, _ = run_pls_embedding_to_gene_plots(
             lrdata_target_rna_genesets,
-            None, # full_spatial_obsm_df_target,
+            full_spatial_obsm_df_target,
             umap_title='target RNA LIANA (geneset aggregate)',
             umap_plot_prefix='08_target_rna_liana_geneset',
             weights_plot_type='barplot',
