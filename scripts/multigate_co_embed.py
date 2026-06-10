@@ -2369,6 +2369,24 @@ def main():
     #target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
     #target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
 
+    #%% load multivi data
+    import muon as mu
+    mdata = mu.read_h5mu(os.path.join(base_path, 'multivi_mdata.h5mu'))
+    mdata.mod['rna'].obsm['X_multivi'] = mdata.mod['rna'].obsm['X_multivi_rna']
+    mdata.mod['atac'].obsm['X_multivi'] = mdata.mod['atac'].obsm['X_multivi_atac']
+    mdata.update()
+
+    target_mdata = mu.read_h5mu(os.path.join(base_path, 'multivi_mdata_target.h5mu'))
+    target_mdata.mod['rna'].obsm['X_multivi'] = target_mdata.mod['rna'].obsm['X_multivi_rna']
+    target_mdata.mod['atac'].obsm['X_multivi'] = target_mdata.mod['atac'].obsm['X_multivi_atac']
+
+    # load zero-shot multivi data, but copy embeddings to non-zero-shot adata (will remove reliance on zero-shot adata)
+    target_mdata_zero_shot = mu.read_h5mu(os.path.join(base_path, 'multivi_mdata_zero_shot.h5mu'))
+    target_mdata.mod['rna'].obsm['X_multivi_zero_shot'] = target_mdata_zero_shot.mod['rna'].obsm['X_multivi_rna_zero_shot']
+    target_mdata.mod['atac'].obsm['X_multivi_zero_shot'] = target_mdata_zero_shot.mod['atac'].obsm['X_multivi_atac_zero_shot']
+    target_mdata.update()
+    del target_mdata_zero_shot
+
     #%% compute scib metrics for OT-aligned and nonspatial data, and plot model metrics
 
     '''
@@ -2416,6 +2434,8 @@ def main():
         ("target_ot", target_rna, target_atac, "MultiGATE_source_aligned"),
         ("source_nonspatial", source_rna, source_atac, "MultiGATE_nonspatial"),
         ("source_multivi", mdata.mod['rna'], mdata.mod['atac'], "X_multivi"),
+        ("target_multivi", target_mdata.mod['rna'], target_mdata.mod['atac'], "X_multivi"),
+        ("target_multivi_zero_shot", target_mdata.mod['rna'], target_mdata.mod['atac'], "X_multivi_zero_shot"),
     ]
     foscttm_metrics_df = pd.DataFrame(
         [
@@ -2437,12 +2457,22 @@ def main():
     ## convert FOSCTTM scores to 1 - FOSCTTM, such that the higher the better
     foscttm_metrics_df['value'] = 1 - foscttm_metrics_df['value']
 
+    ## set label keys for source and target data
+    source_label_key = {
+        "rna": "RNA_clusters",
+        "atac": "ATAC_clusters",
+    }
+    target_label_key = {
+        "rna": "arc_gex_graphclust_Cluster",
+        "atac": "arc_atac_graphclust_Cluster",
+    }
+
     ## scib metrics of full teacher data
     teacher_source_scib_metrics = compute_scib_metrics_for_domain(
         rna_adata=source_rna,
         atac_adata=source_atac,
         domain_name="source",
-        label_key="RNA_clusters",
+        label_key=source_label_key,
         scib_n_jobs=1,
         embedding_key="MultiGATE_full_teacher",
     )
@@ -2451,7 +2481,7 @@ def main():
         rna_adata=source_rna,
         atac_adata=source_atac,
         domain_name="source",
-        label_key="RNA_clusters",
+        label_key=source_label_key,
         scib_n_jobs=1,
         embedding_key="MultiGATE_source_aligned",
     )
@@ -2460,7 +2490,7 @@ def main():
         rna_adata=target_rna,
         atac_adata=target_atac,
         domain_name="target",
-        label_key="celltypist_predictions",
+        label_key=target_label_key,
         scib_n_jobs=1,
         embedding_key="MultiGATE",
     )
@@ -2469,7 +2499,7 @@ def main():
         rna_adata=target_rna,
         atac_adata=target_atac,
         domain_name="target",
-        label_key="celltypist_predictions",
+        label_key=target_label_key,
         scib_n_jobs=1,
         embedding_key="MultiGATE_source_aligned",
     )
@@ -2478,24 +2508,35 @@ def main():
         rna_adata=source_rna,
         atac_adata=source_atac,
         domain_name="source",
-        label_key="RNA_clusters",
+        label_key=source_label_key,
         scib_n_jobs=1,
         embedding_key="MultiGATE_nonspatial",
     )
     ## scib metrics of multivi data
-    import muon as mu
-    mdata = mu.read_h5mu(os.path.join(base_path, 'multivi_mdata.h5mu'))
-    mdata.mod['rna'].obsm['X_multivi'] = mdata.mod['rna'].obsm['X_multivi_rna']
-    mdata.mod['atac'].obsm['X_multivi'] = mdata.mod['atac'].obsm['X_multivi_atac']
-    mdata.update()
-
     source_multivi_scib_metrics = compute_scib_metrics_for_domain(
         rna_adata=mdata.mod['rna'],
         atac_adata=mdata.mod['atac'],
         domain_name="source",
-        label_key="RNA_clusters",
+        label_key=source_label_key,
         scib_n_jobs=1,
         embedding_key="X_multivi",
+    )
+    target_multivi_scib_metrics = compute_scib_metrics_for_domain(
+        rna_adata=target_mdata.mod['rna'],
+        atac_adata=target_mdata.mod['atac'],
+        domain_name="target",
+        label_key=target_label_key,
+        scib_n_jobs=1,
+        embedding_key="X_multivi",
+    )
+
+    target_multivi_zero_shot_scib_metrics = compute_scib_metrics_for_domain(
+        rna_adata=target_mdata.mod['rna'],
+        atac_adata=target_mdata.mod['atac'],
+        domain_name="target",
+        label_key=target_label_key,
+        scib_n_jobs=1,
+        embedding_key="X_multivi_zero_shot",
     )
 
     ## build tidy DataFrames for freshly computed scib metrics
@@ -2515,6 +2556,8 @@ def main():
     target_ot_scib_metrics_df = _scib_metrics_to_df(target_ot_scib_metrics, domain="target_ot")
     source_nonspatial_scib_metrics_df = _scib_metrics_to_df(source_nonspatial_scib_metrics, domain="source_nonspatial")
     source_multivi_scib_metrics_df = _scib_metrics_to_df(source_multivi_scib_metrics, domain="source_multivi")
+    target_multivi_scib_metrics_df = _scib_metrics_to_df(target_multivi_scib_metrics, domain="target_multivi")
+    target_multivi_zero_shot_scib_metrics_df = _scib_metrics_to_df(target_multivi_zero_shot_scib_metrics, domain="target_multivi_zero_shot")
 
     # model_metrics_df already has 'domain' and 'metric_name' (stripped) from
     # extract_logged_model_metrics / parse_metric_domain_and_name.
@@ -2528,6 +2571,8 @@ def main():
             target_ot_scib_metrics_df,
             source_nonspatial_scib_metrics_df,
             source_multivi_scib_metrics_df,
+            target_multivi_scib_metrics_df,
+            target_multivi_zero_shot_scib_metrics_df,
             foscttm_metrics_df,
         ],
         ignore_index=True,

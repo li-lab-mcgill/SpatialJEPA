@@ -1364,27 +1364,49 @@ def require_scib_backend():
 
 
 def resolve_scib_labels(rna_adata, atac_adata, concat_adata, label_key, domain_name):
-    if label_key is not None:
-        if label_key in rna_adata.obs.columns and label_key in atac_adata.obs.columns:
-            if label_key not in concat_adata.obs.columns:
-                raise KeyError(
-                    "Label key '{}' missing in concatenated obs for {} domain.".format(label_key, domain_name)
-                )
-            return label_key, "provided"
-        warnings.warn(
-            "Requested label key '{}' for {} not found in both RNA and ATAC obs. "
-            "Falling back to pseudo labels.".format(label_key, domain_name)
+    if label_key is None:
+        raise ValueError(
+            "label_key must be provided for {} domain scIB computation.".format(domain_name)
         )
 
-    sc.pp.neighbors(concat_adata, use_rep="X", n_neighbors=15, key_added="scib_eval")
-    sc.tl.leiden(
-        concat_adata,
-        neighbors_key="scib_eval",
-        key_added="scib_pseudo_leiden",
-        resolution=1.5,
-        random_state=0,
-    )
-    return "scib_pseudo_leiden", "pseudo_leiden"
+    if isinstance(label_key, dict):
+        rna_key = label_key.get("rna")
+        atac_key = label_key.get("atac")
+        if rna_key is None or atac_key is None:
+            raise ValueError(
+                "When label_key is a dict, both 'rna' and 'atac' keys must be provided."
+            )
+        if rna_key not in rna_adata.obs.columns:
+            raise KeyError(
+                "RNA label key '{}' not found in RNA obs for {} domain.".format(rna_key, domain_name)
+            )
+        if atac_key not in atac_adata.obs.columns:
+            raise KeyError(
+                "ATAC label key '{}' not found in ATAC obs for {} domain.".format(atac_key, domain_name)
+            )
+        unified_key = "_scib_label"
+        concat_adata.obs[unified_key] = concat_adata.obs.apply(
+            lambda row: row[rna_key] if row["modality"] == "rna" else row[atac_key],
+            axis=1,
+        )
+        return unified_key, "provided_per_modality"
+
+    missing = [
+        modality
+        for modality, adata in (("RNA", rna_adata), ("ATAC", atac_adata))
+        if label_key not in adata.obs.columns
+    ]
+    if missing:
+        raise KeyError(
+            "Label key '{}' not found in {} obs for {} domain.".format(
+                label_key, " and ".join(missing), domain_name
+            )
+        )
+    if label_key not in concat_adata.obs.columns:
+        raise KeyError(
+            "Label key '{}' missing in concatenated obs for {} domain.".format(label_key, domain_name)
+        )
+    return label_key, "provided"
 
 
 def compute_scib_metrics_for_domain(
