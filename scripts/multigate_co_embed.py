@@ -2371,12 +2371,13 @@ def main():
 
     #%% compute scib metrics for OT-aligned and nonspatial data, and plot model metrics
 
-
+    '''
     #  ── Extract logged model metrics ──────────────────────────────────────
     model_metrics_df = extract_logged_model_metrics(client, run_id, run_name=args.run_name)
     model_metrics_df = model_metrics_df.loc[model_metrics_df['step'].eq(model_metrics_df['step'].max())]
     model_metrics_df.drop(columns=['run_id', 'run_name', 'timestamp', 'logged_at', 'step'], inplace=True)
     # columns now: metric_group, domain, metric_name, value
+    '''
 
     ## calculate FOSCTTM scores
     def _mean_foscttm_for_embedding(rna_adata, atac_adata, embedding_key, domain):
@@ -2414,6 +2415,7 @@ def main():
         ("target", target_rna, target_atac, "MultiGATE"),
         ("target_ot", target_rna, target_atac, "MultiGATE_source_aligned"),
         ("source_nonspatial", source_rna, source_atac, "MultiGATE_nonspatial"),
+        ("source_multivi", mdata.mod['rna'], mdata.mod['atac'], "X_multivi"),
     ]
     foscttm_metrics_df = pd.DataFrame(
         [
@@ -2480,6 +2482,21 @@ def main():
         scib_n_jobs=1,
         embedding_key="MultiGATE_nonspatial",
     )
+    ## scib metrics of multivi data
+    import muon as mu
+    mdata = mu.read_h5mu(os.path.join(base_path, 'multivi_mdata.h5mu'))
+    mdata.mod['rna'].obsm['X_multivi'] = mdata.mod['rna'].obsm['X_multivi_rna']
+    mdata.mod['atac'].obsm['X_multivi'] = mdata.mod['atac'].obsm['X_multivi_atac']
+    mdata.update()
+
+    source_multivi_scib_metrics = compute_scib_metrics_for_domain(
+        rna_adata=mdata.mod['rna'],
+        atac_adata=mdata.mod['atac'],
+        domain_name="source",
+        label_key="RNA_clusters",
+        scib_n_jobs=1,
+        embedding_key="X_multivi",
+    )
 
     ## build tidy DataFrames for freshly computed scib metrics
     _SCIB_NUMERIC_KEYS = {"silhouette_label", "ilisi", "bras", "bio_conservation", "batch_correction", "total"}
@@ -2497,6 +2514,7 @@ def main():
     target_scib_metrics_df = _scib_metrics_to_df(target_scib_metrics, domain="target")
     target_ot_scib_metrics_df = _scib_metrics_to_df(target_ot_scib_metrics, domain="target_ot")
     source_nonspatial_scib_metrics_df = _scib_metrics_to_df(source_nonspatial_scib_metrics, domain="source_nonspatial")
+    source_multivi_scib_metrics_df = _scib_metrics_to_df(source_multivi_scib_metrics, domain="source_multivi")
 
     # model_metrics_df already has 'domain' and 'metric_name' (stripped) from
     # extract_logged_model_metrics / parse_metric_domain_and_name.
@@ -2509,6 +2527,7 @@ def main():
             target_scib_metrics_df,
             target_ot_scib_metrics_df,
             source_nonspatial_scib_metrics_df,
+            source_multivi_scib_metrics_df,
             foscttm_metrics_df,
         ],
         ignore_index=True,
