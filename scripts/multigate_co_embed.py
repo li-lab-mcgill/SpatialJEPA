@@ -2916,7 +2916,9 @@ def main():
     resource = li.rs.select_resource('mouseconsensus')
 
     ## ingest RNA_cluster assign RNA_clusters to target_rna
+    print("Ingesting RNA_clusters to target_rna...")
     sc.tl.ingest(target_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters', inplace=True)
+    print("RNA_clusters ingested to target_rna")
 
     ingested_rna_clusters = target_concat_adata.obs.loc[
         target_concat_adata.obs['modality'].eq('rna'), 'RNA_clusters'
@@ -2987,7 +2989,7 @@ def main():
     ## compare ARI between NMF leiden and source, target and nonspatial-source leiden
     from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
-    ## teacher source ARI
+    ## teacher source
     nmf = source_liana_results['nmf'].copy()
     teacher_source_leiden = teacher_source_concat_adata[
             teacher_source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
@@ -3002,7 +3004,7 @@ def main():
     print(f'Adjusted Rand Score: {teacher_source_ari:.2f}')
     print(f'Normalized Mutual Information Score: {teacher_source_nmi:.2f}')
 
-    ## source ARI
+    ## source
     nmf = source_liana_results['nmf'].copy()
     source_leiden = source_concat_adata[
             source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
@@ -3017,7 +3019,7 @@ def main():
     print(f'Adjusted Rand Score: {source_ari:.2f}')
     print(f'Normalized Mutual Information Score: {source_nmi:.2f}')
 
-    ## target ARI
+    ## target
     nmf = target_liana_results['nmf'].copy()
     adata = target_liana_results['adata'].copy()
     nmf_spatial = target_liana_results['nmf_spatial'].copy()
@@ -3062,7 +3064,7 @@ def main():
     print(f'Adjusted Rand Score: {target_ari:.2f}')
     print(f'Normalized Mutual Information Score: {target_nmi:.2f}')
 
-    ## nonspatial source ARI
+    ## nonspatial source
     nmf = source_liana_results['nmf'].copy()
     nonspatial_source_leiden = nonspatial_source_concat_adata[
             nonspatial_source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
@@ -3077,7 +3079,7 @@ def main():
     print(f'Adjusted Rand Score: {nonspatial_source_ari:.2f}')
     print(f'Normalized Mutual Information Score: {nonspatial_source_nmi:.2f}')
 
-    ## ingested nonspatial source ARI
+    ## ingested nonspatial source
     ingested_nonspatial_source_concat_adata = sc.tl.ingest(nonspatial_source_concat_adata, source_concat_adata, embedding_method='umap', obs='leiden', inplace=False)
     nmf = source_liana_results['nmf'].copy()
     nonspatial_source_leiden = ingested_nonspatial_source_concat_adata[
@@ -3093,11 +3095,23 @@ def main():
     print(f'Adjusted Rand Score: {ingested_nonspatial_source_ari:.2f}')
     print(f'Normalized Mutual Information Score: {ingested_nonspatial_source_nmi:.2f}')
 
+    ## multivi source
+    nmf = source_liana_results['nmf'].copy()
+    multivi_source_leiden = mdata.mod['rna'].obs['RNA_clusters']
+    multivi_source_leiden.index = multivi_source_leiden.index.str.split("_").str[0]
+    multivi_source_leiden = multivi_source_leiden.loc[nmf.obs_names]
+    nmf_leiden = nmf.obs['leiden']
+    assert multivi_source_leiden.index.equals(nmf_leiden.index)
+    multivi_source_ari = adjusted_rand_score(multivi_source_leiden, nmf_leiden)
+    multivi_source_nmi = normalized_mutual_info_score(multivi_source_leiden, nmf_leiden)
+    print(f'Adjusted Rand Score: {multivi_source_ari:.2f}')
+    print(f'Normalized Mutual Information Score: {multivi_source_nmi:.2f}')
+
     ## compare ARI and NMI between source, target and nonspatial-source
     ari_nmi_df = pd.DataFrame({
-        'ARI': [teacher_source_ari, source_ari, target_ari, nonspatial_source_ari, ingested_nonspatial_source_ari],
-        'NMI': [teacher_source_nmi, source_nmi, target_nmi, nonspatial_source_nmi, ingested_nonspatial_source_nmi]
-    }, index=['Teach. Source', 'Source', 'Target', 'Nsp Source', 'Nsp Source$^\dagger$'])
+        'ARI': [teacher_source_ari, source_ari, target_ari, nonspatial_source_ari, ingested_nonspatial_source_ari, multivi_source_ari],
+        'NMI': [teacher_source_nmi, source_nmi, target_nmi, nonspatial_source_nmi, ingested_nonspatial_source_nmi, multivi_source_nmi]
+    }, index=['Teach. Source', 'Source', 'Target', 'Nsp Source', 'Nsp Source$^\dagger$', 'MultiVI Source'])
     ari_nmi_df.plot(kind='bar', rot=30, cmap='Set2', figsize=(5, 2.5)); plt.show()
 
     ## plot UMAP of source, target, nonspatial-source and ingested nonspatial-source
