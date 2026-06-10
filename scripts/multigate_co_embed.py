@@ -3152,11 +3152,83 @@ def main():
     print(f'Adjusted Rand Score: {multivi_source_ari:.2f}')
     print(f'Normalized Mutual Information Score: {multivi_source_nmi:.2f}')
 
+    def _align_target_series_to_nmf(series, nmf):
+        series = series.copy()
+        series.index = series.index.str.split("_").str[0]
+
+        duplicated = series.index[series.index.duplicated(keep=False)]
+        if len(duplicated) > 0:
+            duplicate_mask = series.index.duplicated(keep=False)
+            maj_labels = (
+                series.loc[duplicate_mask]
+                .groupby(level=0)
+                .agg(lambda x: x.value_counts().idxmax())
+            )
+            series = series.loc[~duplicate_mask]
+            series = pd.concat([series, maj_labels]).sort_index()
+
+        overlap = series.index.intersection(nmf.obs_names)
+        if overlap.empty:
+            raise ValueError("No shared target observations between MultiVI labels and LIANA NMF.")
+        series = series.loc[overlap]
+        nmf_leiden = nmf.obs['leiden'].loc[overlap]
+        series = series.loc[nmf_leiden.index]
+        assert series.index.equals(nmf_leiden.index)
+        return series, nmf_leiden
+
+    ## multivi target
+    multivi_target_concat_adata = build_concat_adata_for_umap(
+        target_mdata.mod['rna'],
+        target_mdata.mod['atac'],
+        embedding_key="X_multivi",
+    )
+    compute_concat_umap(
+        multivi_target_concat_adata,
+        n_neighbors=leiden_neighbors,
+        resolution=leiden_resolution,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    nmf = target_liana_results['nmf'].copy()
+    multivi_target_leiden = multivi_target_concat_adata[
+            multivi_target_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
+            multivi_target_concat_adata.obs['modality'].eq('rna')
+            ].obs['leiden']
+    multivi_target_leiden, nmf_leiden = _align_target_series_to_nmf(multivi_target_leiden, nmf)
+    multivi_target_ari = adjusted_rand_score(multivi_target_leiden, nmf_leiden)
+    multivi_target_nmi = normalized_mutual_info_score(multivi_target_leiden, nmf_leiden)
+    print(f'Adjusted Rand Score: {multivi_target_ari:.2f}')
+    print(f'Normalized Mutual Information Score: {multivi_target_nmi:.2f}')
+
+    ## multivi target zero-shot
+    multivi_target_zero_shot_concat_adata = build_concat_adata_for_umap(
+        target_mdata.mod['rna'],
+        target_mdata.mod['atac'],
+        embedding_key="X_multivi_zero_shot",
+    )
+    compute_concat_umap(
+        multivi_target_zero_shot_concat_adata,
+        n_neighbors=leiden_neighbors,
+        resolution=leiden_resolution,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    nmf = target_liana_results['nmf'].copy()
+    multivi_target_zero_shot_leiden = multivi_target_zero_shot_concat_adata[
+            multivi_target_zero_shot_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
+            multivi_target_zero_shot_concat_adata.obs['modality'].eq('rna')
+            ].obs['leiden']
+    multivi_target_zero_shot_leiden, nmf_leiden = _align_target_series_to_nmf(multivi_target_zero_shot_leiden, nmf)
+    multivi_target_zero_shot_ari = adjusted_rand_score(multivi_target_zero_shot_leiden, nmf_leiden)
+    multivi_target_zero_shot_nmi = normalized_mutual_info_score(multivi_target_zero_shot_leiden, nmf_leiden)
+    print(f'Adjusted Rand Score: {multivi_target_zero_shot_ari:.2f}')
+    print(f'Normalized Mutual Information Score: {multivi_target_zero_shot_nmi:.2f}')
+
     ## compare ARI and NMI between source, target and nonspatial-source
     ari_nmi_df = pd.DataFrame({
-        'ARI': [teacher_source_ari, source_ari, target_ari, nonspatial_source_ari, ingested_nonspatial_source_ari, multivi_source_ari],
-        'NMI': [teacher_source_nmi, source_nmi, target_nmi, nonspatial_source_nmi, ingested_nonspatial_source_nmi, multivi_source_nmi]
-    }, index=['Teach. Source', 'Source', 'Target', 'Nsp Source', 'Nsp Source$^\dagger$', 'MultiVI Source'])
+        'ARI': [teacher_source_ari, source_ari, target_ari, nonspatial_source_ari, ingested_nonspatial_source_ari, multivi_source_ari, multivi_target_ari, multivi_target_zero_shot_ari],
+        'NMI': [teacher_source_nmi, source_nmi, target_nmi, nonspatial_source_nmi, ingested_nonspatial_source_nmi, multivi_source_nmi, multivi_target_nmi, multivi_target_zero_shot_nmi]
+    }, index=['Teach. Source', 'Source', 'Target', 'Nsp Source', 'Nsp Source$^\dagger$', 'MultiVI Source', 'MultiVI Target', 'MultiVI Target$^\dagger$'])
     ari_nmi_df.plot(kind='bar', rot=30, cmap='Set2', figsize=(5, 2.5)); plt.show()
 
     ## plot UMAP of source, target, nonspatial-source and ingested nonspatial-source
