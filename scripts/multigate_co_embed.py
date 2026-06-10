@@ -2387,6 +2387,33 @@ def main():
     target_mdata.update()
     del target_mdata_zero_shot
 
+    # create concat adatas for multivi and multivi zero-shot data
+    multivi_target_concat_adata = build_concat_adata_for_umap(
+        target_mdata.mod['rna'],
+        target_mdata.mod['atac'],
+        embedding_key="X_multivi",
+    )
+    compute_concat_umap(
+        multivi_target_concat_adata,
+        n_neighbors=leiden_neighbors,
+        resolution=leiden_resolution,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    multivi_target_zero_shot_concat_adata = build_concat_adata_for_umap(
+        target_mdata.mod['rna'],
+        target_mdata.mod['atac'],
+        embedding_key="X_multivi_zero_shot",
+    )
+    compute_concat_umap(
+        multivi_target_zero_shot_concat_adata,
+        n_neighbors=leiden_neighbors,
+        resolution=leiden_resolution,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+
+
     #%% compute scib metrics for OT-aligned and nonspatial data, and plot model metrics
 
     '''
@@ -3034,39 +3061,77 @@ def main():
     ## compare ARI between NMF leiden and source, target and nonspatial-source leiden
     from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
+    def _extract_rna_leiden(concat_adata, nmf):
+        return concat_adata[
+            concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
+            concat_adata.obs['modality'].eq('rna')
+        ].obs['leiden']
+
+    def _align_source_series_to_nmf(series, nmf):
+        series = series.copy()
+        series.index = series.index.str.split("_").str[0]
+        series = series.loc[nmf.obs_names]
+        nmf_leiden = nmf.obs['leiden']
+        assert series.index.equals(nmf_leiden.index)
+        return series, nmf_leiden
+
+    def _align_target_series_to_nmf(series, nmf):
+        series = series.copy()
+        series.index = series.index.str.split("_").str[0]
+        duplicate_mask = series.index.duplicated(keep=False)
+        if duplicate_mask.any():
+            maj_labels = (
+                series.loc[duplicate_mask]
+                .groupby(level=0)
+                .agg(lambda x: x.value_counts().idxmax())
+            )
+            series = pd.concat([series.loc[~duplicate_mask], maj_labels]).sort_index()
+        overlap = series.index.intersection(nmf.obs_names)
+        if overlap.empty:
+            raise ValueError("No shared target observations between labels and LIANA NMF.")
+        series = series.loc[overlap]
+        nmf_leiden = nmf.obs['leiden'].loc[overlap]
+        series = series.loc[nmf_leiden.index]
+        assert series.index.equals(nmf_leiden.index)
+        return series, nmf_leiden
+
+    def _print_ari_nmi(label, ari, nmi):
+        print(f'{label} — ARI: {ari:.2f}, NMI: {nmi:.2f}')
+
     ## teacher source
     nmf = source_liana_results['nmf'].copy()
-    teacher_source_leiden = teacher_source_concat_adata[
-            teacher_source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
-            teacher_source_concat_adata.obs['modality'].eq('rna')
-            ].obs['leiden']
-    teacher_source_leiden.index = teacher_source_leiden.index.str.split("_").str[0]
-    teacher_source_leiden = teacher_source_leiden.loc[nmf.obs_names]
-    nmf_leiden = nmf.obs['leiden']
-    assert teacher_source_leiden.index.equals(nmf_leiden.index)
+    teacher_source_leiden, nmf_leiden = _align_source_series_to_nmf(_extract_rna_leiden(teacher_source_concat_adata, nmf), nmf)
     teacher_source_ari = adjusted_rand_score(teacher_source_leiden, nmf_leiden)
     teacher_source_nmi = normalized_mutual_info_score(teacher_source_leiden, nmf_leiden)
-    print(f'Adjusted Rand Score: {teacher_source_ari:.2f}')
-    print(f'Normalized Mutual Information Score: {teacher_source_nmi:.2f}')
+    _print_ari_nmi('Teacher source', teacher_source_ari, teacher_source_nmi)
 
     ## source
-    nmf = source_liana_results['nmf'].copy()
-    source_leiden = source_concat_adata[
-            source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
-            source_concat_adata.obs['modality'].eq('rna')
-            ].obs['leiden']
-    source_leiden.index = source_leiden.index.str.split("_").str[0]
-    source_leiden = source_leiden.loc[nmf.obs_names]
-    nmf_leiden = nmf.obs['leiden']
-    assert source_leiden.index.equals(nmf_leiden.index)
+    source_leiden, nmf_leiden = _align_source_series_to_nmf(_extract_rna_leiden(source_concat_adata, nmf), nmf)
     source_ari = adjusted_rand_score(source_leiden, nmf_leiden)
     source_nmi = normalized_mutual_info_score(source_leiden, nmf_leiden)
-    print(f'Adjusted Rand Score: {source_ari:.2f}')
-    print(f'Normalized Mutual Information Score: {source_nmi:.2f}')
+    _print_ari_nmi('Source', source_ari, source_nmi)
+
+    ## nonspatial source
+    nonspatial_source_leiden, nmf_leiden = _align_source_series_to_nmf(_extract_rna_leiden(nonspatial_source_concat_adata, nmf), nmf)
+    nonspatial_source_ari = adjusted_rand_score(nonspatial_source_leiden, nmf_leiden)
+    nonspatial_source_nmi = normalized_mutual_info_score(nonspatial_source_leiden, nmf_leiden)
+    _print_ari_nmi('Nonspatial source', nonspatial_source_ari, nonspatial_source_nmi)
+
+    ## ingested nonspatial source
+    ingested_nonspatial_source_concat_adata = sc.tl.ingest(nonspatial_source_concat_adata, source_concat_adata, embedding_method='umap', obs='leiden', inplace=False)
+    ingested_nonspatial_source_leiden, nmf_leiden = _align_source_series_to_nmf(_extract_rna_leiden(ingested_nonspatial_source_concat_adata, nmf), nmf)
+    ingested_nonspatial_source_ari = adjusted_rand_score(ingested_nonspatial_source_leiden, nmf_leiden)
+    ingested_nonspatial_source_nmi = normalized_mutual_info_score(ingested_nonspatial_source_leiden, nmf_leiden)
+    _print_ari_nmi('Ingested nonspatial source', ingested_nonspatial_source_ari, ingested_nonspatial_source_nmi)
+
+    ## multivi source
+    multivi_source_leiden, nmf_leiden = _align_source_series_to_nmf(mdata.mod['rna'].obs['RNA_clusters'], nmf)
+    multivi_source_ari = adjusted_rand_score(multivi_source_leiden, nmf_leiden)
+    multivi_source_nmi = normalized_mutual_info_score(multivi_source_leiden, nmf_leiden)
+    _print_ari_nmi('MultiVI source', multivi_source_ari, multivi_source_nmi)
 
     ## target
     nmf = target_liana_results['nmf'].copy()
-    adata = target_liana_results['adata'].copy()
     nmf_spatial = target_liana_results['nmf_spatial'].copy()
 
     fig, ax = plt.subplots(1, 2, figsize=(12, 5))
@@ -3076,160 +3141,29 @@ def main():
         ax[1].get_legend().remove()
     plt.tight_layout(); plt.show()
 
-    target_leiden = target_concat_adata[
-            #target_concat_adata.obs['source_obs_names'].str.split("_").str[0].isin(nmf.obs_names) &
-            target_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
-            target_concat_adata.obs['modality'].eq('rna')
-            #].obs.set_index('source_obs_names')['leiden']
-            ].obs['leiden']
-    target_leiden.index = target_leiden.index.str.split("_").str[0]
-    overlap = target_leiden.index.intersection(nmf.obs_names)
-
-    # Drop duplicate indices in target_leiden via majority voting
-    # Find duplicated indices
-    duplicated = target_leiden.index[target_leiden.index.duplicated(keep=False)]
-    if len(duplicated) > 0:
-        # For each duplicated index, assign label by majority vote
-        maj_labels = (
-            target_leiden[duplicated]
-            .groupby(level=0)
-            .agg(lambda x: x.value_counts().idxmax())
-        )
-        # Remove all duplicates
-        target_leiden = target_leiden[~target_leiden.index.duplicated(keep=False)]
-        # Add back the majority-vote labels
-        target_leiden = pd.concat([target_leiden, maj_labels]).sort_index()
-
-    target_leiden = target_leiden.loc[overlap]
-    nmf_leiden = nmf.obs['leiden'].loc[overlap]
-    target_leiden = target_leiden.loc[nmf_leiden.index]
-    assert target_leiden.index.equals(nmf_leiden.index)
+    target_leiden, nmf_leiden = _align_target_series_to_nmf(_extract_rna_leiden(target_concat_adata, nmf), nmf)
     target_ari = adjusted_rand_score(target_leiden, nmf_leiden)
     target_nmi = normalized_mutual_info_score(target_leiden, nmf_leiden)
-    print(f'Adjusted Rand Score: {target_ari:.2f}')
-    print(f'Normalized Mutual Information Score: {target_nmi:.2f}')
-
-    ## nonspatial source
-    nmf = source_liana_results['nmf'].copy()
-    nonspatial_source_leiden = nonspatial_source_concat_adata[
-            nonspatial_source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
-            nonspatial_source_concat_adata.obs['modality'].eq('rna')
-            ].obs['leiden']
-    nonspatial_source_leiden.index = nonspatial_source_leiden.index.str.split("_").str[0]
-    nonspatial_source_leiden = nonspatial_source_leiden.loc[nmf.obs_names]
-    nmf_leiden = nmf.obs['leiden']
-    assert nonspatial_source_leiden.index.equals(nmf_leiden.index)
-    nonspatial_source_ari = adjusted_rand_score(nonspatial_source_leiden, nmf_leiden)
-    nonspatial_source_nmi = normalized_mutual_info_score(nonspatial_source_leiden, nmf_leiden)
-    print(f'Adjusted Rand Score: {nonspatial_source_ari:.2f}')
-    print(f'Normalized Mutual Information Score: {nonspatial_source_nmi:.2f}')
-
-    ## ingested nonspatial source
-    ingested_nonspatial_source_concat_adata = sc.tl.ingest(nonspatial_source_concat_adata, source_concat_adata, embedding_method='umap', obs='leiden', inplace=False)
-    nmf = source_liana_results['nmf'].copy()
-    nonspatial_source_leiden = ingested_nonspatial_source_concat_adata[
-            ingested_nonspatial_source_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
-            ingested_nonspatial_source_concat_adata.obs['modality'].eq('rna')
-            ].obs['leiden']
-    nonspatial_source_leiden.index = nonspatial_source_leiden.index.str.split("_").str[0]
-    nonspatial_source_leiden = nonspatial_source_leiden.loc[nmf.obs_names]
-    nmf_leiden = nmf.obs['leiden']
-    assert nonspatial_source_leiden.index.equals(nmf_leiden.index)
-    ingested_nonspatial_source_ari = adjusted_rand_score(nonspatial_source_leiden, nmf_leiden)
-    ingested_nonspatial_source_nmi = normalized_mutual_info_score(nonspatial_source_leiden, nmf_leiden)
-    print(f'Adjusted Rand Score: {ingested_nonspatial_source_ari:.2f}')
-    print(f'Normalized Mutual Information Score: {ingested_nonspatial_source_nmi:.2f}')
-
-    ## multivi source
-    nmf = source_liana_results['nmf'].copy()
-    multivi_source_leiden = mdata.mod['rna'].obs['RNA_clusters']
-    multivi_source_leiden.index = multivi_source_leiden.index.str.split("_").str[0]
-    multivi_source_leiden = multivi_source_leiden.loc[nmf.obs_names]
-    nmf_leiden = nmf.obs['leiden']
-    assert multivi_source_leiden.index.equals(nmf_leiden.index)
-    multivi_source_ari = adjusted_rand_score(multivi_source_leiden, nmf_leiden)
-    multivi_source_nmi = normalized_mutual_info_score(multivi_source_leiden, nmf_leiden)
-    print(f'Adjusted Rand Score: {multivi_source_ari:.2f}')
-    print(f'Normalized Mutual Information Score: {multivi_source_nmi:.2f}')
-
-    def _align_target_series_to_nmf(series, nmf):
-        series = series.copy()
-        series.index = series.index.str.split("_").str[0]
-
-        duplicated = series.index[series.index.duplicated(keep=False)]
-        if len(duplicated) > 0:
-            duplicate_mask = series.index.duplicated(keep=False)
-            maj_labels = (
-                series.loc[duplicate_mask]
-                .groupby(level=0)
-                .agg(lambda x: x.value_counts().idxmax())
-            )
-            series = series.loc[~duplicate_mask]
-            series = pd.concat([series, maj_labels]).sort_index()
-
-        overlap = series.index.intersection(nmf.obs_names)
-        if overlap.empty:
-            raise ValueError("No shared target observations between MultiVI labels and LIANA NMF.")
-        series = series.loc[overlap]
-        nmf_leiden = nmf.obs['leiden'].loc[overlap]
-        series = series.loc[nmf_leiden.index]
-        assert series.index.equals(nmf_leiden.index)
-        return series, nmf_leiden
+    _print_ari_nmi('Target', target_ari, target_nmi)
 
     ## multivi target
-    multivi_target_concat_adata = build_concat_adata_for_umap(
-        target_mdata.mod['rna'],
-        target_mdata.mod['atac'],
-        embedding_key="X_multivi",
-    )
-    compute_concat_umap(
-        multivi_target_concat_adata,
-        n_neighbors=leiden_neighbors,
-        resolution=leiden_resolution,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    nmf = target_liana_results['nmf'].copy()
-    multivi_target_leiden = multivi_target_concat_adata[
-            multivi_target_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
-            multivi_target_concat_adata.obs['modality'].eq('rna')
-            ].obs['leiden']
-    multivi_target_leiden, nmf_leiden = _align_target_series_to_nmf(multivi_target_leiden, nmf)
+    multivi_target_leiden, nmf_leiden = _align_target_series_to_nmf(_extract_rna_leiden(multivi_target_concat_adata, nmf), nmf)
     multivi_target_ari = adjusted_rand_score(multivi_target_leiden, nmf_leiden)
     multivi_target_nmi = normalized_mutual_info_score(multivi_target_leiden, nmf_leiden)
-    print(f'Adjusted Rand Score: {multivi_target_ari:.2f}')
-    print(f'Normalized Mutual Information Score: {multivi_target_nmi:.2f}')
+    _print_ari_nmi('MultiVI target', multivi_target_ari, multivi_target_nmi)
 
     ## multivi target zero-shot
-    multivi_target_zero_shot_concat_adata = build_concat_adata_for_umap(
-        target_mdata.mod['rna'],
-        target_mdata.mod['atac'],
-        embedding_key="X_multivi_zero_shot",
-    )
-    compute_concat_umap(
-        multivi_target_zero_shot_concat_adata,
-        n_neighbors=leiden_neighbors,
-        resolution=leiden_resolution,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    nmf = target_liana_results['nmf'].copy()
-    multivi_target_zero_shot_leiden = multivi_target_zero_shot_concat_adata[
-            multivi_target_zero_shot_concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
-            multivi_target_zero_shot_concat_adata.obs['modality'].eq('rna')
-            ].obs['leiden']
-    multivi_target_zero_shot_leiden, nmf_leiden = _align_target_series_to_nmf(multivi_target_zero_shot_leiden, nmf)
+    multivi_target_zero_shot_leiden, nmf_leiden = _align_target_series_to_nmf(_extract_rna_leiden(multivi_target_zero_shot_concat_adata, nmf), nmf)
     multivi_target_zero_shot_ari = adjusted_rand_score(multivi_target_zero_shot_leiden, nmf_leiden)
     multivi_target_zero_shot_nmi = normalized_mutual_info_score(multivi_target_zero_shot_leiden, nmf_leiden)
-    print(f'Adjusted Rand Score: {multivi_target_zero_shot_ari:.2f}')
-    print(f'Normalized Mutual Information Score: {multivi_target_zero_shot_nmi:.2f}')
+    _print_ari_nmi('MultiVI target zero-shot', multivi_target_zero_shot_ari, multivi_target_zero_shot_nmi)
 
     ## compare ARI and NMI between source, target and nonspatial-source
     ari_nmi_df = pd.DataFrame({
         'ARI': [teacher_source_ari, source_ari, target_ari, nonspatial_source_ari, ingested_nonspatial_source_ari, multivi_source_ari, multivi_target_ari, multivi_target_zero_shot_ari],
         'NMI': [teacher_source_nmi, source_nmi, target_nmi, nonspatial_source_nmi, ingested_nonspatial_source_nmi, multivi_source_nmi, multivi_target_nmi, multivi_target_zero_shot_nmi]
     }, index=['Teach. Source', 'Source', 'Target', 'Nsp Source', 'Nsp Source$^\dagger$', 'MultiVI Source', 'MultiVI Target', 'MultiVI Target$^\dagger$'])
-    ari_nmi_df.plot(kind='bar', rot=30, cmap='Set2', figsize=(5, 2.5)); plt.show()
+    ari_nmi_df.plot(kind='bar', rot=30, cmap='Set2', figsize=(8, 2.5)); plt.show()
 
     ## plot UMAP of source, target, nonspatial-source and ingested nonspatial-source
     fig, axs = plt.subplots(2, 2, figsize=(10, 10))
