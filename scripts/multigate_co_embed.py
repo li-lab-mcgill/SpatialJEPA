@@ -2661,6 +2661,330 @@ def main():
     plt.show()
 
 
+    #%% spatial structure metrics
+    #
+    # Three "absolute score per model" spatial metrics for the RNA-ATAC lineup:
+    #   1. Niche recovery             -> predict each spot's neighbours' cluster
+    #                                    composition (excluding self) from the
+    #                                    joint embedding; report R^2.
+    #   2. Within-cluster coherence   -> inside each transcriptomic cluster,
+    #                                    correlate embedding distance with physical
+    #                                    distance (Spearman rho).
+    #   3. Orthogonal-target recovery -> predict the held-out modality's (ATAC)
+    #                                    spatial pattern from the RNA-only
+    #                                    embedding; report R^2.
+    #
+    # Scoring is on the SOURCE replicate: the teacher and no-distillation
+    # (nonspatial) embeddings only exist there. Spatial-block cross-validation
+    # holds out contiguous tissue, providing both the "held-out" signal and the
+    # per-fold values used for bootstrap CIs and the paired significance test.
+    # Coordinates are used only to build targets / CV blocks, never as model input.
+    from sklearn.neighbors import NearestNeighbors
+    from sklearn.cluster import KMeans
+    from sklearn.linear_model import Ridge
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import r2_score
+    from scipy.stats import spearmanr, wilcoxon
+
+    _spatial_key = "spatial"
+    _cluster_key = "RNA_clusters"
+    n_spatial_blocks = 10
+    niche_k = 15
+    ssm_rng = np.random.default_rng(0)
+
+    # --- reference geometry: source replicate (RNA coords / clusters) ---
+    ref_obs_names = pd.Index(source_rna.obs_names)
+    coords = np.asarray(source_rna.obsm[_spatial_key], dtype=float)
+    clusters = source_rna.obs[_cluster_key].astype("category")
+    cluster_codes = clusters.cat.codes.to_numpy()
+    cluster_onehot = pd.get_dummies(clusters).to_numpy().astype(float)
+    n_ref = ref_obs_names.size
+
+    # contiguous spatial blocks (KMeans on coordinates) shared across all models
+    block_labels = KMeans(
+        n_clusters=n_spatial_blocks, random_state=0, n_init=10
+    ).fit_predict(coords)
+
+    def _to_pca(adata, n_comps=30):
+        """Top components of a modality (TruncatedSVD == PCA on centred input)."""
+        X = adata.X
+        if sp.issparse(X):
+            n = min(n_comps, X.shape[1] - 1)
+            return TruncatedSVD(n_components=n, random_state=0).fit_transform(X)
+        X = StandardScaler().fit_transform(np.asarray(X, dtype=float))
+        n = min(n_comps, X.shape[1] - 1)
+        return TruncatedSVD(n_components=n, random_state=0).fit_transform(X)
+
+    def _standardize(X):
+        return StandardScaler().fit_transform(X)
+
+    def _align_to_ref(rna_adata, atac_adata, key):
+        """Return (rna_emb, atac_emb, valid) aligned to ref_obs_names.
+
+        RNA is matched by obs_name; ATAC is taken at the SAME positional index
+        (RNA/ATAC are paired row-for-row, see FOSCTTM above).
+        """
+        if key not in rna_adata.obsm or key not in atac_adata.obsm:
+            return None
+        rna_e = np.asarray(rna_adata.obsm[key], dtype=float)
+        atac_e = np.asarray(atac_adata.obsm[key], dtype=float)
+        pos = pd.Index(rna_adata.obs_names).get_indexer(ref_obs_names)
+        valid = pos >= 0
+        if valid.mean() < 0.5:
+            warnings.warn(
+                "Embedding '{}' overlaps <50% of reference spots; skipping.".format(key)
+            )
+            return None
+        rna_al = np.full((n_ref, rna_e.shape[1]), np.nan)
+        atac_al = np.full((n_ref, atac_e.shape[1]), np.nan)
+        rna_al[valid] = rna_e[pos[valid]]
+        atac_al[valid] = atac_e[pos[valid]]
+        return rna_al, atac_al, valid
+
+    # ── assemble the lineup ──────────────────────────────────────────────
+    # each entry -> (rna_emb, atac_emb, valid); joint = concat([rna, atac]),
+    # the RNA-only emb (for orthogonal-target) is the rna_emb.
+    model_specs = [
+        ("teacher",    source_rna,        source_atac,        "MultiGATE_full_teacher"),
+        ("student",    source_rna,        source_atac,        "MultiGATE"),
+        ("nonspatial", source_rna,        source_atac,        "MultiGATE_nonspatial"),
+        ("multivi",    mdata.mod['rna'],  mdata.mod['atac'],  "X_multivi"),
+    ]
+
+    lineup = {}
+    for name, rna_ad, atac_ad, key in model_specs:
+        aligned = _align_to_ref(rna_ad, atac_ad, key)
+        if aligned is None:
+            warnings.warn("Lineup model '{}' unavailable; skipping.".format(name))
+            continue
+        rna_al, atac_al, valid = aligned
+        lineup[name] = {
+            "rna": rna_al,
+            "joint": np.concatenate([rna_al, atac_al], axis=1),
+            "valid": valid,
+        }
+
+    # raw-feature floor: PCA of each modality (RNA-only = RNA PCA, joint = concat)
+    rna_pca = _to_pca(source_rna, 30)
+    atac_pca = _to_pca(source_atac, 30)
+    lineup["pca"] = {
+        "rna": rna_pca,
+        "joint": np.concatenate([rna_pca, atac_pca], axis=1),
+        "valid": np.ones(n_ref, dtype=bool),
+    }
+
+    # standardize embeddings so distances / ridge are comparable across models
+    for name in lineup:
+        v = lineup[name]["valid"]
+        for k in ("rna", "joint"):
+            X = lineup[name][k]
+            Xs = np.full_like(X, np.nan)
+            Xs[v] = _standardize(X[v])
+            lineup[name][k] = Xs
+
+    def _sample_pairs(idx, max_pairs, rng):
+        """Random unordered index pairs drawn from `idx`."""
+        m = idx.size
+        n_pairs = min(max_pairs, m * (m - 1) // 2)
+        a = rng.integers(0, m, size=n_pairs)
+        b = rng.integers(0, m, size=n_pairs)
+        keep = a != b
+        return idx[a[keep]], idx[b[keep]]
+
+    # ── per-fold metric computations (one scalar per spatial block) ──────
+    def _r2_vw(y_true, y_pred):
+        # variance_weighted avoids near-constant output columns (e.g. a cluster
+        # nearly absent from a held-out block) dominating the score.
+        return float(r2_score(y_true, y_pred, multioutput="variance_weighted"))
+
+    def _mean_spearman(y_true, y_pred):
+        """Mean over output columns of Spearman(pred, true); robust to the
+        scale/mean shift that drives R^2 negative under spatial-block CV."""
+        rhos = []
+        for j in range(y_true.shape[1]):
+            rho, _ = spearmanr(y_true[:, j], y_pred[:, j])
+            if np.isfinite(rho):
+                rhos.append(rho)
+        return float(np.mean(rhos)) if rhos else np.nan
+
+    def _cv_predict_per_block(X, Y, valid, scorer):
+        """Ridge predict Y from X holding out one spatial block at a time;
+        return {block: scorer(y_true, y_pred)}."""
+        out = {}
+        for b in np.unique(block_labels):
+            test = (block_labels == b) & valid
+            train = (block_labels != b) & valid
+            if test.sum() < 5 or train.sum() < 20:
+                continue
+            scaler = StandardScaler().fit(X[train])
+            ridge = Ridge(alpha=1.0).fit(scaler.transform(X[train]), Y[train])
+            pred = ridge.predict(scaler.transform(X[test]))
+            out[b] = scorer(Y[test], pred)
+        return out
+
+    def _coherence_per_block(Xjoint, valid, coords_for_dist):
+        """Within-cluster Spearman(embedding dist, physical dist), per block."""
+        out = {}
+        for b in np.unique(block_labels):
+            mask = (block_labels == b) & valid
+            idx = np.where(mask)[0]
+            if idx.size < 30:
+                continue
+            rhos, weights = [], []
+            for c in np.unique(cluster_codes[idx]):
+                ci = idx[cluster_codes[idx] == c]
+                if ci.size < 8:
+                    continue
+                pa, pb = _sample_pairs(ci, max_pairs=2000, rng=ssm_rng)
+                if pa.size < 10:
+                    continue
+                ed = np.linalg.norm(Xjoint[pa] - Xjoint[pb], axis=1)
+                pdist = np.linalg.norm(coords_for_dist[pa] - coords_for_dist[pb], axis=1)
+                rho, _ = spearmanr(ed, pdist)
+                if np.isfinite(rho):
+                    rhos.append(rho)
+                    weights.append(ci.size)
+            if rhos:
+                out[b] = float(np.average(rhos, weights=weights))
+        return out
+
+    def _build_targets(coords_for_targets):
+        """Niche (neighbour cluster composition) and orthogonal (neighbour-
+        averaged ATAC PCA) targets for the given coordinate set."""
+        nn = NearestNeighbors(n_neighbors=niche_k + 1).fit(coords_for_targets)
+        nbr = nn.kneighbors(coords_for_targets, return_distance=False)[:, 1:]
+        y_niche = cluster_onehot[nbr].mean(axis=1)
+        y_orth = _standardize(atac_pca[nbr].mean(axis=1))
+        return y_niche, y_orth
+
+    def _score_lineup(coords_for_dist, coords_for_targets, tag):
+        """Compute the three per-fold metrics for every model in the lineup."""
+        y_niche, y_orth = _build_targets(coords_for_targets)
+        rows = []
+        for name, d in lineup.items():
+            valid = d["valid"]
+            niche = _cv_predict_per_block(d["joint"], y_niche, valid, _mean_spearman)
+            orth = _cv_predict_per_block(d["rna"], y_orth, valid, _mean_spearman)
+            coher = _coherence_per_block(d["joint"], valid, coords_for_dist)
+            for metric, per_block in (
+                ("niche_recovery_r2", niche),
+                ("orthogonal_target_spearman", orth),
+                ("within_cluster_coherence", coher),
+            ):
+                for fold, value in per_block.items():
+                    rows.append(
+                        {"setting": tag, "model": name, "metric": metric,
+                         "fold": int(fold), "value": value}
+                    )
+        return pd.DataFrame(rows)
+
+    # real scores + coordinate-permutation control (scoring-side shuffle)
+    perm = ssm_rng.permutation(n_ref)
+    spatial_metrics_df = pd.concat(
+        [
+            _score_lineup(coords, coords, tag="real"),
+            _score_lineup(coords[perm], coords[perm], tag="coord_permuted"),
+        ],
+        ignore_index=True,
+    )
+    # NOTE: the teacher-graph-shuffle control requires retraining the student
+    # with a permuted teacher graph and is run upstream, not in this scoring cell.
+
+    # ── absolute scores (mean over folds) + bootstrap 95% CI ─────────────
+    def _bootstrap_ci(values, n_boot=2000, alpha=0.05):
+        values = np.asarray(values, dtype=float)
+        if values.size == 0:
+            return (np.nan, np.nan)
+        boot = ssm_rng.choice(values, size=(n_boot, values.size), replace=True).mean(axis=1)
+        return (float(np.quantile(boot, alpha / 2)), float(np.quantile(boot, 1 - alpha / 2)))
+
+    summary_rows = []
+    for (setting, model, metric), grp in spatial_metrics_df.groupby(["setting", "model", "metric"]):
+        lo, hi = _bootstrap_ci(grp["value"].to_numpy())
+        summary_rows.append(
+            {"setting": setting, "model": model, "metric": metric,
+             "mean": float(grp["value"].mean()), "ci_lo": lo, "ci_hi": hi,
+             "n_folds": int(grp.shape[0])}
+        )
+    spatial_metrics_summary_df = pd.DataFrame(summary_rows)
+    print("\n[spatial structure metrics] absolute scores (mean over folds):")
+    print(
+        spatial_metrics_summary_df[spatial_metrics_summary_df["setting"] == "real"]
+        .pivot(index="model", columns="metric", values="mean")
+        .round(3)
+        .to_string()
+    )
+    print("\n[spatial structure metrics] coordinate-permutation control (should be ~chance):")
+    print(
+        spatial_metrics_summary_df[spatial_metrics_summary_df["setting"] == "coord_permuted"]
+        .pivot(index="model", columns="metric", values="mean")
+        .round(3)
+        .to_string()
+    )
+
+    # ── paired significance test: student vs nonspatial (across folds) ───
+    sig_rows = []
+    real_df = spatial_metrics_df[spatial_metrics_df["setting"] == "real"]
+    if {"student", "nonspatial"}.issubset(set(real_df["model"])):
+        for metric in real_df["metric"].unique():
+            a = real_df[(real_df["model"] == "student") & (real_df["metric"] == metric)]
+            b = real_df[(real_df["model"] == "nonspatial") & (real_df["metric"] == metric)]
+            merged = a.merge(b, on="fold", suffixes=("_student", "_nonspatial"))
+            if merged.shape[0] >= 3:
+                diff = merged["value_student"] - merged["value_nonspatial"]
+                try:
+                    stat, p = wilcoxon(diff)
+                except ValueError:
+                    stat, p = np.nan, np.nan
+                sig_rows.append(
+                    {"metric": metric, "n_folds": int(merged.shape[0]),
+                     "mean_diff_student_minus_nonspatial": float(diff.mean()),
+                     "wilcoxon_p": float(p)}
+                )
+    spatial_metrics_sig_df = pd.DataFrame(sig_rows)
+    if not spatial_metrics_sig_df.empty:
+        print("\n[spatial structure metrics] student vs nonspatial (paired over folds):")
+        print(spatial_metrics_sig_df.round(4).to_string(index=False))
+
+    # ── figure: absolute scores per model per metric (CI over folds) ─────
+    _metric_titles = {
+        "niche_recovery_r2": "Niche recovery",
+        "within_cluster_coherence": "Within-cluster coherence",
+        "orthogonal_target_spearman": "Orthogonal-target recovery",
+    }
+    _metric_order = ["niche_recovery_r2", "within_cluster_coherence", "orthogonal_target_spearman"]
+    _model_order = [m for m in ["teacher", "student", "nonspatial", "multivi", "pca"]
+                    if m in set(real_df["model"])]
+    g = sns.catplot(
+        data=real_df, x="model", y="value", col="metric",
+        order=_model_order,
+        col_order=_metric_order,
+        kind="bar", palette="Set2", height=4, aspect=0.8,
+        errorbar=("ci", 95), capsize=0.15, sharey=False,
+    )
+    for ax, metric in zip(g.axes.flat, _metric_order):
+        ax.set_title(_metric_titles.get(metric, metric))
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.axhline(0.0, color="#999999", lw=0.8, ls="--")
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
+        for patch in ax.patches:
+            patch.set_edgecolor("#cccccc")
+            patch.set_linewidth(1)
+    g.fig.set_size_inches(10, 4)
+    plt.tight_layout()
+    save_figure_pdf_vector_raster(
+        plt.gcf(),
+        os.path.join(
+            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+            "spatial_structure_metrics_barplot.pdf",
+        ),
+    )
+    ax = g.axes.flat[0]
+    ax.set_ylabel('Correlation coefficient ($\\rho$)')
+    plt.show()
+
     #%% LIANA+ inflow analysis
     import plotnine as p9
     import gc
