@@ -2688,7 +2688,6 @@ def main():
     from scipy.stats import spearmanr, wilcoxon
 
     _spatial_key = "spatial"
-    _cluster_key = "RNA_clusters"
     n_spatial_blocks = 10
     niche_k = 15
     ssm_rng = np.random.default_rng(0)
@@ -2760,6 +2759,11 @@ def main():
         ("nonspatial", source_rna,        source_atac,        "MultiGATE_nonspatial"),
         ("multivi",    mdata.mod['rna'],  mdata.mod['atac'],  "X_multivi"),
     ]
+
+    # confirm that the multivi embeddings are the same as the rna and atac embeddings, not the joint embedding from mdata.obsm['X_multivi']
+    assert (mdata.mod['rna'].obsm['X_multivi'] == mdata.mod['rna'].obsm['X_multivi_rna']).all()
+    assert (mdata.mod['atac'].obsm['X_multivi'] == mdata.mod['atac'].obsm['X_multivi_atac']).all()
+    assert not (mdata.mod['rna'].obsm['X_multivi'] == mdata.mod['atac'].obsm['X_multivi']).any()
 
     lineup = {}
     for name, rna_ad, atac_ad, key in model_specs:
