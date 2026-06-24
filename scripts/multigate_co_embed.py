@@ -2666,13 +2666,13 @@ def main():
     # Three "absolute score per model" spatial metrics for the RNA-ATAC lineup:
     #   1. Niche recovery             -> predict each spot's neighbours' cluster
     #                                    composition (excluding self) from the
-    #                                    joint embedding; report R^2.
+    #                                    joint embedding; report Spearman rho.
     #   2. Within-cluster coherence   -> inside each transcriptomic cluster,
     #                                    correlate embedding distance with physical
     #                                    distance (Spearman rho).
     #   3. Orthogonal-target recovery -> predict the held-out modality's (ATAC)
     #                                    spatial pattern from the RNA-only
-    #                                    embedding; report R^2.
+    #                                    embedding; report Spearman rho.
     #
     # Scoring is on the SOURCE replicate: the teacher and no-distillation
     # (nonspatial) embeddings only exist there. Spatial-block cross-validation
@@ -2694,12 +2694,21 @@ def main():
     ssm_rng = np.random.default_rng(0)
 
     # --- reference geometry: source replicate (RNA coords / clusters) ---
+    # RNA and ATAC are paired row-for-row, so the ATAC cluster labels align to
+    # the same spots and are used alongside RNA clusters (both modalities define
+    # the microenvironment and a "near-flat" partition for the coherence test).
     ref_obs_names = pd.Index(source_rna.obs_names)
     coords = np.asarray(source_rna.obsm[_spatial_key], dtype=float)
-    clusters = source_rna.obs[_cluster_key].astype("category")
-    cluster_codes = clusters.cat.codes.to_numpy()
-    cluster_onehot = pd.get_dummies(clusters).to_numpy().astype(float)
     n_ref = ref_obs_names.size
+
+    def _codes_and_onehot(labels):
+        cat = pd.Series(np.asarray(labels)).astype("category")
+        return cat.cat.codes.to_numpy(), pd.get_dummies(cat).to_numpy().astype(float)
+
+    rna_cluster_codes, rna_cluster_onehot = _codes_and_onehot(source_rna.obs["RNA_clusters"])
+    atac_cluster_codes, atac_cluster_onehot = _codes_and_onehot(source_atac.obs["ATAC_clusters"])
+    # partitions reused by the within-cluster coherence metric (pooled)
+    cluster_partitions = [rna_cluster_codes, atac_cluster_codes]
 
     # contiguous spatial blocks (KMeans on coordinates) shared across all models
     block_labels = KMeans(
@@ -2824,7 +2833,8 @@ def main():
         return out
 
     def _coherence_per_block(Xjoint, valid, coords_for_dist):
-        """Within-cluster Spearman(embedding dist, physical dist), per block."""
+        """Within-cluster Spearman(embedding dist, physical dist), per block,
+        pooled over both the RNA and ATAC cluster partitions."""
         out = {}
         for b in np.unique(block_labels):
             mask = (block_labels == b) & valid
@@ -2832,19 +2842,20 @@ def main():
             if idx.size < 30:
                 continue
             rhos, weights = [], []
-            for c in np.unique(cluster_codes[idx]):
-                ci = idx[cluster_codes[idx] == c]
-                if ci.size < 8:
-                    continue
-                pa, pb = _sample_pairs(ci, max_pairs=2000, rng=ssm_rng)
-                if pa.size < 10:
-                    continue
-                ed = np.linalg.norm(Xjoint[pa] - Xjoint[pb], axis=1)
-                pdist = np.linalg.norm(coords_for_dist[pa] - coords_for_dist[pb], axis=1)
-                rho, _ = spearmanr(ed, pdist)
-                if np.isfinite(rho):
-                    rhos.append(rho)
-                    weights.append(ci.size)
+            for codes in cluster_partitions:
+                for c in np.unique(codes[idx]):
+                    ci = idx[codes[idx] == c]
+                    if ci.size < 8:
+                        continue
+                    pa, pb = _sample_pairs(ci, max_pairs=2000, rng=ssm_rng)
+                    if pa.size < 10:
+                        continue
+                    ed = np.linalg.norm(Xjoint[pa] - Xjoint[pb], axis=1)
+                    pdist = np.linalg.norm(coords_for_dist[pa] - coords_for_dist[pb], axis=1)
+                    rho, _ = spearmanr(ed, pdist)
+                    if np.isfinite(rho):
+                        rhos.append(rho)
+                        weights.append(ci.size)
             if rhos:
                 out[b] = float(np.average(rhos, weights=weights))
         return out
@@ -2854,7 +2865,11 @@ def main():
         averaged ATAC PCA) targets for the given coordinate set."""
         nn = NearestNeighbors(n_neighbors=niche_k + 1).fit(coords_for_targets)
         nbr = nn.kneighbors(coords_for_targets, return_distance=False)[:, 1:]
-        y_niche = cluster_onehot[nbr].mean(axis=1)
+        # neighbour composition over BOTH modalities' clusters (joint niche)
+        y_niche = np.concatenate(
+            [rna_cluster_onehot[nbr].mean(axis=1), atac_cluster_onehot[nbr].mean(axis=1)],
+            axis=1,
+        )
         y_orth = _standardize(atac_pca[nbr].mean(axis=1))
         return y_niche, y_orth
 
