@@ -4,7 +4,7 @@ SpatialJEPA is a JEPA-inspired framework for transferring spatial context from s
 
 In mouse brain RNA--ATAC experiments, SpatialJEPA supports source-to-target alignment, recovers spatially organized transcriptomic and chromatin-accessibility programs, and produces representations concordant with ligand--receptor pathway structure.
 
-<img src="fig/methodology.png" alt="SpatialJEPA methodology" style="background-color: white;">
+<img src="fig/methodology.png" alt="SpatialJEPA methodology" style="background-color: white; margin: 1cm;">
 
 ## Citation
 
