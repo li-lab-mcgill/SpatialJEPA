@@ -1,18 +1,13 @@
-# MultiGATE
+# SpatialJEPA
 
+SpatialJEPA is a JEPA-inspired framework for transferring spatial context from spatial multiomics data to dissociated single-cell multiome data. It uses a MultiGATE-based spatial teacher trained with the full neighborhood graph and distills its latent representation into a student trained with a self-only graph, allowing the student to operate when spatial coordinates are unavailable.
 
-![Overview](https://github.com/aqlkzf/typoraimg/raw/main//imgmac/MultiGATE_framework.png)
+In mouse brain RNA--ATAC experiments, SpatialJEPA supports source-to-target alignment, recovers spatially organized transcriptomic and chromatin-accessibility programs, and produces representations concordant with ligand--receptor pathway structure.
 
-MultiGATE is a two-level graph-attention auto-encoder designed for spatial multi-omics analysis. It extracts the latent embeddings of the pixels/spots in spatial multi-omics data, while simultaneously incorporating the regulatory relationship of the cross-modality features through the cross-modality attention mechanism and the spatial relationship of the pixels/spots through the within-modality attention mechanism. In addition to reconstruction loss, a CLIP contrastive loss aligns embeddings across modalities.  MultiGATE yields (i) latent representations of pixels for clustering and visualization and (ii) cross-modality attention scores for cross-modality regulatory inference.
-
-## Reproduce
-
-The `/Reproduce` directory contains scripts and resources to reproduce the main figures and results of MultiGATE, including spatial clustering results, cis-regulation, trans-regulation analysis, long-range interaction detection, and protein-gene interaction findings. Please refer to the instructions and scripts in this directory to replicate the key analyses and visualizations presented in the paper.
-
-## Usage && installation
-
-Please follow the [Tutorials](https://multigate.readthedocs.io/en/latest) for installation and Usage.
+![SpatialJEPA methodology](fig/methodology.png)
 
 ## Citation
-Miao, Jishuai, Jinzhao Li, Jingxue Xin, Jiajuan Tu, Muyang Ge, Ji Qi, Xiaocheng Zhou, Ying Zhu, Can Yang, and Zhixiang Lin. "MultiGATE: integrative analysis and regulatory inference in spatial multi-omics data via graph representation learning." Nature Communications 16, no. 1 (2025): 9403.
-https://www.nature.com/articles/s41467-025-63418-x
+
+SpatialJEPA builds on the MultiGATE spatial multiomics framework. Please cite the original MultiGATE work where appropriate:
+
+Miao, Jishuai, Jinzhao Li, Jingxue Xin, Jiajuan Tu, Muyang Ge, Ji Qi, Xiaocheng Zhou, Ying Zhu, Can Yang, and Zhixiang Lin. "MultiGATE: integrative analysis and regulatory inference in spatial multi-omics data via graph representation learning." *Nature Communications* 16, no. 1 (2025): 9403. https://www.nature.com/articles/s41467-025-63418-x
