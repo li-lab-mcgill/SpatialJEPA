@@ -8,11 +8,6 @@ RHO_MASK_MODE_NONE = 0
 RHO_MASK_MODE_FIXED = 1
 RHO_MASK_MODE_TRAINABLE_MASKED = 2
 
-def _load_legacy_tf_mgate():
-    from .model_MultiGATE_legacy_tf import MGATE as legacy_cls
-
-    return legacy_cls
-
 def decorr_loss_correlation(
     z: torch.Tensor,
     eps: float = 1e-4,
@@ -37,12 +32,6 @@ def decorr_loss_correlation(
     num_offdiag = corr.shape[0] * (corr.shape[0] - 1) // 2
     loss = upper.pow(2).sum() / num_offdiag
     return loss
-
-class LegacyTFMGATE(object):
-    def __new__(cls, *args, **kwargs):
-        legacy_cls = _load_legacy_tf_mgate()
-        return legacy_cls(*args, **kwargs)
-
 
 class MGATE(nn.Module):
 
