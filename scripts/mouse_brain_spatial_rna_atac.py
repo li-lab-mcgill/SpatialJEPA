@@ -1363,6 +1363,84 @@ def require_scib_backend():
     return _SCIB_BACKEND
 
 
+SHARED_SCIB_LABEL_KEY = "scib_shared_label"
+
+
+def _labels_aligned_to(src_adata, src_key, dst_adata, context=""):
+    """``src_adata.obs[src_key]`` reordered onto ``dst_adata``'s rows.
+
+    Matches on obs_names when they overlap; falls back to positional assignment
+    for the paired RNA/ATAC pairs whose row order is the pairing itself but whose
+    obs_names carry a modality-specific suffix.
+    """
+    src = src_adata.obs[src_key]
+    common = dst_adata.obs_names.intersection(src.index)
+    if len(common) >= 0.99 * dst_adata.n_obs and dst_adata.n_obs > 0:
+        return src.reindex(dst_adata.obs_names).to_numpy()
+    if src_adata.n_obs == dst_adata.n_obs:
+        warnings.warn(
+            "{}obs_names do not match; assigning '{}' positionally across the "
+            "paired modalities ({} rows).".format(
+                context and context + ": ", src_key, dst_adata.n_obs
+            )
+        )
+        return src.to_numpy()
+    raise ValueError(
+        "{}cannot transfer '{}': {} source rows vs {} destination rows and no "
+        "obs_name overlap.".format(
+            context and context + ": ", src_key, src_adata.n_obs, dst_adata.n_obs
+        )
+    )
+
+
+def assign_shared_modality_label(
+    rna_adata,
+    atac_adata,
+    source_key,
+    source_adata=None,
+    dest_key=SHARED_SCIB_LABEL_KEY,
+    context="",
+):
+    """Write one modality-agnostic annotation onto every AnnData in a lineup.
+
+    scIB bio-conservation (silhouette / NMI / ARI / cLISI) is computed on the
+    *pooled* RNA+ATAC embedding. If each modality carries its own cluster
+    vocabulary (R0..R10 for RNA, C0..C13 for ATAC) then no label is ever shared
+    between modalities, so the label perfectly predicts the modality: an
+    embedding is rewarded for keeping RNA and ATAC apart, which is the opposite
+    of what integration should do, and bio-conservation ends up anti-correlated
+    with iLISI by construction. RNA and ATAC here are paired row-for-row (same
+    spot / same nucleus), so a single annotation is valid for both modalities
+    and restores the intended meaning of the metric.
+
+    Labels are taken from ``source_adata`` (default: ``rna_adata``, i.e. the
+    pair's own RNA annotation) and written to both members of the pair, matched
+    by obs_name or positionally when the two carry modality-specific names.
+    """
+    if source_adata is None:
+        source_adata = rna_adata
+    if source_key not in source_adata.obs.columns:
+        raise KeyError(
+            "{}shared-label source '{}' not found in obs.".format(
+                context and context + ": ", source_key
+            )
+        )
+    for adata in (rna_adata, atac_adata):
+        values = _labels_aligned_to(source_adata, source_key, adata, context=context)
+        values = pd.Series(values).astype(str)
+        if values.isin(["nan", "None"]).any():
+            raise ValueError(
+                "{}shared label '{}' is undefined for {} of {} rows.".format(
+                    context and context + ": ",
+                    source_key,
+                    int(values.isin(["nan", "None"]).sum()),
+                    len(values),
+                )
+            )
+        adata.obs[dest_key] = pd.Categorical(values.to_numpy())
+    return dest_key
+
+
 def resolve_scib_labels(rna_adata, atac_adata, concat_adata, label_key, domain_name):
     if label_key is None:
         raise ValueError(
@@ -1385,11 +1463,39 @@ def resolve_scib_labels(rna_adata, atac_adata, concat_adata, label_key, domain_n
                 "ATAC label key '{}' not found in ATAC obs for {} domain.".format(atac_key, domain_name)
             )
         unified_key = "_scib_label"
-        concat_adata.obs[unified_key] = concat_adata.obs.apply(
-            lambda row: row[rna_key] if row["modality"] == "rna" else row[atac_key],
-            axis=1,
+        rna_values = concat_adata.obs[rna_key].astype(str).to_numpy()
+        atac_values = concat_adata.obs[atac_key].astype(str).to_numpy()
+        is_rna = (concat_adata.obs["modality"] == "rna").to_numpy()
+
+        if rna_key == atac_key:
+            ## one vocabulary shared by both modalities -- the intended setting
+            label_mode = "shared"
+        else:
+            ## Two independent clusterings. Their value vocabularies must not
+            ## collide: 10x graphclust writes plain integers for both assays, so
+            ## RNA cluster "3" and ATAC cluster "3" would silently be merged into
+            ## one label despite being unrelated groupings. Namespace them.
+            overlap = set(rna_values[is_rna]) & set(atac_values[~is_rna])
+            if overlap:
+                warnings.warn(
+                    "{} domain: RNA label '{}' and ATAC label '{}' share {} value(s) "
+                    "(e.g. {}) despite being independent clusterings; prefixing with "
+                    "'rna:'/'atac:' so they are not merged.".format(
+                        domain_name,
+                        rna_key,
+                        atac_key,
+                        len(overlap),
+                        sorted(overlap)[:3],
+                    )
+                )
+                rna_values = np.array(["rna:" + v for v in rna_values], dtype=object)
+                atac_values = np.array(["atac:" + v for v in atac_values], dtype=object)
+            label_mode = "provided_per_modality"
+
+        concat_adata.obs[unified_key] = pd.Categorical(
+            np.where(is_rna, rna_values, atac_values)
         )
-        return unified_key, "provided_per_modality"
+        return unified_key, label_mode
 
     missing = [
         modality
@@ -1443,13 +1549,22 @@ def compute_scib_metrics_for_domain(
             nmi_ari_cluster_labels_leiden=True,
             nmi_ari_cluster_labels_kmeans=False,
             silhouette_label=True,
-            clisi_knn=False,
+            ## cLISI is only interpretable once the label vocabulary is shared
+            ## across modalities (see assign_shared_modality_label); with
+            ## per-modality clusterings it just re-measures modality separation.
+            clisi_knn=True,
         ),
         batch_correction_metrics=BatchCorrection(
             bras=False,
             ilisi_knn=True,
             kbet_per_label=False,
-            graph_connectivity=False,
+            ## scib's "Batch correction" (and hence "Total") is the mean of the
+            ## enabled batch metrics. With iLISI as the only member, Total is
+            ## half a synonym for iLISI -- the one quantity MultiVI optimizes
+            ## directly via its paired-cell posterior alignment term. Graph
+            ## connectivity is a cheap second member that penalizes the
+            ## fragmented, many-island embeddings iLISI is blind to.
+            graph_connectivity=True,
             pcr_comparison=False,
         ),
         pre_integrated_embedding_obsm_key="multigate_latent",
@@ -1472,6 +1587,21 @@ def compute_scib_metrics_for_domain(
         metrics["silhouette_label"] = float(row["silhouette_label"])
     if "ilisi_knn" in row.index:
         metrics["ilisi"] = float(row["ilisi_knn"])
+    if "clisi_knn" in row.index:
+        metrics["clisi"] = float(row["clisi_knn"])
+    if "graph_connectivity" in row.index:
+        metrics["graph_connectivity"] = float(row["graph_connectivity"])
+    ## scib renames the Leiden NMI/ARI columns between versions, so keep every
+    ## remaining numeric column under its raw name instead of guessing.
+    for _col in row.index:
+        if _col in metrics:
+            continue
+        try:
+            _val = float(row[_col])
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(_val):
+            metrics.setdefault(str(_col), _val)
     if "bras" in row.index:
         metrics["bras"] = float(row["bras"])
     if "Bio conservation" in row.index:
@@ -1488,6 +1618,8 @@ def log_scib_metrics(prefix, metrics, step):
     mapping = {
         "silhouette_label": "{}_scib_silhouette_label".format(prefix),
         "ilisi": "{}_scib_ilisi".format(prefix),
+        "clisi": "{}_scib_clisi".format(prefix),
+        "graph_connectivity": "{}_scib_graph_connectivity".format(prefix),
         "bras": "{}_scib_bras".format(prefix),
         "bio_conservation": "{}_scib_bio_conservation".format(prefix),
         "batch_correction": "{}_scib_batch_correction".format(prefix),

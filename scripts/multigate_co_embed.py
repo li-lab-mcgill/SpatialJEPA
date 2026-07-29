@@ -630,6 +630,18 @@ def parse_args(notebook: bool = False):
         help="Number of parallel jobs used to compute scib bootstrap replicates.",
     )
     p.add_argument(
+        "--scib-label-mode",
+        choices=("shared", "per_modality"),
+        default="shared",
+        help=(
+            "Label column used by the scib bio-conservation metrics. 'shared' (default) "
+            "uses one modality-agnostic annotation for both RNA and ATAC rows "
+            "(RNA_clusters on source, celltypist_predictions on target), so that "
+            "bio-conservation is not confounded with modality separation. "
+            "'per_modality' restores the old RNA_clusters/ATAC_clusters split."
+        ),
+    )
+    p.add_argument(
         "--no-combined-gp-dict",
         action="store_true",
         default=False,
@@ -2830,15 +2842,83 @@ def main():
         ("target_multivi_zero_shot", target_mdata.mod['rna'], target_mdata.mod['atac'], "X_multivi_zero_shot"),
     ]
 
-    ## set label keys for source and target data
-    source_label_key = {
+    ## ── labels used by the scib bio-conservation metrics ──────────────────
+    ##
+    ## scib computes silhouette / NMI / ARI / cLISI on the POOLED RNA+ATAC
+    ## embedding, against a single label column. Handing it a different cluster
+    ## vocabulary per modality (R0..R10 vs C0..C13) makes the label perfectly
+    ## predictive of the modality: a well-mixed embedding surrounds every
+    ## R-labelled cell with C-labelled neighbours and is scored as a
+    ## bio-conservation *failure*, so bio_cons becomes anti-correlated with
+    ## iLISI by construction rather than by any real tradeoff.
+    ##
+    ## RNA and ATAC are paired row-for-row here (same spot / same nucleus -- the
+    ## same assumption FOSCTTM above relies on), so one annotation is valid for
+    ## both modalities:
+    ##   source -> RNA_clusters (the transcriptomic domains in the spatial map)
+    ##   target -> celltypist_predictions (already shared by both modalities)
+    ##
+    ## 'per_modality' keeps the old behaviour for comparison; resolve_scib_labels
+    ## now namespaces the two vocabularies before pooling them, because the
+    ## target's 10x graphclust keys are plain integers in BOTH assays and would
+    ## otherwise merge unrelated RNA and ATAC clusters under the same label.
+    from mouse_brain_spatial_rna_atac import (
+        SHARED_SCIB_LABEL_KEY,
+        assign_shared_modality_label,
+    )
+
+    scib_label_mode = str(getattr(args, "scib_label_mode", "shared"))
+    if scib_label_mode not in ("shared", "per_modality"):
+        raise ValueError(
+            "scib_label_mode must be 'shared' or 'per_modality'; got {!r}".format(
+                scib_label_mode
+            )
+        )
+
+    ## each pair takes its own RNA annotation where it has one; the MultiVI
+    ## target mudata never saw CellTypist, so it borrows from target_rna
+    assign_shared_modality_label(
+        source_rna, source_atac,
+        source_key="RNA_clusters",
+        context="source (student/teacher)",
+    )
+    assign_shared_modality_label(
+        mdata.mod["rna"], mdata.mod["atac"],
+        source_key="RNA_clusters",
+        context="source (MultiVI)",
+    )
+    assign_shared_modality_label(
+        target_rna, target_atac,
+        source_key="celltypist_predictions",
+        context="target (student)",
+    )
+    assign_shared_modality_label(
+        target_mdata.mod["rna"], target_mdata.mod["atac"],
+        source_key="celltypist_predictions",
+        source_adata=target_rna,
+        context="target (MultiVI)",
+    )
+
+    shared_label_key = {"rna": SHARED_SCIB_LABEL_KEY, "atac": SHARED_SCIB_LABEL_KEY}
+    source_label_key_per_modality = {
         "rna": "RNA_clusters",
         "atac": "ATAC_clusters",
     }
-    target_label_key = {
+    target_label_key_per_modality = {
         "rna": "arc_gex_graphclust_Cluster",
         "atac": "arc_atac_graphclust_Cluster",
     }
+    if scib_label_mode == "shared":
+        source_label_key = shared_label_key
+        target_label_key = shared_label_key
+    else:
+        source_label_key = source_label_key_per_modality
+        target_label_key = target_label_key_per_modality
+    print(
+        "[scib] label mode '{}' -> source {}, target {}".format(
+            scib_label_mode, source_label_key, target_label_key
+        )
+    )
 
     ## every scib panel is computed on the same set of (domain, embedding) pairs
     scib_metric_specs = [
@@ -2923,7 +3003,10 @@ def main():
             ]
         )
 
-        _SCIB_NUMERIC_KEYS = {"silhouette_label", "ilisi", "bras", "bio_conservation", "batch_correction", "total"}
+        _SCIB_NUMERIC_KEYS = {
+            "silhouette_label", "ilisi", "clisi", "graph_connectivity", "bras",
+            "bio_conservation", "batch_correction", "total",
+        }
 
         def _subsample_adata(adata, rng):
             n_sub = max(int(round(bootstrap_frac * adata.n_obs)), 2)
@@ -3028,94 +3111,211 @@ def main():
             "then re-run this cell.".format(d=metrics_work_dir)
         )
     else:
-        model_metrics_df = model_metrics_df.loc[model_metrics_df['metric_name'].isin(['foscttm', 'ilisi', 'bio_conservation', 'total'])]
+        model_metrics_df = model_metrics_df.loc[
+            model_metrics_df['metric_name'].isin(
+                ['foscttm', 'ilisi', 'clisi', 'graph_connectivity',
+                 'bio_conservation', 'total']
+            )
+        ].copy()
         model_metrics_df['metric_name'] = model_metrics_df['metric_name'].replace({
             'bio_conservation': 'bio_cons.',
             'foscttm': '1-FOSCTTM',
             'ilisi': 'iLISI',
+            'clisi': 'cLISI',
+            'graph_connectivity': 'graph conn.',
         })
-        metric_sort_order = ['1-FOSCTTM', 'iLISI', 'bio_cons.', 'total']
+        ## cLISI sits next to iLISI on purpose: iLISI alone cannot distinguish
+        ## "modalities mixed, biology preserved" from "modalities mixed because
+        ## the embedding discarded the biology"; graph connectivity catches the
+        ## fragmented embeddings both LISIs are blind to. A CSV from an older
+        ## bootstrap run predates them, so keep only the metrics actually present.
+        metric_sort_order = [
+            m for m in ['1-FOSCTTM', 'iLISI', 'cLISI', 'graph conn.', 'bio_cons.', 'total']
+            if m in set(model_metrics_df['metric_name'])
+        ]
         model_metrics_df = model_metrics_df.set_index('metric_name').loc[metric_sort_order].reset_index()
 
-        #ax = sns.barplot(data=model_metrics_df, y='metric_name', x='value', hue='domain', orient='h')
-        #ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=1, borderaxespad=0.)
-        #plt.gcf().set_size_inches(4, 5)
-        #ax.set_ylabel('')
+        ## ── domains, grouped into source / target blocks ───────────────────
+        ##
+        ## Source bars are scored against RNA_clusters (spatial domains of the
+        ## source replicate) and target bars against celltypist_predictions
+        ## (cell types of a different sample): different vocabularies, different
+        ## granularity, different tissue. bio_cons./cLISI/total are therefore
+        ## comparable WITHIN a block only, so the blocks get their own ROW of
+        ## panels (one row per block, one column per metric, independent y axes)
+        ## instead of sharing an axis that invites the cross-block read.
+        available_domains = set(model_metrics_df['domain'])
 
-        domain_order = [spec[0] for spec in foscttm_metric_specs]
+        ## `target_multivi` is MultiVI retrained from scratch on the target
+        ## sample. It is not solving the transfer task every other entry solves,
+        ## and it is scored on its own training cells, so it wins by
+        ## construction; it is excluded from the figures rather than presented as
+        ## a competitor. It stays in model_metrics_df / the CSV for reference.
+        excluded_domains = {"target_multivi"}
+        multivi_domains = {"source_multivi", "target_multivi", "target_multivi_zero_shot"}
 
-        g = sns.catplot(
-            data=model_metrics_df, y='value', x='metric_name', hue='domain', palette='Set2', col='metric_name',
-            col_wrap=2, kind="bar", height=4, aspect=.6, sharey=False, sharex=False, legend=False,
-            hue_order=domain_order, col_order=metric_sort_order,
+        block_layout = [
+            ("source", ["teacher_source", "source", "source_nonspatial", "source_multivi"]),
+            ("target", ["target", "target_ot", "target_multivi_zero_shot", "target_multivi"]),
+        ]
+        plotted_domains = [
+            d
+            for _, doms in block_layout
+            for d in doms
+            if d in available_domains and d not in excluded_domains
+        ]
+        ## anything new in the specs still gets plotted, in its own block
+        leftover = [
+            d for d in (spec[0] for spec in foscttm_metric_specs)
+            if d in available_domains and d not in excluded_domains and d not in plotted_domains
+        ]
+        if leftover:
+            warnings.warn(
+                "Domains {} are not assigned to a source/target block; appending them.".format(
+                    leftover
+                )
+            )
+            block_layout = block_layout + [("other", leftover)]
+            plotted_domains = plotted_domains + leftover
+
+        ## Domains whose embedding was trained on the very cells being scored.
+        ## For MultiVI this matters twice over: its loss contains an explicit
+        ## alignment term between the RNA and ATAC posteriors of the same paired
+        ## cell, which is (up to a monotone transform) what FOSCTTM measures --
+        ## so `source_multivi` reports a training objective evaluated on training
+        ## data, not held-out integration quality. The target block is the honest
+        ## cross-dataset comparison: every model there is applied to a sample it
+        ## never saw.
+        in_sample_domains = {
+            "teacher_source",
+            "source",
+            "source_nonspatial",
+            "source_multivi",
+            "target_multivi",
+        }
+        in_sample_hatch = "//"
+
+        ## fixed colour per domain, so the two figure variants stay comparable
+        domain_palette = dict(
+            zip(plotted_domains, sns.color_palette("Set2", n_colors=max(len(plotted_domains), 3)))
         )
-        g.set_titles("")
-        g.set(xlabel="", ylabel="")
 
-        ## (metric, domain) -> bootstrap interval, used for the error bars below
-        ci_lookup = {
-            (row.metric_name, row.domain): (row.ci_low, row.ci_high)
+        ## (metric, domain) -> point estimate + bootstrap interval
+        metric_lookup = {
+            (row.metric_name, row.domain): (row.value, row.ci_low, row.ci_high)
             for row in model_metrics_df.itertuples()
         }
 
-        for metric_name, ax in g.axes_dict.items():
-            ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
-            # Add a light gray frame around each bar
-            bar_patches = [p for p in ax.patches if isinstance(p, mpl.patches.Rectangle)]
-            for patch in bar_patches:
-                patch.set_edgecolor('#cccccc')  # light gray
-                patch.set_linewidth(1)
+        def plot_scib_barplot(domains_to_plot, filename, panel_width=2.3, panel_height=2.6):
+            """One row of panels per domain block, one column per metric."""
+            blocks = [
+                (name, [d for d in doms if d in domains_to_plot])
+                for name, doms in block_layout
+            ]
+            blocks = [(name, doms) for name, doms in blocks if doms]
+            if not blocks:
+                warnings.warn("No domains left to plot for {}; skipping.".format(filename))
+                return None
 
-            # Bars are drawn in hue order, left to right within the single x category
-            bar_patches.sort(key=lambda p: p.get_x())
-            extrema = []
-            for domain, patch in zip(domain_order, bar_patches):
-                height = patch.get_height()
-                extrema.append(height)
-                ci_low, ci_high = ci_lookup.get((metric_name, domain), (np.nan, np.nan))
-                if not (np.isfinite(ci_low) and np.isfinite(ci_high)):
-                    continue
-                ax.errorbar(
-                    patch.get_x() + patch.get_width() / 2,
-                    height,
-                    yerr=[[max(height - ci_low, 0.0)], [max(ci_high - height, 0.0)]],
-                    fmt='none',
-                    ecolor='#444444',
-                    elinewidth=1,
-                    capsize=2,
-                    zorder=3,
+            n_rows, n_cols = len(blocks), len(metric_sort_order)
+            fig, axes = plt.subplots(
+                n_rows, n_cols,
+                figsize=(panel_width * n_cols, panel_height * n_rows),
+                squeeze=False,
+            )
+
+            for row_idx, (block_name, block_domains) in enumerate(blocks):
+                for col_idx, metric_name in enumerate(metric_sort_order):
+                    ax = axes[row_idx][col_idx]
+                    extrema = []
+                    for bar_idx, domain in enumerate(block_domains):
+                        value, ci_low, ci_high = metric_lookup.get(
+                            (metric_name, domain), (np.nan, np.nan, np.nan)
+                        )
+                        if not np.isfinite(value):
+                            continue
+                        extrema.append(value)
+                        patch = ax.bar(
+                            bar_idx, value, width=0.8,
+                            color=domain_palette[domain],
+                            edgecolor='#555555' if domain in in_sample_domains else '#cccccc',
+                            linewidth=1,
+                            ## hatched = scored on the cells the model was trained on
+                            hatch=in_sample_hatch if domain in in_sample_domains else None,
+                        )[0]
+                        if np.isfinite(ci_low) and np.isfinite(ci_high):
+                            ax.errorbar(
+                                patch.get_x() + patch.get_width() / 2,
+                                value,
+                                yerr=[[max(value - ci_low, 0.0)], [max(ci_high - value, 0.0)]],
+                                fmt='none', ecolor='#444444', elinewidth=1, capsize=2, zorder=3,
+                            )
+                            extrema.extend([ci_low, ci_high])
+
+                    ax.set_xticks([])
+                    ax.set_xlim(-0.7, len(block_domains) - 0.3)
+                    if row_idx == 0:
+                        ax.set_title(metric_name)
+                    if col_idx == 0:
+                        ax.set_ylabel(block_name, fontweight='bold')
+
+                    # Zoom the y axis onto the range actually occupied (error bars included)
+                    extrema = [v for v in extrema if np.isfinite(v) and v > 0]
+                    if extrema:
+                        min_val, max_val = min(extrema), max(extrema)
+                        margin = (max_val - min_val) * 0.2
+                        if margin == 0:
+                            margin = min_val * 0.1
+                        ax.set_ylim(bottom=max(0, min_val - margin), top=max_val + margin)
+
+            legend_handles = [
+                mpl.patches.Patch(
+                    facecolor=domain_palette[d],
+                    edgecolor='#555555' if d in in_sample_domains else '#cccccc',
+                    hatch=in_sample_hatch if d in in_sample_domains else None,
+                    label=d,
                 )
-                extrema.extend([ci_low, ci_high])
-
-            # Adjust y-axis limits to better capture the range of values (error bars included)
-            extrema = [v for v in extrema if np.isfinite(v) and v > 0]
-            if extrema:
-                min_val = min(extrema)
-                max_val = max(extrema)
-                margin = (max_val - min_val) * 0.2
-                if margin == 0:
-                    margin = min_val * 0.1
-                ax.set_ylim(
-                    bottom=max(0, min_val - margin),
-                    top=max_val + margin,
+                for d in plotted_domains if d in domains_to_plot
+            ]
+            ## explicit key for the hatch, so the in-sample caveat travels with the figure
+            legend_handles.append(
+                mpl.patches.Patch(
+                    facecolor='white', edgecolor='#555555', hatch=in_sample_hatch,
+                    label='scored on training cells',
                 )
+            )
+            fig.legend(
+                handles=legend_handles,
+                bbox_to_anchor=(0.5, 1.02), loc='lower center',
+                ncol=min(4, len(legend_handles)), borderaxespad=0.,
+            )
+            fig.tight_layout()
+            if len(blocks) > 1:
+                ## bbox_inches='tight' in the save helper keeps this note in the PDF
+                fig.text(
+                    0.5, -0.02,
+                    "cLISI / bio_cons. / total use a different label set per row "
+                    "(source: RNA_clusters, target: CellTypist);\ncompare within a "
+                    "row only. Rows have independent y axes.",
+                    ha="center", va="top", fontsize=9, color="#444444",
+                )
+            save_figure_pdf_vector_raster(
+                fig,
+                os.path.join(
+                    "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+                    filename,
+                ),
+            )
+            plt.show()
+            return fig
 
-
-        handles, labels = g.axes.flat[0].get_legend_handles_labels()
-        by_label = dict(zip(labels, handles))
-        g.fig.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=2, borderaxespad=0.)
-        g.fig.set_size_inches(6, 4.5)
-        plt.tight_layout()
-
-        # Place legend on top of the plot
-        save_figure_pdf_vector_raster(
-            plt.gcf(),
-            os.path.join(
-                "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
-                "scib_metrics_barplot.pdf",
-            ),
+        ## two variants: the MultiGATE-only lineup, and the same plus the MultiVI
+        ## baselines that are actually solving the transfer task
+        plot_scib_barplot(plotted_domains, "scib_metrics_barplot.pdf")
+        plot_scib_barplot(
+            [d for d in plotted_domains if d not in multivi_domains],
+            "scib_metrics_barplot_no_multivi.pdf",
         )
-        plt.show()
 
 
     #%% spatial structure metrics

@@ -73,7 +73,16 @@ def _bootstrap_sys_path():
     return base_dir
 
 
-_SCIB_NUMERIC_KEYS = ("silhouette_label", "ilisi", "bras", "bio_conservation", "batch_correction", "total")
+_SCIB_NUMERIC_KEYS = (
+    "silhouette_label",
+    "ilisi",
+    "clisi",
+    "graph_connectivity",
+    "bras",
+    "bio_conservation",
+    "batch_correction",
+    "total",
+)
 
 SPECS_FILENAME = "specs.json"
 JOB_FILENAME = "job.json"
