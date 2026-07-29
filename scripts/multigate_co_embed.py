@@ -119,6 +119,153 @@ def save_plot_to_pdf(fig, filename, save_dir="/home/mcb/users/dmannk/THESIS_base
     print(f"Saved: {filepath}")
     plt.close(fig)
 
+
+
+def save_figure_svg(fig, filepath, dpi=300):
+    """Save an SVG with dense scatter layers rasterized and text/axes vector."""
+    rasterize_heavy_pdf_artists(fig)
+    d = os.path.dirname(filepath)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with plt.rc_context({"svg.fonttype": "none"}):
+        fig.savefig(filepath, format="svg", dpi=dpi, bbox_inches="tight")
+    print(f"Saved: {filepath}")
+
+
+def plot_methods_umap_rows(
+    *lineups,
+    color="modality",
+    size=25,
+    figsize_per_panel=4.0,
+    letter_labels=True,
+    legend_titles=None,
+):
+    """Multi-row UMAP figure from one or more method lineups.
+
+    Each positional ``lineups`` arg is an ordered mapping of
+    ``{panel_title: adata}``. ``color`` is either a single ``obs`` key applied
+    to every row, or a sequence of keys (one per row).
+
+    Panels are labeled a., b., c., ... in row-major order when
+    ``letter_labels`` is True.
+    """
+    import string
+
+    if not lineups:
+        raise ValueError("At least one lineup is required")
+
+    rows = [
+        [(n, ad) for n, ad in lineup.items() if ad is not None]
+        for lineup in lineups
+    ]
+    nrows = len(rows)
+    if isinstance(color, (list, tuple)):
+        if len(color) != nrows:
+            raise ValueError(
+                f"len(color)={len(color)} must match number of rows ({nrows})"
+            )
+        row_colors = list(color)
+    else:
+        row_colors = [color] * nrows
+
+    if legend_titles is not None:
+        if isinstance(legend_titles, str):
+            legend_titles = [legend_titles] * nrows
+        elif len(legend_titles) != nrows:
+            raise ValueError(f"len(legend_titles)={len(legend_titles)} must match number of rows ({nrows})")
+        row_legend_titles = list(legend_titles)
+    else:
+        row_legend_titles = row_colors
+
+    ncols = max((len(r) for r in rows), default=0)
+    if ncols == 0:
+        raise ValueError("All lineups are empty")
+
+    fig, axs = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(figsize_per_panel * ncols, figsize_per_panel * nrows),
+        squeeze=False,
+    )
+
+    letter_iter = iter(string.ascii_lowercase)
+    for r, items in enumerate(rows):
+        row_color = row_colors[r]
+        for c in range(ncols):
+            ax = axs[r, c]
+            if c >= len(items):
+                ax.axis("off")
+                continue
+            name, adata = items[c]
+            if "X_umap" not in adata.obsm:
+                raise KeyError(f"{name!r} is missing obsm['X_umap']")
+            if row_color not in adata.obs:
+                raise KeyError(f"{name!r} is missing obs[{row_color!r}]")
+
+            letter = next(letter_iter)
+            if letter_labels:
+                # Use matplotlib's mathtext to make just the letter bold
+                title_str = r"$\mathbf{" + letter + r".}$ " + name
+            else:
+                title_str = name
+
+            sc.pl.umap(
+                adata,
+                color=row_color,
+                size=size,
+                ax=ax,
+                show=False,
+                legend_loc="right margin" if c == len(items) - 1 else None,
+                title=title_str,
+            )
+            ax.set_xlabel("")
+            ax.set_ylabel("")
+
+            if c == len(items) - 1:
+                legend = ax.get_legend()
+                if legend is not None:
+                    handles = getattr(legend, "legend_handles", getattr(legend, "legendHandles", None))
+                    labels = [t.get_text() for t in legend.texts]
+                    if handles is not None:
+                        ax.legend(
+                            handles=handles,
+                            labels=labels,
+                            loc="center left",
+                            bbox_to_anchor=(1.05, 0.5),
+                            ncol=1,
+                            frameon=False,
+                            title=row_legend_titles[r],
+                        )
+
+    fig.tight_layout()
+    return fig, axs
+
+
+def ensure_concat_obs_from_modalities(concat_adata, col, rna_adata, atac_adata):
+    """Fill ``concat_adata.obs[col]`` from RNA/ATAC obs by barcode (before _rna/_atac)."""
+    if col in concat_adata.obs.columns and concat_adata.obs[col].notna().any():
+        return
+    if col not in rna_adata.obs.columns or col not in atac_adata.obs.columns:
+        raise KeyError(
+            f"Cannot transfer {col!r}: missing on rna and/or atac "
+            f"(rna has it: {col in rna_adata.obs.columns}; "
+            f"atac has it: {col in atac_adata.obs.columns})"
+        )
+    values = []
+    for name in concat_adata.obs_names.astype(str):
+        if name.endswith("_rna"):
+            barcode = name[: -len("_rna")]
+            values.append(rna_adata.obs.loc[barcode, col])
+        elif name.endswith("_atac"):
+            barcode = name[: -len("_atac")]
+            values.append(atac_adata.obs.loc[barcode, col])
+        else:
+            raise KeyError(
+                f"Expected obs_name ending in '_rna' or '_atac', got {name!r}"
+            )
+    concat_adata.obs[col] = values
+
+
 #%%
 
 from dotenv import dotenv_values, load_dotenv
@@ -423,6 +570,64 @@ def parse_args(notebook: bool = False):
         action="store_true",
         default=False,
         help="Save the annotated source and target AnnData objects as h5ad files.",
+    )
+    p.add_argument(
+        "--metrics-csv",
+        default=None,
+        help=(
+            "Path to a metrics CSV produced by metrics_bootstrap.py. When given (and "
+            "the file exists), the scib/FOSCTTM barplot is drawn from it instead of "
+            "recomputing the metrics in-process."
+        ),
+    )
+    p.add_argument(
+        "--metrics-mode",
+        choices=["inline", "background", "load"],
+        default="inline",
+        help=(
+            "How to obtain the scib/FOSCTTM metrics. 'inline' computes them in "
+            "this process and blocks. 'background' launches metrics_bootstrap.py "
+            "as a detached job and continues immediately (plot later). 'load' "
+            "reads a finished job's results from --metrics-work-dir."
+        ),
+    )
+    p.add_argument(
+        "--metrics-work-dir",
+        default=None,
+        help=(
+            "Working directory for the background metrics bootstrap (inputs, CSV, "
+            "log, job.json). Defaults to <output-dir>/metrics_bootstrap."
+        ),
+    )
+    p.add_argument(
+        "--n-bootstrap",
+        type=int,
+        default=20,
+        help=(
+            "Number of bootstrap replicates used for the error bars of the scib/FOSCTTM "
+            "barplot. Set to 0 (or 1) to disable error bars."
+        ),
+    )
+    p.add_argument(
+        "--bootstrap-frac",
+        type=float,
+        default=0.8,
+        help=(
+            "Fraction of cells drawn (without replacement) in each bootstrap replicate of "
+            "the scib metrics."
+        ),
+    )
+    p.add_argument(
+        "--bootstrap-seed",
+        type=int,
+        default=0,
+        help="Base RNG seed for the metric bootstrap.",
+    )
+    p.add_argument(
+        "--bootstrap-n-jobs",
+        type=int,
+        default=1,
+        help="Number of parallel jobs used to compute scib bootstrap replicates.",
     )
     p.add_argument(
         "--no-combined-gp-dict",
@@ -2413,6 +2618,113 @@ def main():
         random_state=deterministic_seed,
     )
 
+    # MultiVI source + student zero-shot target (OT overwrote target_concat_adata earlier)
+    multivi_source_concat_adata = build_concat_adata_for_umap(
+        mdata.mod["rna"],
+        mdata.mod["atac"],
+        embedding_key="X_multivi",
+    )
+    compute_concat_umap(
+        multivi_source_concat_adata,
+        n_neighbors=leiden_neighbors,
+        resolution=leiden_resolution,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+    student_target_zs_concat = build_concat_adata_for_umap(
+        target_rna,
+        target_atac,
+        embedding_key="MultiGATE",
+    )
+    compute_concat_umap(
+        student_target_zs_concat,
+        n_neighbors=leiden_neighbors,
+        resolution=leiden_resolution,
+        deterministic=True,
+        random_state=deterministic_seed,
+    )
+
+    #%% modality-colored UMAP grid: source (row 0) / target (row 1)
+    source_lineup = {
+        "source - teacher": teacher_source_concat_adata,
+        "source - student": source_concat_adata,
+        "source - MultiVI": multivi_source_concat_adata,
+        "source - nonspatial": nonspatial_source_concat_adata,
+    }
+    target_lineup = {
+        "target - student (OT)": target_concat_adata,
+        "target - student (ZS)": student_target_zs_concat,
+        "target - MultiVI (ZS)": multivi_target_zero_shot_concat_adata,
+        "target - MultiVI": multivi_target_concat_adata,
+    }
+    fig, axs = plot_methods_umap_rows(
+        source_lineup,
+        target_lineup,
+        color="modality",
+        legend_titles="Modality",
+        figsize_per_panel=6.0,
+    )
+    save_figure_svg(
+        fig,
+        os.path.join(
+            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+            "methods_umap_modality_grid.svg",
+        ),
+    )
+    plt.show()
+
+    #%% celltype-colored UMAP grid:
+    # source RNA_clusters (row 0) / source ATAC_clusters (row 1) / target celltypist (row 2)
+    for _ad in (
+        teacher_source_concat_adata,
+        source_concat_adata,
+        nonspatial_source_concat_adata,
+    ):
+        ensure_concat_obs_from_modalities(
+            _ad, "RNA_clusters", source_rna, source_atac
+        )
+        ensure_concat_obs_from_modalities(
+            _ad, "ATAC_clusters", source_rna, source_atac
+        )
+    ensure_concat_obs_from_modalities(
+        multivi_source_concat_adata,
+        "RNA_clusters",
+        mdata.mod["rna"],
+        mdata.mod["atac"],
+    )
+    ensure_concat_obs_from_modalities(
+        multivi_source_concat_adata,
+        "ATAC_clusters",
+        mdata.mod["rna"],
+        mdata.mod["atac"],
+    )
+    for _ad in (
+        target_concat_adata,
+        student_target_zs_concat,
+        multivi_target_zero_shot_concat_adata,
+        multivi_target_concat_adata,
+    ):
+        ensure_concat_obs_from_modalities(
+            _ad, "celltypist_predictions", target_rna, target_atac
+        )
+
+    fig, axs = plot_methods_umap_rows(
+        source_lineup,
+        source_lineup,
+        target_lineup,
+        color=["RNA_clusters", "ATAC_clusters", "celltypist_predictions"],
+        legend_titles=["RNA clusters", "ATAC clusters", "CellTypist predictions"],
+        figsize_per_panel=5.0,
+    )
+    save_figure_svg(
+        fig,
+        os.path.join(
+            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+            "methods_umap_celltype_grid.svg",
+        ),
+    )
+    plt.show()
+
 
     #%% compute scib metrics for OT-aligned and nonspatial data, and plot model metrics
 
@@ -2424,8 +2736,60 @@ def main():
     # columns now: metric_group, domain, metric_name, value
     '''
 
+    ## ── bootstrap settings for the metric error bars ──────────────────────
+    ## defaults here must match the argparse defaults, so that an interactive
+    ## `args` namespace predating these flags still produces error bars
+    n_bootstrap = max(int(getattr(args, "n_bootstrap", 20) or 0), 0)
+    bootstrap_frac = float(getattr(args, "bootstrap_frac", 0.8))
+    bootstrap_seed = int(getattr(args, "bootstrap_seed", 0))
+    bootstrap_n_jobs = int(getattr(args, "bootstrap_n_jobs", 1))
+    bootstrap_ci = (2.5, 97.5)
+    bootstrap_enabled = n_bootstrap >= 2
+
+    def _percentile_ci(replicate_values):
+        """Percentile interval of a set of bootstrap replicates."""
+        replicate_values = np.asarray(
+            [v for v in replicate_values if np.isfinite(v)], dtype=float
+        )
+        if replicate_values.size < 2:
+            return np.nan, np.nan
+        return (
+            float(np.percentile(replicate_values, bootstrap_ci[0])),
+            float(np.percentile(replicate_values, bootstrap_ci[1])),
+        )
+
+    def _spread_ci(point_value, replicate_values, z=1.96):
+        """Error bar for a dataset-level metric, anchored at the full-data estimate.
+
+        Subsample replicates are *biased* relative to the full data -- fewer cells
+        shifts every kNN/Leiden-based metric -- so a percentile interval of the
+        replicates can sit entirely to one side of the point estimate. Take only
+        the replicate spread as the uncertainty and centre it on the point
+        estimate; sqrt(bootstrap_frac) rescales an m-out-of-n subsample spread
+        back to the full sample size.
+        """
+        replicate_values = np.asarray(
+            [v for v in replicate_values if np.isfinite(v)], dtype=float
+        )
+        if replicate_values.size < 2:
+            return np.nan, np.nan
+        half_width = z * float(replicate_values.std(ddof=1)) * float(np.sqrt(bootstrap_frac))
+        return float(point_value - half_width), float(point_value + half_width)
+
+    def _bootstrap_mean_ci(per_cell_values, seed):
+        """Nonparametric bootstrap of the mean of per-cell scores."""
+        per_cell_values = np.asarray(per_cell_values, dtype=float)
+        if not bootstrap_enabled or per_cell_values.size < 2:
+            return np.nan, np.nan
+        rng = np.random.default_rng(seed)
+        n = per_cell_values.size
+        boot_means = np.empty(n_bootstrap, dtype=float)
+        for b in range(n_bootstrap):
+            boot_means[b] = per_cell_values[rng.integers(0, n, size=n)].mean()
+        return _percentile_ci(boot_means)
+
     ## calculate FOSCTTM scores
-    def _mean_foscttm_for_embedding(rna_adata, atac_adata, embedding_key, domain):
+    def _foscttm_per_cell_for_embedding(rna_adata, atac_adata, embedding_key, domain):
         if rna_adata.n_obs != atac_adata.n_obs:
             raise ValueError(
                 "FOSCTTM for domain '{}' requires paired RNA/ATAC rows; "
@@ -2452,7 +2816,8 @@ def main():
             np.asarray(rna_adata.obsm[embedding_key]),
             np.asarray(atac_adata.obsm[embedding_key]),
         )
-        return float(np.asarray(foscttm_full).mean())
+        # per-cell FOSCTTM scores; the reported metric is their mean
+        return np.asarray(foscttm_full, dtype=float).ravel()
 
     foscttm_metric_specs = [
         ("teacher_source", source_rna, source_atac, "MultiGATE_full_teacher"),
@@ -2464,25 +2829,6 @@ def main():
         ("target_multivi", target_mdata.mod['rna'], target_mdata.mod['atac'], "X_multivi"),
         ("target_multivi_zero_shot", target_mdata.mod['rna'], target_mdata.mod['atac'], "X_multivi_zero_shot"),
     ]
-    foscttm_metrics_df = pd.DataFrame(
-        [
-            {
-                "domain": domain,
-                "metric_name": "foscttm",
-                "value": _mean_foscttm_for_embedding(
-                    rna_adata,
-                    atac_adata,
-                    embedding_key,
-                    domain,
-                ),
-            }
-            for domain, rna_adata, atac_adata, embedding_key in foscttm_metric_specs
-        ],
-        columns=["domain", "metric_name", "value"],
-    )
-
-    ## convert FOSCTTM scores to 1 - FOSCTTM, such that the higher the better
-    foscttm_metrics_df['value'] = 1 - foscttm_metrics_df['value']
 
     ## set label keys for source and target data
     source_label_key = {
@@ -2494,171 +2840,282 @@ def main():
         "atac": "arc_atac_graphclust_Cluster",
     }
 
-    ## scib metrics of full teacher data
-    teacher_source_scib_metrics = compute_scib_metrics_for_domain(
-        rna_adata=source_rna,
-        atac_adata=source_atac,
-        domain_name="source",
-        label_key=source_label_key,
-        scib_n_jobs=1,
-        embedding_key="MultiGATE_full_teacher",
-    )
-    ## scib metrics of source data
-    source_scib_metrics = compute_scib_metrics_for_domain(
-        rna_adata=source_rna,
-        atac_adata=source_atac,
-        domain_name="source",
-        label_key=source_label_key,
-        scib_n_jobs=1,
-        embedding_key="MultiGATE_source_aligned",
-    )
-    ## scib metrics of target data (non-OT-aligned)
-    target_scib_metrics = compute_scib_metrics_for_domain(
-        rna_adata=target_rna,
-        atac_adata=target_atac,
-        domain_name="target",
-        label_key=target_label_key,
-        scib_n_jobs=1,
-        embedding_key="MultiGATE",
-    )
-    ## scib metrics of OT-aligned data
-    target_ot_scib_metrics = compute_scib_metrics_for_domain(
-        rna_adata=target_rna,
-        atac_adata=target_atac,
-        domain_name="target",
-        label_key=target_label_key,
-        scib_n_jobs=1,
-        embedding_key="MultiGATE_source_aligned",
-    )
-    ## scib metrics of nonspatial data
-    source_nonspatial_scib_metrics = compute_scib_metrics_for_domain(
-        rna_adata=source_rna,
-        atac_adata=source_atac,
-        domain_name="source",
-        label_key=source_label_key,
-        scib_n_jobs=1,
-        embedding_key="MultiGATE_nonspatial",
-    )
-    ## scib metrics of multivi data
-    source_multivi_scib_metrics = compute_scib_metrics_for_domain(
-        rna_adata=mdata.mod['rna'],
-        atac_adata=mdata.mod['atac'],
-        domain_name="source",
-        label_key=source_label_key,
-        scib_n_jobs=1,
-        embedding_key="X_multivi",
-    )
-    target_multivi_scib_metrics = compute_scib_metrics_for_domain(
-        rna_adata=target_mdata.mod['rna'],
-        atac_adata=target_mdata.mod['atac'],
-        domain_name="target",
-        label_key=target_label_key,
-        scib_n_jobs=1,
-        embedding_key="X_multivi",
-    )
+    ## every scib panel is computed on the same set of (domain, embedding) pairs
+    scib_metric_specs = [
+        ("teacher_source", source_rna, source_atac, "source", source_label_key, "MultiGATE_full_teacher"),
+        ("source", source_rna, source_atac, "source", source_label_key, "MultiGATE_source_aligned"),
+        ("target", target_rna, target_atac, "target", target_label_key, "MultiGATE"),
+        ("target_ot", target_rna, target_atac, "target", target_label_key, "MultiGATE_source_aligned"),
+        ("source_nonspatial", source_rna, source_atac, "source", source_label_key, "MultiGATE_nonspatial"),
+        ("source_multivi", mdata.mod['rna'], mdata.mod['atac'], "source", source_label_key, "X_multivi"),
+        ("target_multivi", target_mdata.mod['rna'], target_mdata.mod['atac'], "target", target_label_key, "X_multivi"),
+        ("target_multivi_zero_shot", target_mdata.mod['rna'], target_mdata.mod['atac'], "target", target_label_key, "X_multivi_zero_shot"),
+    ]
 
-    target_multivi_zero_shot_scib_metrics = compute_scib_metrics_for_domain(
-        rna_adata=target_mdata.mod['rna'],
-        atac_adata=target_mdata.mod['atac'],
-        domain_name="target",
-        label_key=target_label_key,
-        scib_n_jobs=1,
-        embedding_key="X_multivi_zero_shot",
-    )
+    ## ── where the metrics come from ───────────────────────────────────────
+    ## Computing the bootstrap in-process costs ~n_bootstrap x the point estimates
+    ## alone, and blocks the session for the duration. metrics_bootstrap.py runs
+    ## the identical computation as a detached background job.
+    ##
+    ##   'inline'     -- compute here and block (default)
+    ##   'background' -- launch the worker, return immediately, plot later
+    ##   'load'       -- read a finished worker CSV and plot
+    metrics_mode = getattr(args, "metrics_mode", "inline")
+    try:
+        _metrics_default_dir = os.path.join(output_dir, "metrics_bootstrap")
+    except NameError:  # cell run before the output-directory cell
+        _metrics_default_dir = os.path.join(os.getcwd(), "metrics_bootstrap")
+    metrics_work_dir = getattr(args, "metrics_work_dir", None) or _metrics_default_dir
+    metrics_csv_path = getattr(args, "metrics_csv", None)
 
-    ## build tidy DataFrames for freshly computed scib metrics
-    _SCIB_NUMERIC_KEYS = {"silhouette_label", "ilisi", "bras", "bio_conservation", "batch_correction", "total"}
+    if metrics_mode == "background":
+        from metrics_bootstrap import launch_background_bootstrap
 
-    def _scib_metrics_to_df(metrics_dict, domain):
-        rows = [
-            {"domain": domain, "metric_name": k, "value": v}
-            for k, v in metrics_dict.items()
-            if k in _SCIB_NUMERIC_KEYS
-        ]
-        return pd.DataFrame(rows, columns=["domain", "metric_name", "value"])
+        ## non-blocking: keep running the cells below while this computes
+        metrics_job = launch_background_bootstrap(
+            scib_metric_specs,
+            metrics_work_dir,
+            n_bootstrap=n_bootstrap,
+            bootstrap_frac=bootstrap_frac,
+            bootstrap_seed=bootstrap_seed,
+            n_jobs=max(bootstrap_n_jobs, 1),
+        )
+        model_metrics_df = None
 
-    teacher_source_scib_metrics_df = _scib_metrics_to_df(teacher_source_scib_metrics, domain="teacher_source")
-    source_scib_metrics_df = _scib_metrics_to_df(source_scib_metrics, domain="source")
-    target_scib_metrics_df = _scib_metrics_to_df(target_scib_metrics, domain="target")
-    target_ot_scib_metrics_df = _scib_metrics_to_df(target_ot_scib_metrics, domain="target_ot")
-    source_nonspatial_scib_metrics_df = _scib_metrics_to_df(source_nonspatial_scib_metrics, domain="source_nonspatial")
-    source_multivi_scib_metrics_df = _scib_metrics_to_df(source_multivi_scib_metrics, domain="source_multivi")
-    target_multivi_scib_metrics_df = _scib_metrics_to_df(target_multivi_scib_metrics, domain="target_multivi")
-    target_multivi_zero_shot_scib_metrics_df = _scib_metrics_to_df(target_multivi_zero_shot_scib_metrics, domain="target_multivi_zero_shot")
+    elif metrics_mode == "load" or (metrics_csv_path and os.path.exists(metrics_csv_path)):
+        from metrics_bootstrap import load_bootstrap_metrics
 
-    # model_metrics_df already has 'domain' and 'metric_name' (stripped) from
-    # extract_logged_model_metrics / parse_metric_domain_and_name.
-    # metric_group is only present in the MLflow rows; fill NaN for the new rows.
-    model_metrics_df = pd.concat(
-        #[model_metrics_df, teacher_source_scib_metrics_df, target_ot_scib_metrics_df, source_nonspatial_scib_metrics_df],
-        [
-            teacher_source_scib_metrics_df,
-            source_scib_metrics_df,
-            target_scib_metrics_df,
-            target_ot_scib_metrics_df,
-            source_nonspatial_scib_metrics_df,
-            source_multivi_scib_metrics_df,
-            target_multivi_scib_metrics_df,
-            target_multivi_zero_shot_scib_metrics_df,
-            foscttm_metrics_df,
-        ],
-        ignore_index=True,
-    )
+        ## precomputed by metrics_bootstrap.py; its foscttm rows are already 1-FOSCTTM
+        if metrics_csv_path and os.path.exists(metrics_csv_path):
+            model_metrics_df = pd.read_csv(metrics_csv_path)
+            print("Loaded metrics from {}".format(metrics_csv_path))
+        else:
+            model_metrics_df = load_bootstrap_metrics(metrics_work_dir)
+            print("Loaded metrics from {}".format(metrics_work_dir))
 
-    model_metrics_df = model_metrics_df.loc[model_metrics_df['metric_name'].isin(['foscttm', 'ilisi', 'bio_conservation', 'total'])]
-    model_metrics_df['metric_name'] = model_metrics_df['metric_name'].replace({
-        'bio_conservation': 'bio_cons.',
-        'foscttm': '1-FOSCTTM',
-        'ilisi': 'iLISI',
-    })
-    metric_sort_order = ['1-FOSCTTM', 'iLISI', 'bio_cons.', 'total']
-    model_metrics_df = model_metrics_df.set_index('metric_name').loc[metric_sort_order].reset_index()
-
-    #ax = sns.barplot(data=model_metrics_df, y='metric_name', x='value', hue='domain', orient='h')
-    #ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=1, borderaxespad=0.)
-    #plt.gcf().set_size_inches(4, 5)
-    #ax.set_ylabel('')
-
-    g = sns.catplot(
-        data=model_metrics_df, y='value', x='metric_name', hue='domain', palette='Set2', col='metric_name',
-        col_wrap=2, kind="bar", height=4, aspect=.6, sharey=False, sharex=False, legend=False
-    )
-    g.set_titles("")
-    g.set(xlabel="", ylabel="")
-    for ax in g.axes.flat:
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
-        # Add a light gray frame around each bar
-        for patch in ax.patches:
-            patch.set_edgecolor('#cccccc')  # light gray
-            patch.set_linewidth(1)
-        # Adjust y-axis limits to better capture the range of values
-        bars = [p.get_height() for p in ax.patches if p.get_height() > 0]
-        if bars:
-            min_val = min(bars)
-            max_val = max(bars)
-            margin = (max_val - min_val) * 0.2
-            if margin == 0:
-                margin = min_val * 0.1
-            ax.set_ylim(
-                bottom=max(0, min_val - margin),
-                top=max_val + margin,
+    else:
+        ## the FOSCTTM error bars come from resampling the per-cell scores with replacement
+        ## (subsampling cells would shrink the set of competing cells and bias the score itself)
+        foscttm_rows = []
+        for spec_idx, (domain, rna_adata, atac_adata, embedding_key) in enumerate(foscttm_metric_specs):
+            per_cell = _foscttm_per_cell_for_embedding(rna_adata, atac_adata, embedding_key, domain)
+            ci_low, ci_high = _bootstrap_mean_ci(per_cell, seed=bootstrap_seed + spec_idx)
+            foscttm_rows.append(
+                {
+                    "domain": domain,
+                    "metric_name": "foscttm",
+                    "value": float(per_cell.mean()),
+                    "ci_low": ci_low,
+                    "ci_high": ci_high,
+                }
             )
-    
-    handles, labels = g.axes.flat[0].get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    g.fig.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=2, borderaxespad=0.)
-    g.fig.set_size_inches(6, 4.5)
-    plt.tight_layout()
+        foscttm_metrics_df = pd.DataFrame(
+            foscttm_rows, columns=["domain", "metric_name", "value", "ci_low", "ci_high"]
+        )
 
-    # Place legend on top of the plot
-    save_figure_pdf_vector_raster(
-        plt.gcf(),
-        os.path.join(
-            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
-            "scib_metrics_barplot.pdf",
-        ),
-    )
-    plt.show()
+        ## convert FOSCTTM scores to 1 - FOSCTTM, such that the higher the better
+        ## (the interval flips too: [lo, hi] -> [1 - hi, 1 - lo])
+        foscttm_metrics_df[['value', 'ci_low', 'ci_high']] = np.column_stack(
+            [
+                1 - foscttm_metrics_df['value'].to_numpy(),
+                1 - foscttm_metrics_df['ci_high'].to_numpy(),
+                1 - foscttm_metrics_df['ci_low'].to_numpy(),
+            ]
+        )
+
+        _SCIB_NUMERIC_KEYS = {"silhouette_label", "ilisi", "bras", "bio_conservation", "batch_correction", "total"}
+
+        def _subsample_adata(adata, rng):
+            n_sub = max(int(round(bootstrap_frac * adata.n_obs)), 2)
+            n_sub = min(n_sub, adata.n_obs)
+            idx = rng.choice(adata.n_obs, size=n_sub, replace=False)
+            idx.sort()
+            return adata[idx].copy()
+
+        def _scib_replicate(rna_adata, atac_adata, domain_name, label_key, embedding_key, seed):
+            """One scib replicate on a random subsample of cells.
+
+            scib metrics are dataset-level (kNN graph + Leiden), so they cannot be
+            recomputed from per-cell scores. We resample *without* replacement instead
+            of a textbook bootstrap because duplicated cells sit at distance zero from
+            each other and would corrupt every neighbourhood-based metric.
+            """
+            rng = np.random.default_rng(seed)
+            try:
+                return compute_scib_metrics_for_domain(
+                    rna_adata=_subsample_adata(rna_adata, rng),
+                    atac_adata=_subsample_adata(atac_adata, rng),
+                    domain_name=domain_name,
+                    label_key=label_key,
+                    scib_n_jobs=1,
+                    embedding_key=embedding_key,
+                )
+            except Exception as exc:  # a subsample can drop a label entirely
+                warnings.warn(
+                    "scib bootstrap replicate failed for domain '{}' (embedding '{}'): {}".format(
+                        domain_name, embedding_key, exc
+                    )
+                )
+                return None
+
+        scib_metrics_frames = []
+        for spec_idx, (domain, rna_adata, atac_adata, domain_name, label_key, embedding_key) in enumerate(
+            scib_metric_specs
+        ):
+            ## point estimate on the full data
+            point_metrics = compute_scib_metrics_for_domain(
+                rna_adata=rna_adata,
+                atac_adata=atac_adata,
+                domain_name=domain_name,
+                label_key=label_key,
+                scib_n_jobs=1,
+                embedding_key=embedding_key,
+            )
+
+            ## bootstrap replicates on subsampled cells
+            replicate_metrics = []
+            if bootstrap_enabled:
+                replicate_seeds = [
+                    bootstrap_seed + 1000 * (spec_idx + 1) + b for b in range(n_bootstrap)
+                ]
+                replicate_metrics = Parallel(n_jobs=bootstrap_n_jobs)(
+                    delayed(_scib_replicate)(
+                        rna_adata, atac_adata, domain_name, label_key, embedding_key, seed
+                    )
+                    for seed in replicate_seeds
+                )
+                replicate_metrics = [m for m in replicate_metrics if m is not None]
+
+            rows = []
+            for metric_name, value in point_metrics.items():
+                if metric_name not in _SCIB_NUMERIC_KEYS:
+                    continue
+                ci_low, ci_high = _spread_ci(
+                    float(value),
+                    [m[metric_name] for m in replicate_metrics if metric_name in m],
+                )
+                rows.append(
+                    {
+                        "domain": domain,
+                        "metric_name": metric_name,
+                        "value": float(value),
+                        "ci_low": ci_low,
+                        "ci_high": ci_high,
+                    }
+                )
+            scib_metrics_frames.append(
+                pd.DataFrame(rows, columns=["domain", "metric_name", "value", "ci_low", "ci_high"])
+            )
+
+        model_metrics_df = pd.concat(
+            scib_metrics_frames + [foscttm_metrics_df],
+            ignore_index=True,
+        )
+
+    #%% plot the scib / FOSCTTM barplot
+    ##
+    ## This cell only needs `model_metrics_df`, so it can be re-run on its own
+    ## once a background bootstrap has finished:
+    ##     from metrics_bootstrap import bootstrap_status, load_bootstrap_metrics
+    ##     bootstrap_status(metrics_work_dir)
+    ##     model_metrics_df = load_bootstrap_metrics(metrics_work_dir)
+    if model_metrics_df is None:
+        print(
+            "Metrics are still computing in the background; skipping the barplot.\n"
+            "  from metrics_bootstrap import bootstrap_status, load_bootstrap_metrics\n"
+            "  bootstrap_status({d!r})\n"
+            "  model_metrics_df = load_bootstrap_metrics({d!r})\n"
+            "then re-run this cell.".format(d=metrics_work_dir)
+        )
+    else:
+        model_metrics_df = model_metrics_df.loc[model_metrics_df['metric_name'].isin(['foscttm', 'ilisi', 'bio_conservation', 'total'])]
+        model_metrics_df['metric_name'] = model_metrics_df['metric_name'].replace({
+            'bio_conservation': 'bio_cons.',
+            'foscttm': '1-FOSCTTM',
+            'ilisi': 'iLISI',
+        })
+        metric_sort_order = ['1-FOSCTTM', 'iLISI', 'bio_cons.', 'total']
+        model_metrics_df = model_metrics_df.set_index('metric_name').loc[metric_sort_order].reset_index()
+
+        #ax = sns.barplot(data=model_metrics_df, y='metric_name', x='value', hue='domain', orient='h')
+        #ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=1, borderaxespad=0.)
+        #plt.gcf().set_size_inches(4, 5)
+        #ax.set_ylabel('')
+
+        domain_order = [spec[0] for spec in foscttm_metric_specs]
+
+        g = sns.catplot(
+            data=model_metrics_df, y='value', x='metric_name', hue='domain', palette='Set2', col='metric_name',
+            col_wrap=2, kind="bar", height=4, aspect=.6, sharey=False, sharex=False, legend=False,
+            hue_order=domain_order, col_order=metric_sort_order,
+        )
+        g.set_titles("")
+        g.set(xlabel="", ylabel="")
+
+        ## (metric, domain) -> bootstrap interval, used for the error bars below
+        ci_lookup = {
+            (row.metric_name, row.domain): (row.ci_low, row.ci_high)
+            for row in model_metrics_df.itertuples()
+        }
+
+        for metric_name, ax in g.axes_dict.items():
+            ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
+            # Add a light gray frame around each bar
+            bar_patches = [p for p in ax.patches if isinstance(p, mpl.patches.Rectangle)]
+            for patch in bar_patches:
+                patch.set_edgecolor('#cccccc')  # light gray
+                patch.set_linewidth(1)
+
+            # Bars are drawn in hue order, left to right within the single x category
+            bar_patches.sort(key=lambda p: p.get_x())
+            extrema = []
+            for domain, patch in zip(domain_order, bar_patches):
+                height = patch.get_height()
+                extrema.append(height)
+                ci_low, ci_high = ci_lookup.get((metric_name, domain), (np.nan, np.nan))
+                if not (np.isfinite(ci_low) and np.isfinite(ci_high)):
+                    continue
+                ax.errorbar(
+                    patch.get_x() + patch.get_width() / 2,
+                    height,
+                    yerr=[[max(height - ci_low, 0.0)], [max(ci_high - height, 0.0)]],
+                    fmt='none',
+                    ecolor='#444444',
+                    elinewidth=1,
+                    capsize=2,
+                    zorder=3,
+                )
+                extrema.extend([ci_low, ci_high])
+
+            # Adjust y-axis limits to better capture the range of values (error bars included)
+            extrema = [v for v in extrema if np.isfinite(v) and v > 0]
+            if extrema:
+                min_val = min(extrema)
+                max_val = max(extrema)
+                margin = (max_val - min_val) * 0.2
+                if margin == 0:
+                    margin = min_val * 0.1
+                ax.set_ylim(
+                    bottom=max(0, min_val - margin),
+                    top=max_val + margin,
+                )
+
+
+        handles, labels = g.axes.flat[0].get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        g.fig.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(0.5, 1.05), loc='lower center', ncol=2, borderaxespad=0.)
+        g.fig.set_size_inches(6, 4.5)
+        plt.tight_layout()
+
+        # Place legend on top of the plot
+        save_figure_pdf_vector_raster(
+            plt.gcf(),
+            os.path.join(
+                "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+                "scib_metrics_barplot.pdf",
+            ),
+        )
+        plt.show()
 
 
     #%% spatial structure metrics
