@@ -3299,7 +3299,7 @@ def main():
                     "row only. Rows have independent y axes.",
                     ha="center", va="top", fontsize=9, color="#444444",
                 )
-            save_figure_pdf_vector_raster(
+            save_figure_svg(
                 fig,
                 os.path.join(
                     "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
@@ -3311,10 +3311,10 @@ def main():
 
         ## two variants: the MultiGATE-only lineup, and the same plus the MultiVI
         ## baselines that are actually solving the transfer task
-        plot_scib_barplot(plotted_domains, "scib_metrics_barplot.pdf")
+        plot_scib_barplot(plotted_domains, "scib_metrics_barplot.svg")
         plot_scib_barplot(
             [d for d in plotted_domains if d not in multivi_domains],
-            "scib_metrics_barplot_no_multivi.pdf",
+            "scib_metrics_barplot_no_multivi.svg",
         )
 
 
