@@ -132,6 +132,75 @@ def save_figure_svg(fig, filepath, dpi=300):
     print(f"Saved: {filepath}")
 
 
+## ---------------------------------------------------------------------------
+## Panels of the assembled LIANA figure (figures/3_liana_analyses.svg)
+##
+## Panels c/d/e are laid out with the other panels by hand, so each is emitted
+## standalone at the physical size of the slot it occupies there: dropped in at
+## 100% scale, they need no resizing and every panel ends up with the same type
+## size and line weight. c and d share a width (they stack into one column) and
+## their heights sum to e's height, so the three tile a single block.
+## Panel letters are added at assembly time and are deliberately not drawn here.
+## ---------------------------------------------------------------------------
+PANEL_SIZE_IN = {
+    'c_referee_agreement': (2.05, 1.50),
+    'd_heldout_cdf': (2.05, 1.80),
+    'e_nmf_multigate_corr': (2.55, 3.30),
+}
+
+## point sizes as they read in the assembled figure
+PANEL_FS = {'tick': 5.5, 'label': 6.5, 'legend': 5.5, 'annot': 5.0}
+
+PANEL_RC = {
+    'font.size': PANEL_FS['tick'],
+    'axes.titlesize': PANEL_FS['label'],
+    'axes.labelsize': PANEL_FS['label'],
+    'xtick.labelsize': PANEL_FS['tick'],
+    'ytick.labelsize': PANEL_FS['tick'],
+    'legend.fontsize': PANEL_FS['legend'],
+    'axes.linewidth': 0.5,
+    'axes.labelpad': 2.0,
+    'xtick.major.width': 0.5,
+    'ytick.major.width': 0.5,
+    'xtick.major.size': 1.8,
+    'ytick.major.size': 1.8,
+    'xtick.major.pad': 1.5,
+    'ytick.major.pad': 1.5,
+    'lines.linewidth': 0.9,
+    'patch.linewidth': 0.5,
+    'legend.handlelength': 1.3,
+    'legend.handletextpad': 0.45,
+    'legend.labelspacing': 0.28,
+    'legend.borderpad': 0.3,
+    'legend.borderaxespad': 0.25,
+    'legend.frameon': False,
+}
+
+
+def panel_figure(panel):
+    """Blank figure sized to the slot ``panel`` occupies in the assembled figure."""
+    return plt.figure(figsize=PANEL_SIZE_IN[panel])
+
+
+def save_panel_svg(fig, panel, save_dir="/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis", dpi=600):
+    """Save a composite panel at its declared physical size.
+
+    No ``bbox_inches='tight'`` on purpose: trimming crops each panel by a
+    different amount, which is exactly what makes hand-assembled panels come out
+    at mismatched scales. Axes rectangles are set explicitly instead, so the
+    declared figsize is the size the panel occupies on the page.
+    """
+    filepath = os.path.join(save_dir, f"{panel}.svg")
+    d = os.path.dirname(filepath)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with plt.rc_context({"svg.fonttype": "none"}):
+        fig.savefig(filepath, format="svg", dpi=dpi)
+    print(f"Saved: {filepath} ({PANEL_SIZE_IN[panel][0]:.2f} x "
+          f"{PANEL_SIZE_IN[panel][1]:.2f} in, place at 100%)")
+    return filepath
+
+
 def plot_methods_umap_rows(
     *lineups,
     color="modality",
@@ -2077,7 +2146,7 @@ def main():
             device=device,
         )
 
-    #%% data figures
+    #%% Celltypist predictions and data UMAP figures
     fig, ax = plt.subplots(1, 2, figsize=(10, 4))
     sc.pl.embedding(source_rna, color='RNA_clusters', basis='spatial', size=40, ax=ax[0], show=False)
     sc.pl.embedding(source_atac, color='ATAC_clusters', basis='spatial', size=40, ax=ax[1], show=False)
@@ -4026,12 +4095,14 @@ def main():
         labels=None, interaction=None, ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
         )
 
+    '''
     target_liana_results = liana_spatial_analysis(
         target_rna_liana,
         subsample_n=5000,
         resource=resource,
         labels=None, interaction=None, ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
         )
+    '''
 
     ## LIANA-MultiGATE heatmaps
     from scipy.stats import rankdata
@@ -4039,145 +4110,642 @@ def main():
     nmf = source_liana_results['nmf'].copy()
     nmf_spatial = source_liana_results['nmf_spatial'].copy()
 
-    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
-    sc.pl.embedding(nmf_spatial, basis='spatial', color='leiden', s=80, na_color='lightgray', na_in_legend=False, ax=ax[0], show=False)
-    sc.pl.embedding(nmf, basis='umap', color='leiden', s=60, ax=ax[1], show=False)
-    if ax[1].get_legend() is not None:
-        ax[1].get_legend().remove()
-    plt.tight_layout(); plt.show()
+    ## Held-out spatial reconstruction: the primary ground-truth spatial claim.
+    ## Hide half the source spots, match each hidden spot to its nearest retained spot in
+    ## embedding space, and inherit that neighbour's real coordinates as the prediction --
+    ## 1-NN regression on position, with the matching done in a space holding no coordinates.
+    ## Only source_rna.obsm['spatial'] and the embeddings enter: no imputed target
+    ## coordinates, no ingested labels, no OT, no Inflow-NMF, so nothing being compared was
+    ## produced by the models under test.
+    ## Caveat for the caption: the split is held out at evaluation time, not training time,
+    ## so this shows position is recoverable from the embedding, not that the model
+    ## generalises to unseen tissue. The teacher sees the spatial graph and is a scale
+    ## reference, not a competitor; the no-KD ablation is the control that isolates
+    ## distillation (same architecture, same data, no teacher).
+    def plot_heldout_spatial_reconstruction(
+        source_rna,
+        multivi_rna,
+        n_splits=5,
+        seed=0,
+        pitch_ref=2.0,
+        panel='d_heldout_cdf',
+        save_dir='/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis',
+        show_summary_table=False,
+        dpi=600,
+    ):
+        from sklearn.neighbors import NearestNeighbors
 
-    x1 = adata.obsm['MultiGATE_source_aligned']
-    x2 = nmf.X
+        rng = np.random.default_rng(seed)
+
+        ## restrict to spots every method covers, so the arms are comparable
+        pos = pd.Series(
+            np.arange(multivi_rna.n_obs), index=multivi_rna.obs_names
+        ).reindex(source_rna.obs_names)
+        mask = pos.notna().to_numpy()
+        xy = np.asarray(source_rna.obsm['spatial'])[mask]
+        ## NearestNeighbors.kneighbors returns (distances, indices) in that order
+        d_nn, _ = NearestNeighbors(n_neighbors=2).fit(xy).kneighbors(xy)
+        pitch = float(np.median(d_nn[:, 1]))
+        print(f'held-out reconstruction: {mask.sum()} spots, pitch {pitch:.1f} units')
+
+        arms = {
+            'MultiGATE teacher (spatial graph)': (
+                np.asarray(source_rna.obsm['MultiGATE_full_teacher'])[mask],
+                '#00441b', 1.4, '--'),
+            'MultiGATE student (identity graph)': (
+                np.asarray(source_rna.obsm['MultiGATE'])[mask], '#1b7837', 2.4, '-'),
+            'MultiGATE no-KD ablation': (
+                np.asarray(source_rna.obsm['MultiGATE_nonspatial'])[mask], '#a6dba0', 1.4, '-'),
+            'MultiVI': (
+                np.asarray(multivi_rna.obsm['X_multivi'])[pos[mask].astype(int).to_numpy()],
+                '#762a83', 2.4, '-'),
+        }
+        for name, (Z, *_rest) in arms.items():
+            assert np.isfinite(Z).all(), f'{name} has non-finite values'
+
+        def _heldout_error(Z):
+            out = []
+            for r in range(n_splits):
+                perm = np.random.default_rng(seed + r).permutation(len(Z))
+                ref, qry = perm[: len(perm) // 2], perm[len(perm) // 2:]
+                _, i = NearestNeighbors(n_neighbors=1).fit(Z[ref]).kneighbors(Z[qry])
+                out.append(np.linalg.norm(xy[ref[i[:, 0]]] - xy[qry], axis=1) / pitch)
+            return np.concatenate(out)
+
+        curves = {name: _heldout_error(Z) for name, (Z, *_rest) in arms.items()}
+        n_q = len(next(iter(curves.values())))
+        ## floor: guess a random spot rather than the embedding's nearest neighbour
+        curves['random floor'] = np.linalg.norm(
+            xy[rng.integers(0, len(xy), n_q)] - xy[rng.integers(0, len(xy), n_q)], axis=1
+        ) / pitch
+        arms['random floor'] = (None, '#999999', 1.4, ':')
+
+        ## legend keys are kept long for the printed summary, short on the panel: at the
+        ## size this panel is placed, the full arm names would take half the axes width.
+        short = {'MultiGATE teacher (spatial graph)': 'MultiGATE teacher',
+                 'MultiGATE student (identity graph)': 'MultiGATE student',
+                 'MultiGATE no-KD ablation': 'MultiGATE no-KD',
+                 'MultiVI': 'MultiVI', 'random floor': 'random floor'}
+
+        with plt.rc_context(PANEL_RC):
+            fig = panel_figure(panel)
+            ## explicit rectangle rather than tight_layout: the panel has to keep the
+            ## figsize it declares, since that is what makes it drop into the assembled
+            ## figure at 100% next to the other panels. The left and right edges match
+            ## panel c's, which stacks directly above it, so the two plot boxes line up.
+            ax = fig.add_axes([0.21, 0.155, 0.765, 0.825])
+
+            rows = []
+            for name, (_Z, color, lw, ls) in arms.items():
+                v = np.sort(curves[name])
+                frac = np.arange(1, len(v) + 1) / len(v)
+                ax.plot(v, frac, lw=lw * 0.62, ls=ls, color=color, label=short[name],
+                        zorder=3)
+                within, med = float((v <= pitch_ref).mean()), float(np.median(v))
+                ## mark where each curve crosses the two reference lines
+                ax.plot([pitch_ref, med], [within, 0.5], ls='none', marker='o', ms=2.4,
+                        color=color, mec='w', mew=0.4, zorder=5)
+                rows.append({'method': name, 'median_err': med,
+                             f'within_{pitch_ref:g}_pitch': within})
+            summary = pd.DataFrame(rows).set_index('method')
+
+            ## log scale and limits first: a text artist anchored at a linear-scale xlim
+            ## would sit at a negative x, which a log axis cannot represent, and autoscale
+            ## then blows the range out to a blank, extremely wide plot
+            ax.set_xscale('log')
+            ## exact hits give an error of 0, which a log axis cannot take as a limit
+            lo = min((v[v > 0].min() for v in curves.values() if (v > 0).any()), default=1.0)
+            ax.set_xlim(lo * 0.9, max(v.max() for v in curves.values()) * 1.1)
+            ax.set_ylim(-0.02, 1.02)
+            ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
+
+            ax.axvline(pitch_ref, ls=':', lw=0.6, color='0.35', zorder=1)
+            ## both reference labels go into the bottom-left wedge, the only region of a
+            ## CDF panel this size that no curve and not the legend passes through;
+            ## x in data coords, y in axes fraction
+            ax.text(pitch_ref, 0.015, f' ≤{pitch_ref:g} sp',
+                    transform=ax.get_xaxis_transform(),
+                    fontsize=PANEL_FS['annot'], color='0.35', va='bottom', ha='left')
+            ax.axhline(0.5, ls=':', lw=0.6, color='0.6', zorder=1)
+            ## x in axes fraction, y in data coords, so this never enters the x data range
+            ax.text(0.985, 0.515, 'median', transform=ax.get_yaxis_transform(),
+                    fontsize=PANEL_FS['annot'], color='0.55', va='bottom', ha='right')
+
+            ## short axis labels: the full sentences are caption material, and at 6.5 pt
+            ## they would overrun the 1.4 in axes they have to sit against
+            ax.set_xlabel('position error (spot widths)')
+            ax.set_ylabel('cumulative fraction')
+            ## opaque frame: every CDF ends up in the top-left corner, so an unfilled
+            ## legend there is unreadable. This is also the key for panel c above, which
+            ## has room only for the arm names without the 'MultiGATE' prefix.
+            leg = ax.legend(loc='upper left', fontsize=PANEL_FS['annot'], frameon=True,
+                            facecolor='white', edgecolor='0.8', framealpha=1.0)
+            leg.set_zorder(6)
+            leg.get_frame().set_linewidth(0.4)
+            ax.spines[['top', 'right']].set_visible(False)
+
+            ## both readings: typical error (median, where each curve crosses y=0.5) and
+            ## the share confidently localised (where each curve crosses the vertical
+            ## reference). Off by default -- it does not survive the panel's final size,
+            ## and the same numbers are printed below for the caption.
+            if show_summary_table:
+                lines = [f'{"":<18s}{"median":>7s}{f"<={pitch_ref:g}sp":>7s}']
+                for m, r in summary.iterrows():
+                    lines.append(f'{short[m]:<18s}{r["median_err"]:>7.1f}'
+                                 f'{r[f"within_{pitch_ref:g}_pitch"]:>7.0%}')
+                ax.text(0.985, 0.03, '\n'.join(lines), transform=ax.transAxes,
+                        fontsize=PANEL_FS['annot'] - 0.5, ha='right', va='bottom',
+                        color='0.3', linespacing=1.5, family='monospace')
+
+            if panel is not None:
+                save_panel_svg(fig, panel, save_dir=save_dir, dpi=dpi)
+        plt.show()
+        print(summary.round(3))
+        return {'summary': summary, 'curves': curves, 'pitch': pitch, 'fig': fig}
+
+    heldout_reconstruction_results = plot_heldout_spatial_reconstruction(
+        source_rna, mdata.mod['rna']
+    )
+
+    ## source-side agreement with the Inflow-NMF referee.
+    ## The target-side referee is deliberately not scored: target spatial coordinates are
+    ## imputed from the MultiGATE latent space being evaluated (see target_rna.obsm['spatial']
+    ## assignment above), so any target agreement is circular. On the source the referee is
+    ## built from real coordinates and expert RNA_clusters, and is model-independent.
+    from matplotlib import gridspec
+    from scipy.optimize import linear_sum_assignment
+
+    def _comb2(x):
+        return x * (x - 1.0) / 2.0
+
+    def _contingency(x_codes, y_codes, nx, ny):
+        return np.bincount(x_codes * ny + y_codes, minlength=nx * ny).reshape(nx, ny)
+
+    def _ari_nmi_from_tables(C):
+        """C: (B, nA, nB) contingency stack -> (ARI[B], NMI[B]), sklearn conventions."""
+        C = np.asarray(C, dtype=np.float64)
+        n = C.sum(axis=(1, 2))
+        a, b = C.sum(axis=2), C.sum(axis=1)
+        s_ij = _comb2(C).sum(axis=(1, 2))
+        s_a, s_b = _comb2(a).sum(axis=1), _comb2(b).sum(axis=1)
+        exp_ = s_a * s_b / _comb2(n)
+        ari = (s_ij - exp_) / (0.5 * (s_a + s_b) - exp_)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            pij, pa, pb = C / n[:, None, None], a / n[:, None], b / n[:, None]
+            lg = np.where(
+                C > 0,
+                np.log(np.where(C > 0, pij, 1.0))
+                - np.log(np.where(C > 0, pa[:, :, None] * pb[:, None, :], 1.0)),
+                0.0,
+            )
+            mi = (pij * lg).sum(axis=(1, 2))
+            ha = -np.where(a > 0, pa * np.log(np.where(a > 0, pa, 1.0)), 0.0).sum(axis=1)
+            hb = -np.where(b > 0, pb * np.log(np.where(b > 0, pb, 1.0)), 0.0).sum(axis=1)
+            nmi = mi / (0.5 * (ha + hb))
+        return ari, nmi
+
+    def _bootstrap_ari_nmi(x_codes, y_codes, nx, ny, n_boot=2000, seed=0):
+        """Nonparametric cell bootstrap. Resampling cells with replacement is exactly a
+        Multinomial(n, p) draw over the contingency bins, so every replicate comes from a
+        single multinomial call: O(nx*ny) per replicate instead of O(n_cells)."""
+        C = _contingency(x_codes, y_codes, nx, ny).astype(np.float64)
+        n = int(C.sum())
+        boot = np.random.default_rng(seed).multinomial(
+            n, (C / n).ravel(), size=n_boot
+        ).reshape(n_boot, nx, ny)
+        ari_b, nmi_b = _ari_nmi_from_tables(boot)
+        ari_p, nmi_p = _ari_nmi_from_tables(C[None])
+        return float(ari_p[0]), float(nmi_p[0]), ari_b, nmi_b
+
+    def _leiden_at_k(ad, k, lo=0.002, hi=4.0, max_iter=30, seed=0):
+        """Bisect the Leiden resolution until the partition has k clusters, so that every
+        method is compared to the referee at matched cluster count (ARI is k-sensitive)."""
+        best = None
+        for _ in range(max_iter):
+            mid = (lo + hi) / 2
+            sc.tl.leiden(ad, resolution=mid, key_added='_k', random_state=seed)
+            n = ad.obs['_k'].nunique()
+            if best is None or abs(n - k) < abs(best[2] - k):
+                best = (np.asarray(ad.obs['_k']).copy(), mid, n)
+            if n == k:
+                break
+            lo, hi = (mid, hi) if n < k else (lo, mid)
+        return best
+
+    def _merged_ceiling(expert, ref_codes, ok, target_k, nref):
+        """Best agreement any coarsening of the expert labels to target_k groups reaches
+        against the referee, found by greedy pairwise merging. The referee is a heavily
+        transformed derivative of those same expert labels (SVG filter -> LR resource ->
+        spatial lag -> per-cell-type stratification -> NMF -> Leiden), so this is how well
+        the referee can be recovered by the annotation that generated it."""
+        grp = {c: {c} for c in pd.unique(expert[ok])}
+
+        def _score(mapping):
+            codes = pd.factorize(expert[ok].map(mapping))[0]
+            C = _contingency(codes, ref_codes, codes.max() + 1, nref).astype(float)
+            return float(_ari_nmi_from_tables(C[None])[0][0])
+
+        while len(grp) > target_k:
+            keys, best = list(grp), (-np.inf, None)
+            for i in range(len(keys)):
+                for j in range(i + 1, len(keys)):
+                    trial = dict(grp)
+                    trial[keys[i]] = trial[keys[i]] | trial.pop(keys[j])
+                    s = _score({lab: g for g, mem in trial.items() for lab in mem})
+                    if s > best[0]:
+                        best = (s, (keys[i], keys[j]))
+            a, b = best[1]
+            grp[a] = grp[a] | grp.pop(b)
+        m = {lab: g for g, mem in grp.items() for lab in mem}
+        codes = pd.factorize(expert[ok].map(m))[0]
+        C = _contingency(codes, ref_codes, codes.max() + 1, nref).astype(float)
+        a_, n_ = _ari_nmi_from_tables(C[None])
+        return float(a_[0]), float(n_[0])
+
+    def _hungarian_map(lab, ref_lab):
+        """Relabel a partition so its cluster ids match the referee's, for shared colours."""
+        lc, lu = pd.factorize(lab, sort=True)
+        rc, ru = pd.factorize(ref_lab, sort=True)
+        r, c = linear_sum_assignment(-_contingency(lc, rc, len(lu), len(ru)))
+        return {lu[i]: ru[j] for i, j in zip(r, c)}
+
+    def _draw_agreement_bar(ax, res_df, ceil_ari, referee_k, fs, tick_labels=None,
+                            rotation=30, ha='right', capsize=2.5, err_lw=0.9,
+                            legend_loc='upper right'):
+        """ARI/NMI against the Inflow-NMF referee, with bootstrap CIs and the expert
+        ceiling. Shared by the overview figure and the standalone composite panel, which
+        differ only in physical size and hence in type size and error-bar weight."""
+        x, w = np.arange(len(res_df)), 0.38
+        for off, key, color in ((-w / 2, 'ARI', '#66c2a5'), (w / 2, 'NMI', '#bbbbbb')):
+            ax.bar(x + off, res_df[key], w, color=color, label=key,
+                   yerr=[res_df[key] - res_df[f'{key}_lo'],
+                         res_df[f'{key}_hi'] - res_df[key]],
+                   capsize=capsize, error_kw=dict(lw=err_lw, ecolor='0.25'))
+        ax.axhline(ceil_ari, ls='--', lw=err_lw, color='#2a7f62')
+        ax.text(len(res_df) - 0.4, ceil_ari, 'expert ceiling ', fontsize=fs['annot'],
+                va='bottom', ha='right', color='#2a7f62')
+        ## headroom so the legend clears the tallest CI whisker instead of sitting on it
+        ax.set_ylim(0, max(res_df['NMI_hi'].max(), res_df['ARI_hi'].max(), ceil_ari) * 1.32)
+        ax.set_xlim(-0.6, len(res_df) - 0.4)
+        ax.set_xticks(x)
+        ax.set_xticklabels(res_df.index if tick_labels is None else tick_labels,
+                           rotation=rotation, ha=ha, fontsize=fs['tick'])
+        ax.set_ylabel(f'agreement with\nInflow-NMF (k={referee_k})', fontsize=fs['label'])
+        ax.tick_params(axis='y', labelsize=fs['tick'])
+        ax.legend(frameon=False, fontsize=fs['legend'], loc=legend_loc)
+        ax.spines[['top', 'right']].set_visible(False)
+        return ax
+
+    def plot_referee_agreement_panel(
+        res_df,
+        ceil_ari,
+        referee_k,
+        panel='c_referee_agreement',
+        save_dir='/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis',
+        dpi=600,
+    ):
+        """Panel c of the assembled LIANA figure, at the size it is placed."""
+        ## drop the repeated 'MultiGATE ' prefix: the four full names do not fit across a
+        ## 1.6 in axes at any usable type size, upright or rotated, and panel d sits
+        ## directly below with the same four arms spelled out in its legend
+        labels = [m.replace('MultiGATE ', '') for m in res_df.index]
+        with plt.rc_context(PANEL_RC):
+            fig = panel_figure(panel)
+            ax = fig.add_axes([0.21, 0.115, 0.765, 0.855])
+            _draw_agreement_bar(ax, res_df, ceil_ari, referee_k, PANEL_FS,
+                                tick_labels=labels, rotation=0, ha='center',
+                                capsize=1.3, err_lw=0.55, legend_loc='upper left')
+            ax.yaxis.set_major_locator(mpl.ticker.MaxNLocator(nbins=5))
+            if panel is not None:
+                save_panel_svg(fig, panel, save_dir=save_dir, dpi=dpi)
+        plt.show()
+        return fig
+
+    def plot_source_referee_panels(
+        source_rna,
+        multivi_rna,
+        source_liana_results,
+        model_label='MultiGATE student',
+        expert_col='RNA_clusters',
+        seed=0,
+        n_boot=2000,
+        n_neighbors=10,
+        s_spatial=11.0,
+        s_umap=3.0,
+        s_missing=2.5,
+        save_name='liana_source_referee_panels',
+        save_dir='/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis',
+        dpi=96,
+    ):
+        ## align MultiVI rows onto source_rna barcodes; all methods share the resulting spots
+        overlap = source_rna.obs_names.intersection(multivi_rna.obs_names)
+        if len(overlap) == 0:
+            assert multivi_rna.n_obs == source_rna.n_obs, (
+                f'no shared barcodes and shape mismatch: '
+                f'{multivi_rna.n_obs} vs {source_rna.n_obs}'
+            )
+            print('WARNING: no barcode overlap with MultiVI - falling back to positional alignment')
+            mv_full = np.asarray(multivi_rna.obsm['X_multivi'])
+            mask = np.ones(source_rna.n_obs, dtype=bool)
+        else:
+            pos = pd.Series(np.arange(multivi_rna.n_obs), index=multivi_rna.obs_names)
+            idx = pos.reindex(source_rna.obs_names)
+            mask = idx.notna().to_numpy()
+            mv_full = np.full(
+                (source_rna.n_obs, multivi_rna.obsm['X_multivi'].shape[1]), np.nan
+            )
+            mv_full[mask] = np.asarray(multivi_rna.obsm['X_multivi'])[
+                idx[mask].astype(int).to_numpy()
+            ]
+        print(f'MultiVI covers {mask.sum()} of {source_rna.n_obs} source spots '
+              f'(all methods restricted to these)')
+        obs_names = source_rna.obs_names[mask]
+
+        reps = {
+            'MultiGATE teacher': np.asarray(source_rna.obsm['MultiGATE_full_teacher'])[mask],
+            'MultiGATE student': np.asarray(source_rna.obsm['MultiGATE'])[mask],
+            'MultiGATE no-KD': np.asarray(source_rna.obsm['MultiGATE_nonspatial'])[mask],
+            'MultiVI': mv_full[mask],
+        }
+        for key, val in reps.items():
+            assert np.isfinite(val).all(), f'{key} has non-finite values after alignment'
+
+        xy = np.asarray(source_rna.obsm['spatial'])[mask]
+        expert = pd.Series(
+            np.asarray(source_rna.obs[expert_col])[mask].astype(str), index=obs_names
+        )
+
+        nmf_src = source_liana_results['nmf_spatial']
+        referee = pd.Series(
+            np.asarray(nmf_src.obs['leiden']).astype(object), index=nmf_src.obs_names
+        ).reindex(obs_names)
+        ok = referee.notna().to_numpy()
+        referee_k = referee.dropna().nunique()
+        ref_codes, ref_uniq = pd.factorize(referee[ok].astype(str), sort=True)
+        print(f'Inflow-NMF referee: {ok.sum()}/{len(obs_names)} spots, k={referee_k} '
+              f'(cells dropped by the keep_nmf filter have no referee label)')
+
+        ## referee's own graph UMAP, rebuilt at full referee coverage. nmf_spatial.obs
+        ## carries the NMF_W factor columns for every kept cell (joined before the
+        ## stratified subsample), so this avoids the 5000-cell subsampled UMAP.
+        factors = [str(c) for c in source_liana_results['nmf'].var_names]
+        factors = [c for c in factors if c in nmf_src.obs.columns]
+        if len(factors) >= 2:
+            W = nmf_src.obs.loc[obs_names[ok], factors].to_numpy(dtype=np.float64)
+            ad_ref = sc.AnnData(X=np.zeros((W.shape[0], 1), dtype=np.float32), obsm={'X_nmf': W})
+            ad_ref.obs_names = obs_names[ok]
+            sc.pp.neighbors(ad_ref, use_rep='X_nmf', metric='euclidean',
+                            n_neighbors=30, random_state=seed)
+            sc.tl.umap(ad_ref, min_dist=0.5, random_state=seed)
+            umap_ref = np.asarray(ad_ref.obsm['X_umap'])
+            print(f'Referee UMAP rebuilt from {len(factors)} NMF factors, {W.shape[0]} cells')
+        else:
+            sub = source_liana_results['nmf']
+            umap_ref = pd.DataFrame(
+                np.asarray(sub.obsm['X_umap']), index=sub.obs_names
+            ).reindex(obs_names[ok]).to_numpy()
+            print('WARNING: NMF factor columns absent from nmf_spatial.obs; '
+                  'falling back to the subsampled referee UMAP')
+
+        ## every embedding partitioned at the referee's own k
+        labels, meta, umap_model = {}, [], None
+        for name, Z in reps.items():
+            ad = sc.AnnData(X=np.zeros((len(Z), 1), dtype=np.float32), obsm={'X_emb': Z})
+            ad.obs_names = obs_names
+            sc.pp.neighbors(ad, use_rep='X_emb', n_neighbors=n_neighbors, random_state=seed)
+            lab, res, k_found = _leiden_at_k(ad, referee_k, seed=seed)
+            labels[name] = pd.Series(lab, index=obs_names)
+            meta.append({'method': name, 'resolution': round(res, 4), 'k': k_found})
+            if name == model_label:
+                sc.tl.umap(ad, min_dist=0.3, random_state=seed)
+                umap_model = np.asarray(ad.obsm['X_umap'])
+        meta_df = pd.DataFrame(meta).set_index('method')
+        print(meta_df)
+
+        ceil_ari, ceil_nmi = _merged_ceiling(expert, ref_codes, ok, referee_k, len(ref_uniq))
+        print(f'Expert ceiling ({expert_col} merged {expert.nunique()} -> {referee_k}): '
+              f'ARI={ceil_ari:.3f}, NMI={ceil_nmi:.3f}')
+
+        rows, boots = [], {}
+        for name, lab in labels.items():
+            codes = pd.factorize(lab[ok].astype(str), sort=True)[0]
+            ari, nmi, ari_b, nmi_b = _bootstrap_ari_nmi(
+                codes, ref_codes, codes.max() + 1, len(ref_uniq), n_boot=n_boot, seed=seed
+            )
+            boots[name] = (ari_b, nmi_b)
+            rows.append({
+                'method': name, 'ARI': ari, 'NMI': nmi,
+                'ARI_lo': np.percentile(ari_b, 2.5), 'ARI_hi': np.percentile(ari_b, 97.5),
+                'NMI_lo': np.percentile(nmi_b, 2.5), 'NMI_hi': np.percentile(nmi_b, 97.5),
+            })
+        res_df = pd.DataFrame(rows).set_index('method')
+        print(res_df.round(3))
+
+        ## paired over shared bootstrap replicates, so the referee's own noise cancels
+        delta = boots[model_label][0] - boots['MultiVI'][0]
+        print(f'{model_label} - MultiVI  dARI={delta.mean():.3f}  95% CI '
+              f'[{np.percentile(delta, 2.5):.3f}, {np.percentile(delta, 97.5):.3f}]  '
+              f'P(>0)={(delta > 0).mean():.3f}')
+
+        cmap = _hungarian_map(
+            labels[model_label][ok].astype(str).to_numpy(), referee[ok].astype(str).to_numpy()
+        )
+        model_lab = labels[model_label].astype(str).map(lambda v: cmap.get(v, v))
+
+        palette = {c: plt.get_cmap('tab10')(i) for i, c in enumerate(sorted(ref_uniq))}
+        grey = '#e8e8e8'
+
+        def _scatter(ax, coords, lab, size, size_missing):
+            lab = pd.Series(np.asarray(lab, dtype=object))
+            good = np.isfinite(coords).all(axis=1)
+            missing = pd.isna(lab).to_numpy() | ~good
+            if missing.any():
+                ## keep_nmf drop-outs go underneath, small, so the colours cover them
+                ax.scatter(coords[missing & good, 0], coords[missing & good, 1],
+                           s=size_missing, c=grey, lw=0, rasterized=True, zorder=1)
+            for c in sorted(ref_uniq):
+                m = (lab == c).to_numpy() & good
+                if m.any():
+                    ax.scatter(coords[m, 0], coords[m, 1], s=size, color=palette[c],
+                               lw=0, rasterized=True, zorder=2)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_linewidth(0.6)
+
+        fig = plt.figure(figsize=(12.6, 5.2))
+        outer = gridspec.GridSpec(1, 2, width_ratios=[3.0, 1.35], wspace=0.20, figure=fig)
+        inner = gridspec.GridSpecFromSubplotSpec(2, 3, subplot_spec=outer[0, 0],
+                                                 wspace=0.06, hspace=0.08)
+        axes = np.array([[fig.add_subplot(inner[r, c]) for c in range(3)] for r in range(2)])
+        ax_bar = fig.add_subplot(outer[0, 1])
+
+        spaces = [
+            ('spatial', xy, s_spatial, s_missing),
+            ('Inflow-NMF UMAP', umap_ref, s_umap, s_umap),
+            (f'{model_label} UMAP', umap_model, s_umap, s_umap),
+        ]
+        rowsets = [('Inflow-NMF\n(referee)', referee), (f'{model_label}\n(k={referee_k})', model_lab)]
+        for r, (row_name, lab) in enumerate(rowsets):
+            for c, (space_name, coords, size, size_missing) in enumerate(spaces):
+                sub_lab = lab[ok] if coords is umap_ref else lab
+                _scatter(axes[r, c], coords, sub_lab, size, size_missing)
+                if r == 0:
+                    axes[r, c].set_title(space_name, fontsize=8.5, pad=3)
+            axes[r, 0].set_ylabel(row_name, fontsize=8.5, labelpad=3)
+
+        _draw_agreement_bar(
+            ax_bar, res_df, ceil_ari, referee_k,
+            {'tick': 7.5, 'label': 8.0, 'legend': 7.5, 'annot': 6.5},
+        )
+
+        handles = [plt.Line2D([], [], marker='o', ls='', ms=5, color=palette[c])
+                   for c in sorted(ref_uniq)]
+        fig.legend(handles, [str(c) for c in sorted(ref_uniq)], ncol=len(ref_uniq),
+                   frameon=False, fontsize=7.5, loc='lower center',
+                   bbox_to_anchor=(0.38, -0.03), handletextpad=0.2, columnspacing=0.9)
+
+        if save_name is not None:
+            save_figure_svg(fig, os.path.join(save_dir, f'{save_name}.svg'), dpi=dpi)
+        plt.show()
+
+        ## same bars again, standalone and at the size panel c is placed in the assembled
+        ## figure -- the copy inside this overview lives on a 12.6 in canvas and would have
+        ## to be scaled down by ~6x to fit, which is what shrinks its type to nothing
+        fig_panel_c = plot_referee_agreement_panel(
+            res_df, ceil_ari, referee_k, save_dir=save_dir
+        )
+        return {'scores': res_df, 'partitions': meta_df,
+                'ceiling': {'ARI': ceil_ari, 'NMI': ceil_nmi},
+                'delta_vs_multivi': delta, 'referee_k': referee_k, 'fig': fig,
+                'fig_panel_c': fig_panel_c}
+
+    source_referee_results = plot_source_referee_panels(
+        source_rna, mdata.mod['rna'], source_liana_results
+    )
+
+    ## Align by barcode rather than by position. nmf has already dropped the cells the
+    ## keep_nmf filter removed and may have been stratified-subsampled, so positional
+    ## correspondence with adata is not guaranteed -- and np.corrcoef only rejects a row
+    ## *count* mismatch, never a row *order* one. A silent misalignment therefore does not
+    ## raise: it produces a correlation matrix at the noise floor (SD ~ 1/sqrt(n), so
+    ## ~0.014 at n=5000) that looks like a real, if weak, result.
+    shared = adata.obs_names.intersection(nmf.obs_names)
+    assert len(shared) > 0, 'adata and nmf share no barcodes'
+    assert not shared.has_duplicates, 'duplicate barcodes make the alignment ambiguous'
+    if len(shared) < min(adata.n_obs, nmf.n_obs):
+        print(f'WARNING: adata ({adata.n_obs}) and nmf ({nmf.n_obs}) overlap in only '
+              f'{len(shared)} barcodes; correlating on those')
+    x1 = np.asarray(adata[shared].obsm['MultiGATE_source_aligned'])
+    x2 = np.asarray(nmf[shared].X)
+    print(f'NMF-MultiGATE correlation on {len(shared)} aligned cells, '
+          f'{x1.shape[1]} dimensions x {x2.shape[1]} factors')
     x1 = rankdata(x1, axis=0)
     x2 = rankdata(x2, axis=0)
     #x1 = np.argsort(x1, axis=0)
     #x2 = np.argsort(x2, axis=0)
     corrs = np.corrcoef(x1, x2, rowvar=False)
     corrs = corrs[x1.shape[1]:, :x1.shape[1]]
+    ## guard against the failure above coming back by another route: a real association
+    ## sits far above the null, whose SD is ~1/sqrt(n-1)
+    null_sd = 1.0 / np.sqrt(len(shared) - 1)
+    if np.abs(corrs).max() < 5 * null_sd:
+        print(f'WARNING: max |rho| = {np.abs(corrs).max():.3f} against a null SD of '
+              f'{null_sd:.3f} -- the embedding and the NMF factors are at the noise '
+              f'floor, check that the two are really row-aligned')
     corrs_df = pd.DataFrame(corrs, index=nmf.var_names.str.replace('Factor', 'NMF'))
     topk=3
-    corrs_order = pd.Series(corrs_df.apply(lambda x: corrs_df.index[np.argsort(x)[:topk]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values.tolist()
+    ## keep the topk factors most strongly associated with each MultiGATE dimension,
+    ## ranked by |rho| so that an anti-correlated factor counts as much as a correlated one
+    corrs_order = pd.Series(corrs_df.apply(lambda x: corrs_df.index[np.argsort(-np.abs(x))[:topk]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values.tolist()
     corr_top = corrs_df.loc[corrs_order]
-    cg = sns.clustermap(
+
+    def plot_nmf_multigate_corr_panel(
         corr_top,
-        cmap='coolwarm',
-        center=0.0,
-        figsize=(7, 4),
-        cbar_kws={'orientation': 'horizontal'},
-        cbar_pos=(0.25, 1.05, 0.55, 0.03),
+        panel='e_nmf_multigate_corr',
+        save_dir='/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis',
+        dpi=600,
+    ):
+        """Panel e of the assembled LIANA figure, at the size it is placed.
+
+        Replaces the seaborn clustermap: the clustermap's dendrograms are dropped at
+        assembly anyway, and its own layout manager fixes the tick/colorbar placement,
+        which is what forced the panel to be rescaled by hand. Here the ordering is
+        computed with the same average-linkage clustering, and the axes rectangles are
+        set explicitly so the panel lands at its declared size.
+        """
+        from scipy.cluster.hierarchy import leaves_list, linkage
+        from scipy.spatial.distance import pdist
+
+        ## rows MultiGATE dimensions, columns NMF factors: the orientation the panel is
+        ## placed in, with the labels on the outer edges of the assembled block
+        M = corr_top.T
+
+        def _order(mat):
+            if mat.shape[0] < 3:
+                return np.arange(mat.shape[0])
+            return leaves_list(linkage(pdist(mat, metric='euclidean'), method='average'))
+
+        M = M.iloc[_order(M.to_numpy()), :]
+        M = M.iloc[:, _order(M.to_numpy().T)]
+
+        ## symmetric limits off a robust quantile, so a single extreme cell cannot wash
+        ## the rest of the map out to white
+        vmax = float(np.nanpercentile(np.abs(M.to_numpy()), 99))
+        ## the colourbar takes the top band, so the factor-axis label moves to the bottom
+        ## and the map keeps the full panel width; the right band holds the dimension-axis
+        ## label. Both axis labels sit on outer edges of the assembled block.
+        ax_rect = [0.025, 0.050, 0.910, 0.840]
+        cbar_rect = [0.270, 0.935, 0.420, 0.018]
+
+        with plt.rc_context(PANEL_RC):
+            fig = panel_figure(panel)
+            cax = fig.add_axes(cbar_rect)
+            ax = fig.add_axes(ax_rect)
+            sns.heatmap(M, ax=ax, cmap='coolwarm', center=0.0, vmin=-vmax, vmax=vmax,
+                        cbar_ax=cax, cbar_kws={'orientation': 'horizontal'},
+                        xticklabels=False, yticklabels=False)
+
+            ## individual dimension identities are not read off this panel, so the ticks
+            ## go entirely; '(unsorted)' warns that position carries no meaning, the rows
+            ## and columns being in hierarchical-clustering order rather than index order
+            ax.yaxis.set_label_position('right')
+            ax.set_xlabel('Inflow-NMF dimensions (unsorted)',
+                          fontsize=PANEL_FS['label'], labelpad=3)
+            ax.set_ylabel('MultiGATE dimensions (unsorted)',
+                          fontsize=PANEL_FS['label'], labelpad=3)
+            ax.tick_params(length=0, width=0)
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_linewidth(0.4)
+
+            ## rank-transformed inputs, so these Pearson correlations are Spearman's rho.
+            ## Title rather than an axis label: it puts the name above a horizontal bar in
+            ## one line, leaving the space under the bar to the tick labels.
+            cbar = ax.collections[0].colorbar
+            cbar.outline.set_linewidth(0.4)
+            cax.xaxis.set_ticks_position('bottom')
+            cax.set_title('Spearman ρ', fontsize=PANEL_FS['label'], pad=2)
+            cbar.locator = mpl.ticker.MaxNLocator(nbins=4, symmetric=True)
+            cbar.update_ticks()
+            cax.tick_params(labelsize=PANEL_FS['tick'], length=1.2, width=0.4, pad=1.2)
+
+            if panel is not None:
+                save_panel_svg(fig, panel, save_dir=save_dir, dpi=dpi)
+        plt.show()
+        return fig
+
+    fig_panel_e = plot_nmf_multigate_corr_panel(corr_top)
+    save_plot_to_pdf(fig_panel_e, "liana_multigate_heatmap")
+
+    ## The per-arm ARI/NMI barplot that used to live here scored every arm against a
+    ## Leiden partition whose k was set by the referee's own fixed resolution, and scored
+    ## the target arms against a referee built on model-imputed coordinates. Both are
+    ## handled above by plot_source_referee_panels, at matched k and source-only.
+    ingested_nonspatial_source_concat_adata = sc.tl.ingest(
+        nonspatial_source_concat_adata, source_concat_adata,
+        embedding_method='umap', obs='leiden', inplace=False
     )
-    cg.ax_heatmap.set_xlabel('MultiGATE dimensions')
-    plt.show()
-
-    save_plot_to_pdf(cg.fig, "liana_multigate_heatmap")
-    plt.close(cg.fig)
-
-    ## compare ARI between NMF leiden and source, target and nonspatial-source leiden
-    from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-
-    def _extract_rna_leiden(concat_adata, nmf):
-        return concat_adata[
-            concat_adata.obs_names.str.split("_").str[0].isin(nmf.obs_names) &
-            concat_adata.obs['modality'].eq('rna')
-        ].obs['leiden']
-
-    def _align_source_series_to_nmf(series, nmf):
-        series = series.copy()
-        series.index = series.index.str.split("_").str[0]
-        series = series.loc[nmf.obs_names]
-        nmf_leiden = nmf.obs['leiden']
-        assert series.index.equals(nmf_leiden.index)
-        return series, nmf_leiden
-
-    def _align_target_series_to_nmf(series, nmf):
-        series = series.copy()
-        series.index = series.index.str.split("_").str[0]
-        duplicate_mask = series.index.duplicated(keep=False)
-        if duplicate_mask.any():
-            maj_labels = (
-                series.loc[duplicate_mask]
-                .groupby(level=0)
-                .agg(lambda x: x.value_counts().idxmax())
-            )
-            series = pd.concat([series.loc[~duplicate_mask], maj_labels]).sort_index()
-        overlap = series.index.intersection(nmf.obs_names)
-        if overlap.empty:
-            raise ValueError("No shared target observations between labels and LIANA NMF.")
-        series = series.loc[overlap]
-        nmf_leiden = nmf.obs['leiden'].loc[overlap]
-        series = series.loc[nmf_leiden.index]
-        assert series.index.equals(nmf_leiden.index)
-        return series, nmf_leiden
-
-    def _print_ari_nmi(label, ari, nmi):
-        print(f'{label} — ARI: {ari:.2f}, NMI: {nmi:.2f}')
-
-    ## teacher source
-    nmf = source_liana_results['nmf'].copy()
-    teacher_source_leiden, nmf_leiden = _align_source_series_to_nmf(_extract_rna_leiden(teacher_source_concat_adata, nmf), nmf)
-    teacher_source_ari = adjusted_rand_score(teacher_source_leiden, nmf_leiden)
-    teacher_source_nmi = normalized_mutual_info_score(teacher_source_leiden, nmf_leiden)
-    _print_ari_nmi('Teacher source', teacher_source_ari, teacher_source_nmi)
-
-    ## source
-    source_leiden, nmf_leiden = _align_source_series_to_nmf(_extract_rna_leiden(source_concat_adata, nmf), nmf)
-    source_ari = adjusted_rand_score(source_leiden, nmf_leiden)
-    source_nmi = normalized_mutual_info_score(source_leiden, nmf_leiden)
-    _print_ari_nmi('Source', source_ari, source_nmi)
-
-    ## nonspatial source
-    nonspatial_source_leiden, nmf_leiden = _align_source_series_to_nmf(_extract_rna_leiden(nonspatial_source_concat_adata, nmf), nmf)
-    nonspatial_source_ari = adjusted_rand_score(nonspatial_source_leiden, nmf_leiden)
-    nonspatial_source_nmi = normalized_mutual_info_score(nonspatial_source_leiden, nmf_leiden)
-    _print_ari_nmi('Nonspatial source', nonspatial_source_ari, nonspatial_source_nmi)
-
-    ## ingested nonspatial source
-    ingested_nonspatial_source_concat_adata = sc.tl.ingest(nonspatial_source_concat_adata, source_concat_adata, embedding_method='umap', obs='leiden', inplace=False)
-    ingested_nonspatial_source_leiden, nmf_leiden = _align_source_series_to_nmf(_extract_rna_leiden(ingested_nonspatial_source_concat_adata, nmf), nmf)
-    ingested_nonspatial_source_ari = adjusted_rand_score(ingested_nonspatial_source_leiden, nmf_leiden)
-    ingested_nonspatial_source_nmi = normalized_mutual_info_score(ingested_nonspatial_source_leiden, nmf_leiden)
-    _print_ari_nmi('Ingested nonspatial source', ingested_nonspatial_source_ari, ingested_nonspatial_source_nmi)
-
-    ## multivi source
-    multivi_source_leiden, nmf_leiden = _align_source_series_to_nmf(mdata.mod['rna'].obs['RNA_clusters'], nmf)
-    multivi_source_ari = adjusted_rand_score(multivi_source_leiden, nmf_leiden)
-    multivi_source_nmi = normalized_mutual_info_score(multivi_source_leiden, nmf_leiden)
-    _print_ari_nmi('MultiVI source', multivi_source_ari, multivi_source_nmi)
-
-    ## target
-    nmf = target_liana_results['nmf'].copy()
-    nmf_spatial = target_liana_results['nmf_spatial'].copy()
-
-    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
-    sc.pl.embedding(nmf_spatial, basis='spatial', color='leiden', s=80, na_color='lightgray', na_in_legend=False, ax=ax[0], show=False)
-    sc.pl.embedding(nmf, basis='umap', color='leiden', s=60, ax=ax[1], show=False)
-    if ax[1].get_legend() is not None:
-        ax[1].get_legend().remove()
-    plt.tight_layout(); plt.show()
-
-    target_leiden, nmf_leiden = _align_target_series_to_nmf(_extract_rna_leiden(target_concat_adata, nmf), nmf)
-    target_ari = adjusted_rand_score(target_leiden, nmf_leiden)
-    target_nmi = normalized_mutual_info_score(target_leiden, nmf_leiden)
-    _print_ari_nmi('Target', target_ari, target_nmi)
-
-    ## multivi target
-    multivi_target_leiden, nmf_leiden = _align_target_series_to_nmf(_extract_rna_leiden(multivi_target_concat_adata, nmf), nmf)
-    multivi_target_ari = adjusted_rand_score(multivi_target_leiden, nmf_leiden)
-    multivi_target_nmi = normalized_mutual_info_score(multivi_target_leiden, nmf_leiden)
-    _print_ari_nmi('MultiVI target', multivi_target_ari, multivi_target_nmi)
-
-    ## multivi target zero-shot
-    multivi_target_zero_shot_leiden, nmf_leiden = _align_target_series_to_nmf(_extract_rna_leiden(multivi_target_zero_shot_concat_adata, nmf), nmf)
-    multivi_target_zero_shot_ari = adjusted_rand_score(multivi_target_zero_shot_leiden, nmf_leiden)
-    multivi_target_zero_shot_nmi = normalized_mutual_info_score(multivi_target_zero_shot_leiden, nmf_leiden)
-    _print_ari_nmi('MultiVI target zero-shot', multivi_target_zero_shot_ari, multivi_target_zero_shot_nmi)
-
-    ## compare ARI and NMI between source, target and nonspatial-source
-    ari_nmi_df = pd.DataFrame({
-        'ARI': [teacher_source_ari, source_ari, target_ari, nonspatial_source_ari, ingested_nonspatial_source_ari, multivi_source_ari, multivi_target_ari, multivi_target_zero_shot_ari],
-        'NMI': [teacher_source_nmi, source_nmi, target_nmi, nonspatial_source_nmi, ingested_nonspatial_source_nmi, multivi_source_nmi, multivi_target_nmi, multivi_target_zero_shot_nmi]
-    }, index=['Teach. Source', 'Source', 'Target', 'Nsp Source', 'Nsp Source$^\dagger$', 'MultiVI Source', 'MultiVI Target', 'MultiVI Target$^\dagger$'])
-    ari_nmi_df.plot(kind='bar', rot=30, cmap='Set2', figsize=(8, 2.5)); plt.show()
 
     ## plot UMAP of source, target, nonspatial-source and ingested nonspatial-source
     fig, axs = plt.subplots(2, 2, figsize=(10, 10))
