@@ -583,12 +583,14 @@ def parse_args(notebook: bool = False):
     p.add_argument(
         "--metrics-mode",
         choices=["inline", "background", "load"],
-        default="inline",
+        default="background",
         help=(
-            "How to obtain the scib/FOSCTTM metrics. 'inline' computes them in "
-            "this process and blocks. 'background' launches metrics_bootstrap.py "
-            "as a detached job and continues immediately (plot later). 'load' "
-            "reads a finished job's results from --metrics-work-dir."
+            "How to obtain the scib/FOSCTTM metrics. 'background' (default) "
+            "launches metrics_bootstrap.py as a detached job and continues "
+            "immediately, so the barplot cell prints load instructions instead "
+            "of plotting until you re-run it with the results. 'inline' computes "
+            "them in this process and blocks. 'load' reads a finished job's "
+            "results from --metrics-work-dir."
         ),
     )
     p.add_argument(
@@ -2937,10 +2939,12 @@ def main():
     ## alone, and blocks the session for the duration. metrics_bootstrap.py runs
     ## the identical computation as a detached background job.
     ##
-    ##   'inline'     -- compute here and block (default)
-    ##   'background' -- launch the worker, return immediately, plot later
+    ##   'background' -- launch the worker, return immediately, plot later (default)
+    ##   'inline'     -- compute here and block
     ##   'load'       -- read a finished worker CSV and plot
-    metrics_mode = getattr(args, "metrics_mode", "inline")
+    ## defaults here must match the argparse default, so that an interactive
+    ## `args` namespace predating this flag still runs non-blocking
+    metrics_mode = getattr(args, "metrics_mode", "background")
     try:
         _metrics_default_dir = os.path.join(output_dir, "metrics_bootstrap")
     except NameError:  # cell run before the output-directory cell
@@ -3095,7 +3099,7 @@ def main():
             ignore_index=True,
         )
 
-    #%% plot the scib / FOSCTTM barplot
+    #%% [RESUME FROM BOOTSTRAP SCIB] plot the scib / FOSCTTM barplot
     ##
     ## This cell only needs `model_metrics_df`, so it can be re-run on its own
     ## once a background bootstrap has finished:
@@ -3111,13 +3115,19 @@ def main():
             "then re-run this cell.".format(d=metrics_work_dir)
         )
     else:
-        model_metrics_df = model_metrics_df.loc[
+        ## Work on a local copy so re-running this cell does not permanently
+        ## rename metric_name in the session-level model_metrics_df (otherwise
+        ## a second pass keeps only 'total', the one name shared by both the
+        ## raw and display vocabularies).
+        plot_metrics_df = model_metrics_df.loc[
             model_metrics_df['metric_name'].isin(
                 ['foscttm', 'ilisi', 'clisi', 'graph_connectivity',
-                 'bio_conservation', 'total']
+                 'bio_conservation', 'total',
+                 # already-renamed names from a prior pass of this cell
+                 '1-FOSCTTM', 'iLISI', 'cLISI', 'graph conn.', 'bio_cons.']
             )
         ].copy()
-        model_metrics_df['metric_name'] = model_metrics_df['metric_name'].replace({
+        plot_metrics_df['metric_name'] = plot_metrics_df['metric_name'].replace({
             'bio_conservation': 'bio_cons.',
             'foscttm': '1-FOSCTTM',
             'ilisi': 'iLISI',
@@ -3131,9 +3141,9 @@ def main():
         ## bootstrap run predates them, so keep only the metrics actually present.
         metric_sort_order = [
             m for m in ['1-FOSCTTM', 'iLISI', 'cLISI', 'graph conn.', 'bio_cons.', 'total']
-            if m in set(model_metrics_df['metric_name'])
+            if m in set(plot_metrics_df['metric_name'])
         ]
-        model_metrics_df = model_metrics_df.set_index('metric_name').loc[metric_sort_order].reset_index()
+        plot_metrics_df = plot_metrics_df.set_index('metric_name').loc[metric_sort_order].reset_index()
 
         ## ── domains, grouped into source / target blocks ───────────────────
         ##
@@ -3144,7 +3154,7 @@ def main():
         ## comparable WITHIN a block only, so the blocks get their own ROW of
         ## panels (one row per block, one column per metric, independent y axes)
         ## instead of sharing an axis that invites the cross-block read.
-        available_domains = set(model_metrics_df['domain'])
+        available_domains = set(plot_metrics_df['domain'])
 
         ## `target_multivi` is MultiVI retrained from scratch on the target
         ## sample. It is not solving the transfer task every other entry solves,
@@ -3203,10 +3213,10 @@ def main():
         ## (metric, domain) -> point estimate + bootstrap interval
         metric_lookup = {
             (row.metric_name, row.domain): (row.value, row.ci_low, row.ci_high)
-            for row in model_metrics_df.itertuples()
+            for row in plot_metrics_df.itertuples()
         }
 
-        def plot_scib_barplot(domains_to_plot, filename, panel_width=2.3, panel_height=2.6):
+        def plot_scib_barplot(domains_to_plot, filename, panel_width=0.81, panel_height=0.732):
             """One row of panels per domain block, one column per metric."""
             blocks = [
                 (name, [d for d in doms if d in domains_to_plot])
@@ -3239,7 +3249,7 @@ def main():
                             bar_idx, value, width=0.8,
                             color=domain_palette[domain],
                             edgecolor='#555555' if domain in in_sample_domains else '#cccccc',
-                            linewidth=1,
+                            linewidth=0.4,
                             ## hatched = scored on the cells the model was trained on
                             hatch=in_sample_hatch if domain in in_sample_domains else None,
                         )[0]
@@ -3248,16 +3258,19 @@ def main():
                                 patch.get_x() + patch.get_width() / 2,
                                 value,
                                 yerr=[[max(value - ci_low, 0.0)], [max(ci_high - value, 0.0)]],
-                                fmt='none', ecolor='#444444', elinewidth=1, capsize=2, zorder=3,
+                                fmt='none', ecolor='#444444', elinewidth=0.4, capsize=0.8, zorder=3,
                             )
                             extrema.extend([ci_low, ci_high])
 
                     ax.set_xticks([])
                     ax.set_xlim(-0.7, len(block_domains) - 0.3)
+                    ax.tick_params(axis='y', labelsize=4.5, width=0.3, length=1.5, pad=1)
+                    for spine in ax.spines.values():
+                        spine.set_linewidth(0.25)
                     if row_idx == 0:
-                        ax.set_title(metric_name)
+                        ax.set_title(metric_name, fontsize=5.5)
                     if col_idx == 0:
-                        ax.set_ylabel(block_name, fontweight='bold')
+                        ax.set_ylabel(block_name, fontweight='bold', fontsize=5.5, labelpad=2)
 
                     # Zoom the y axis onto the range actually occupied (error bars included)
                     extrema = [v for v in extrema if np.isfinite(v) and v > 0]
@@ -3288,8 +3301,9 @@ def main():
                 handles=legend_handles,
                 bbox_to_anchor=(0.5, 1.02), loc='lower center',
                 ncol=min(4, len(legend_handles)), borderaxespad=0.,
+                fontsize=5.0,
             )
-            fig.tight_layout()
+            fig.tight_layout(pad=0.2, w_pad=0.5, h_pad=0.3)
             if len(blocks) > 1:
                 ## bbox_inches='tight' in the save helper keeps this note in the PDF
                 fig.text(
@@ -3297,7 +3311,7 @@ def main():
                     "cLISI / bio_cons. / total use a different label set per row "
                     "(source: RNA_clusters, target: CellTypist);\ncompare within a "
                     "row only. Rows have independent y axes.",
-                    ha="center", va="top", fontsize=9, color="#444444",
+                    ha="center", va="top", fontsize=4.5, color="#444444",
                 )
             save_figure_svg(
                 fig,
@@ -4335,6 +4349,444 @@ def main():
 
         return pls, pls_coef_df, pls_coef_df_sorted
 
+    def plot_pls_biological_annotation(
+        source_adata,
+        target_adata,
+        source_pls,
+        target_pls,
+        source_loadings,
+        target_loadings,
+        n_pairs=5,
+        n_permutations=2000,
+        random_seed=42,
+        fdr_threshold=0.05,
+        save_path="/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis/12_pls_biological_annotation.svg",
+    ):
+        """Plot matched, sign-aligned RNA PLS module enrichments.
+
+        Source component signs remain unchanged. Target components are matched by
+        absolute gene-loading correlation and flipped when their signed loading
+        correlation with the source is negative. The identical target sign is
+        applied to new ``*_plot`` spatial-score columns in ``target_adata.obs``.
+        """
+        from scipy.optimize import linear_sum_assignment
+
+        modules = {
+            "Oligodendrocyte / myelin": [
+                "Mobp", "Mal", "Mag", "Mbp", "Plp1", "Cnp",
+            ],
+            "Striatal / MSN signaling": [
+                "Pde10a", "Rgs9", "Gng7", "Ppp1r1b", "Drd1", "Adora2a",
+            ],
+            "Mural / smooth muscle": [
+                "Cald1", "Myh11", "Mylk", "Acta2", "Tagln", "Rgs5", "Pdgfrb",
+            ],
+            "Endothelial / BBB": [
+                "Flt1", "Abcb1a", "Slco1c1", "Kdr", "Cldn5", "Pecam1",
+            ],
+            "Astrocyte": [
+                "Aqp4", "Slc1a3", "Aldoc", "Gfap", "S100b", "Glul",
+            ],
+            "ECM / adhesion": [
+                "Col1a1", "Col1a2", "Col3a1", "Col5a1", "Dcn", "Fn1",
+            ],
+        }
+        module_display = {
+            "Oligodendrocyte / myelin": "Oligodendrocyte\nmyelin",
+            "Striatal / MSN signaling": "Striatal\nMSN",
+            "Mural / smooth muscle": "Mural\nsmooth muscle",
+            "Endothelial / BBB": "Endothelial\nBBB",
+            "Astrocyte": "Astrocyte",
+            "ECM / adhesion": "ECM\nadhesion",
+        }
+
+        source_loadings = source_loadings.copy()
+        target_loadings = target_loadings.copy()
+        source_loadings.columns = source_loadings.columns.astype(str)
+        target_loadings.columns = target_loadings.columns.astype(str)
+        source_loadings = source_loadings.T.groupby(level=0, sort=False).mean().T
+        target_loadings = target_loadings.T.groupby(level=0, sort=False).mean().T
+
+        shared_genes = source_loadings.columns.intersection(target_loadings.columns)
+        if len(shared_genes) < 10:
+            raise ValueError(
+                "PLS biological annotation requires at least 10 shared genes; "
+                f"found {len(shared_genes)}."
+            )
+
+        source_shared = source_loadings.loc[:, shared_genes].to_numpy(dtype=float)
+        target_shared = target_loadings.loc[:, shared_genes].to_numpy(dtype=float)
+        loading_corr = np.corrcoef(source_shared, target_shared)
+        loading_corr = loading_corr[
+            : len(source_loadings),
+            len(source_loadings) :,
+        ]
+        loading_corr = np.nan_to_num(loading_corr)
+
+        source_indices, target_indices = linear_sum_assignment(
+            -np.abs(loading_corr)
+        )
+        matched_indices = sorted(
+            zip(source_indices, target_indices),
+            key=lambda pair: pair[0],
+        )[:n_pairs]
+        if not matched_indices:
+            raise ValueError("No source-target PLS component matches were found.")
+
+        pair_ids = [f"pair_{i}" for i in range(len(matched_indices))]
+        source_matched = []
+        target_matched = []
+        match_records = []
+
+        for pair_id, (source_i, target_i) in zip(pair_ids, matched_indices):
+            source_name = str(source_loadings.index[source_i])
+            target_name = str(target_loadings.index[target_i])
+            corr_value = float(loading_corr[source_i, target_i])
+            target_sign = -1.0 if corr_value < 0 else 1.0
+
+            source_matched.append(
+                source_loadings.iloc[source_i].to_numpy(dtype=float)
+            )
+            target_matched.append(
+                target_sign
+                * target_loadings.iloc[target_i].to_numpy(dtype=float)
+            )
+            match_records.append(
+                {
+                    "pair_id": pair_id,
+                    "source_component": source_name,
+                    "target_component": target_name,
+                    "source_index": int(source_i),
+                    "target_index": int(target_i),
+                    "loading_correlation": corr_value,
+                    "target_sign": target_sign,
+                }
+            )
+
+        source_matched = pd.DataFrame(
+            source_matched,
+            index=pair_ids,
+            columns=source_loadings.columns,
+        )
+        target_matched = pd.DataFrame(
+            target_matched,
+            index=pair_ids,
+            columns=target_loadings.columns,
+        )
+
+        def module_loading_enrichment(loadings, seed):
+            rng = np.random.default_rng(seed)
+            genes = loadings.columns.astype(str)
+            gene_to_position = {
+                gene: position for position, gene in enumerate(genes)
+            }
+            scores = pd.DataFrame(
+                np.nan,
+                index=list(modules),
+                columns=loadings.index,
+                dtype=float,
+            )
+            pvalues = scores.copy()
+            random_indices = {}
+
+            for module_name, module_genes in modules.items():
+                positions = [
+                    gene_to_position[gene]
+                    for gene in module_genes
+                    if gene in gene_to_position
+                ]
+                module_size = len(positions)
+                if module_size < 2:
+                    print(
+                        f"[WARN] Skipping {module_name!r}: only "
+                        f"{module_size} module genes were found."
+                    )
+                    continue
+
+                if module_size not in random_indices:
+                    random_indices[module_size] = np.vstack(
+                        [
+                            rng.choice(
+                                len(genes),
+                                size=module_size,
+                                replace=False,
+                            )
+                            for _ in range(n_permutations)
+                        ]
+                    )
+                null_indices = random_indices[module_size]
+
+                for component in loadings.index:
+                    weights = loadings.loc[component].to_numpy(dtype=float)
+                    weights = np.nan_to_num(
+                        weights,
+                        nan=float(np.nanmedian(weights)),
+                        posinf=0.0,
+                        neginf=0.0,
+                    )
+                    weight_sd = weights.std(ddof=1)
+                    if weight_sd == 0:
+                        continue
+
+                    weights = (weights - weights.mean()) / weight_sd
+                    observed = weights[positions].mean()
+                    null = weights[null_indices].mean(axis=1)
+                    null_mean = null.mean()
+                    null_sd = null.std(ddof=1)
+
+                    scores.loc[module_name, component] = (
+                        observed - null_mean
+                    ) / max(null_sd, 1e-12)
+                    pvalues.loc[module_name, component] = (
+                        1
+                        + np.sum(
+                            np.abs(null - null_mean)
+                            >= abs(observed - null_mean)
+                        )
+                    ) / (n_permutations + 1)
+
+            return scores, pvalues
+
+        source_scores, source_pvalues = module_loading_enrichment(
+            source_matched,
+            seed=random_seed,
+        )
+        target_scores, target_pvalues = module_loading_enrichment(
+            target_matched,
+            seed=random_seed + 1,
+        )
+
+        heat_scores = pd.DataFrame(index=list(modules))
+        heat_pvalues = pd.DataFrame(index=list(modules))
+        column_ids = []
+        column_domains = []
+        pair_labels = []
+
+        def component_number(component_name):
+            return str(component_name).replace("PLS_", "")
+
+        for pair_id, match in zip(pair_ids, match_records):
+            source_column = f"{pair_id}_source"
+            target_column = f"{pair_id}_target"
+            column_ids.extend([source_column, target_column])
+            column_domains.extend(["Source", "Target"])
+            heat_scores[source_column] = source_scores[pair_id]
+            heat_scores[target_column] = target_scores[pair_id]
+            heat_pvalues[source_column] = source_pvalues[pair_id]
+            heat_pvalues[target_column] = target_pvalues[pair_id]
+
+            source_number = component_number(match["source_component"])
+            target_number = component_number(match["target_component"])
+            pair_labels.append(
+                f"PLS {source_number}"
+                if source_number == target_number
+                else f"PLS {source_number}\N{LEFT RIGHT ARROW}{target_number}"
+            )
+
+        def bh_adjust(values):
+            values = np.asarray(values, dtype=float)
+            adjusted = np.full(values.shape, np.nan)
+            valid = np.isfinite(values)
+            pvalues = values[valid]
+            if len(pvalues) == 0:
+                return adjusted
+
+            order = np.argsort(pvalues)
+            ranked = pvalues[order]
+            qvalues = ranked * len(ranked) / np.arange(
+                1,
+                len(ranked) + 1,
+            )
+            qvalues = np.minimum.accumulate(qvalues[::-1])[::-1]
+            qvalues = np.clip(qvalues, 0, 1)
+            restored = np.empty_like(qvalues)
+            restored[order] = qvalues
+            adjusted[valid] = restored
+            return adjusted
+
+        heat_qvalues = pd.DataFrame(
+            bh_adjust(heat_pvalues.to_numpy().ravel()).reshape(
+                heat_pvalues.shape
+            ),
+            index=heat_pvalues.index,
+            columns=heat_pvalues.columns,
+        )
+
+        module_ids = [f"module_{i}" for i in range(len(heat_scores))]
+        module_labels = [
+            module_display.get(module_name, module_name)
+            for module_name in heat_scores.index
+        ]
+        plot_obs = pd.DataFrame(
+            {
+                "module_id": pd.Categorical(
+                    module_ids,
+                    categories=module_ids,
+                    ordered=True,
+                ),
+                "module_label": module_labels,
+            },
+            index=module_ids,
+        )
+        plot_var = pd.DataFrame(
+            {"domain": column_domains},
+            index=column_ids,
+        )
+        plot_adata = sc.AnnData(
+            X=heat_scores.to_numpy(dtype=np.float32),
+            obs=plot_obs,
+            var=plot_var,
+        )
+
+        finite_values = np.abs(heat_scores.to_numpy())
+        finite_values = finite_values[np.isfinite(finite_values)]
+        vmax = (
+            np.percentile(finite_values, 95)
+            if finite_values.size
+            else 1
+        )
+        vmax = max(vmax, 1)
+
+        mp = sc.pl.matrixplot(
+            plot_adata,
+            var_names=column_ids,
+            groupby="module_id",
+            cmap="RdBu_r",
+            vmin=-vmax,
+            vmax=vmax,
+            colorbar_title="",
+            figsize=(11, 12.0),
+            return_fig=True,
+        )
+        mp.make_figure()
+        axes = mp.get_axes()
+        ax = axes["mainplot_ax"]
+        fig = ax.figure
+
+        ax.set_xticklabels(column_domains, rotation=90, ha="center", fontsize=16)
+        ax.set_yticklabels(module_labels, rotation=0, fontsize=16)
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+
+        for pair_i, pair_label in enumerate(pair_labels):
+            ax.text(
+                2 * pair_i + 1,
+                1.035,
+                pair_label,
+                transform=ax.get_xaxis_transform(),
+                ha="center",
+                va="bottom",
+                fontsize=16,
+                fontweight="bold",
+                clip_on=False,
+            )
+
+        for boundary in range(2, 2 * len(pair_ids), 2):
+            ax.axvline(
+                boundary,
+                color="black",
+                linewidth=1.1,
+                clip_on=False,
+            )
+
+        for row in range(heat_qvalues.shape[0]):
+            for column in range(heat_qvalues.shape[1]):
+                qvalue = heat_qvalues.iat[row, column]
+                if np.isfinite(qvalue) and qvalue < fdr_threshold:
+                    score = heat_scores.iat[row, column]
+                    star_color = (
+                        "white" if abs(score) > 0.65 * vmax else "black"
+                    )
+                    ax.text(
+                        column + 0.5,
+                        row + 0.5,
+                        "*",
+                        ha="center",
+                        va="center",
+                        color=star_color,
+                        fontsize=22,
+                        fontweight="bold",
+                    )
+
+        fig.subplots_adjust(
+            left=0.30,
+            right=0.95,
+            bottom=0.15,
+            top=0.90,
+        )
+
+        # Scanpy creates a horizontal colorbar in a dedicated axes. Move that
+        # axes beneath the main plot and anchor it to the bottom-left.
+        colorbar_ax = axes.get("color_legend_ax")
+        if colorbar_ax is not None:
+            main_position = ax.get_position()
+            colorbar_ax.set_position(
+                [
+                    main_position.x0,
+                    0.03,
+                    main_position.width * 0.15,
+                    0.025,
+                ]
+            )
+            colorbar_ax.set_title(
+                "Signed loading\nenrichment",
+                loc="left",
+                fontsize=16,
+                pad=4,
+            )
+            colorbar_ax.tick_params(labelsize=14)
+
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with plt.rc_context({"svg.fonttype": "none"}):
+            fig.savefig(
+                save_path,
+                format="svg",
+                bbox_inches="tight",
+                dpi=300,
+            )
+        print(f"Saved: {save_path}")
+        plt.show()
+
+        source_scores_spatial = source_pls.transform(
+            source_adata.obsm["MultiGATE_source_aligned"]
+        )
+        target_scores_spatial = target_pls.transform(
+            target_adata.obsm["MultiGATE_source_aligned"]
+        )
+        source_spatial_columns = []
+        target_spatial_columns = []
+
+        for match in match_records:
+            source_column = f"{match['source_component']}_plot"
+            target_column = f"{match['target_component']}_plot"
+            source_adata.obs[source_column] = source_scores_spatial[
+                :,
+                match["source_index"],
+            ]
+            target_adata.obs[target_column] = (
+                match["target_sign"]
+                * target_scores_spatial[:, match["target_index"]]
+            )
+            source_spatial_columns.append(source_column)
+            target_spatial_columns.append(target_column)
+
+        match_table = pd.DataFrame(match_records)
+        print("\nPLS component matching and target sign alignment:")
+        print(match_table.to_string(index=False))
+        print("Source spatial columns:", source_spatial_columns)
+        print("Target spatial columns:", target_spatial_columns)
+
+        return {
+            "figure": fig,
+            "matrixplot": mp,
+            "match_table": match_table,
+            "scores": heat_scores,
+            "qvalues": heat_qvalues,
+            "source_spatial_columns": source_spatial_columns,
+            "target_spatial_columns": target_spatial_columns,
+            "save_path": save_path,
+        }
+
     def get_liana_lrdata(adata, cell_type_col, lr_pairs):
 
         adata.X = adata.layers["SCT_data"].copy()
@@ -4392,6 +4844,16 @@ def main():
     pls_target_rna, pls_target_rna_coef_df, _ = run_pls_embedding_to_gene_plots(target_rna, save_plots=False, plot_prefix='02_target_rna_pls', censor_gene_from_plot=['C530008M17Rik'])
     pls_source_atac, pls_source_atac_coef_df, _ = run_pls_embedding_to_gene_plots(source_atac, save_plots=False, plot_prefix='03_source_atac_pls')
     pls_target_atac, pls_target_atac_coef_df, _ = run_pls_embedding_to_gene_plots(target_atac, save_plots=False, plot_prefix='04_target_atac_pls')
+
+    pls_biological_annotation_results = plot_pls_biological_annotation(
+        source_adata=source_rna,
+        target_adata=target_rna,
+        source_pls=pls_source_rna,
+        target_pls=pls_target_rna,
+        source_loadings=pls_source_rna_coef_df,
+        target_loadings=pls_target_rna_coef_df,
+        n_pairs=5,
+    )
 
     ## plot correlation between source and target PLS dimensions
     fig, ax = plt.subplots(2, 1, figsize=(4, 8))
