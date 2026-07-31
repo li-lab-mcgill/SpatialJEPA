@@ -112,17 +112,58 @@ def save_figure_pdf_vector_raster(fig, filepath, dpi=300):
     finally:
         fonttools_logger.setLevel(prev_level)
 
-def save_plot_to_pdf(fig, filename, save_dir="/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis", dpi=300):
+# Manuscript figure root (outside the MultiGATE repo). Relative save paths are
+# redirected here so interactive `fig.savefig('foo.svg')` / SAVE_SVG basenames
+# cannot land under scripts/ when the IPython cwd is MultiGATE/scripts.
+CIBB_FIGURES_DIR = "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures"
+CIBB_PLS_FIGURES_DIR = os.path.join(CIBB_FIGURES_DIR, "pls_analysis")
+
+
+def resolve_cibb_figure_path(filepath, default_dir=None):
+    """Resolve a figure path into the CIBB figures tree.
+
+    Absolute paths are left alone. Bare filenames and other relative paths are
+    joined under ``default_dir`` (defaults to ``CIBB_PLS_FIGURES_DIR``).
+    """
+    if default_dir is None:
+        default_dir = CIBB_PLS_FIGURES_DIR
+    if os.path.isabs(filepath):
+        return filepath
+    return os.path.join(default_dir, filepath)
+
+
+def save_plot_to_pdf(fig, filename, save_dir=None, dpi=300):
     """Save figure as a fast-rendering PDF with heavy plot layers rasterized."""
-    filepath = os.path.join(save_dir, f"{filename}.pdf")
+    if save_dir is None:
+        save_dir = CIBB_PLS_FIGURES_DIR
+    filepath = resolve_cibb_figure_path(
+        filename if str(filename).endswith(".pdf") else f"{filename}.pdf",
+        default_dir=save_dir,
+    )
     save_figure_pdf_vector_raster(fig, filepath, dpi=dpi)
     print(f"Saved: {filepath}")
     plt.close(fig)
 
 
+def save_plot_to_svg(fig, filename, save_dir=None, dpi=300):
+    """Save figure as an SVG with heavy plot layers rasterized and text/axes vector.
+
+    Same call signature and closing behaviour as save_plot_to_pdf, so the two are
+    interchangeable at call sites.
+    """
+    if save_dir is None:
+        save_dir = CIBB_PLS_FIGURES_DIR
+    filepath = resolve_cibb_figure_path(
+        filename if str(filename).endswith(".svg") else f"{filename}.svg",
+        default_dir=save_dir,
+    )
+    save_figure_svg(fig, filepath, dpi=dpi)
+    plt.close(fig)
+
 
 def save_figure_svg(fig, filepath, dpi=300):
     """Save an SVG with dense scatter layers rasterized and text/axes vector."""
+    filepath = resolve_cibb_figure_path(filepath)
     rasterize_heavy_pdf_artists(fig)
     d = os.path.dirname(filepath)
     if d:
@@ -182,7 +223,7 @@ def panel_figure(panel):
     return plt.figure(figsize=PANEL_SIZE_IN[panel])
 
 
-def save_panel_svg(fig, panel, save_dir="/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis", dpi=600):
+def save_panel_svg(fig, panel, save_dir=None, dpi=600):
     """Save a composite panel at its declared physical size.
 
     No ``bbox_inches='tight'`` on purpose: trimming crops each panel by a
@@ -190,7 +231,9 @@ def save_panel_svg(fig, panel, save_dir="/home/mcb/users/dmannk/THESIS_base/over
     at mismatched scales. Axes rectangles are set explicitly instead, so the
     declared figsize is the size the panel occupies on the page.
     """
-    filepath = os.path.join(save_dir, f"{panel}.svg")
+    if save_dir is None:
+        save_dir = CIBB_PLS_FIGURES_DIR
+    filepath = resolve_cibb_figure_path(f"{panel}.svg", default_dir=save_dir)
     d = os.path.dirname(filepath)
     if d:
         os.makedirs(d, exist_ok=True)
@@ -4129,7 +4172,7 @@ def main():
         seed=0,
         pitch_ref=2.0,
         panel='d_heldout_cdf',
-        save_dir='/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis',
+        save_dir=CIBB_PLS_FIGURES_DIR,
         show_summary_table=False,
         dpi=600,
     ):
@@ -4401,7 +4444,7 @@ def main():
         ceil_ari,
         referee_k,
         panel='c_referee_agreement',
-        save_dir='/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis',
+        save_dir=CIBB_PLS_FIGURES_DIR,
         dpi=600,
     ):
         """Panel c of the assembled LIANA figure, at the size it is placed."""
@@ -4434,7 +4477,7 @@ def main():
         s_umap=3.0,
         s_missing=2.5,
         save_name='liana_source_referee_panels',
-        save_dir='/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis',
+        save_dir=CIBB_PLS_FIGURES_DIR,
         dpi=96,
     ):
         ## align MultiVI rows onto source_rna barcodes; all methods share the resulting spots
@@ -4663,7 +4706,7 @@ def main():
     def plot_nmf_multigate_corr_panel(
         corr_top,
         panel='e_nmf_multigate_corr',
-        save_dir='/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis',
+        save_dir=CIBB_PLS_FIGURES_DIR,
         dpi=600,
     ):
         """Panel e of the assembled LIANA figure, at the size it is placed.
@@ -4736,7 +4779,7 @@ def main():
         return fig
 
     fig_panel_e = plot_nmf_multigate_corr_panel(corr_top)
-    save_plot_to_pdf(fig_panel_e, "liana_multigate_heatmap")
+    save_plot_to_svg(fig_panel_e, "liana_multigate_heatmap")
 
     ## The per-arm ARI/NMI barplot that used to live here scored every arm against a
     ## Leiden partition whose k was set by the referee's own fixed resolution, and scored
@@ -4766,8 +4809,13 @@ def main():
         adata, full_adata=None, umap_title=None, save_plots=False, plot_prefix='',
         umap_plot_prefix=None, spatial_leiden_plot_prefix=None,
         n_components=9, basis='spatial', weights_plot_type='staircase', top_n_genes=5, heatmap_cmap='YlGn',
-        censor_gene_from_plot=None
+        censor_gene_from_plot=None, weights_dendrogram='rows'
     ):
+        ## weights_dendrogram (dotplot only): 'rows' draws a geneset dendrogram, 'both' also
+        ## clusters and draws PLS components, None just orders rows by linkage without
+        ## drawing. 'both' reorders the components, which breaks their natural
+        ## decreasing-covariance order and the correspondence with the PLS_0/1/2 spatial
+        ## panels, so it is opt-in.
         def join_obs_preserving_n_obs(base_obs, values_df):
             base_obs = base_obs.copy()
             values_df = values_df.copy()
@@ -4828,7 +4876,7 @@ def main():
             fig = plt.gcf()
             if save_plots:
                 save_prefix = umap_plot_prefix or plot_prefix
-                save_plot_to_pdf(fig, f"{save_prefix}_liana_umap_leiden")
+                save_plot_to_svg(fig, f"{save_prefix}_liana_umap_leiden")
             plt.show()
 
         if 'spatial' in adata_pls.obsm and 'leiden' in adata_pls.obs:
@@ -4844,7 +4892,7 @@ def main():
             plt.tight_layout()
             if save_plots:
                 save_prefix = spatial_leiden_plot_prefix or plot_prefix
-                save_plot_to_pdf(fig, f"{save_prefix}_spatial_leiden")
+                save_plot_to_svg(fig, f"{save_prefix}_spatial_leiden")
             plt.show()
 
         sc.pl.embedding(
@@ -4860,7 +4908,7 @@ def main():
             ax.set_ylabel('')
         plt.tight_layout()
         if save_plots:
-            save_plot_to_pdf(fig, f"{plot_prefix}_pls_embedding_spatial")
+            save_plot_to_svg(fig, f"{plot_prefix}_pls_embedding_spatial")
         plt.show()
 
         ## plot heatmap of PLS coef
@@ -4882,7 +4930,7 @@ def main():
             sns.heatmap(pls_coef_df_sorted_plot.T.abs(), cmap=heatmap_cmap, cbar=True)
             plt.tight_layout()
             if save_plots:
-                save_plot_to_pdf(fig, f"{plot_prefix}_pls_weights_heatmap_staircase")
+                save_plot_to_svg(fig, f"{plot_prefix}_pls_weights_heatmap_staircase")
             plt.show()
 
         elif weights_plot_type == 'barplot':
@@ -4910,8 +4958,115 @@ def main():
             ax.legend(handles=legend_elements, bbox_to_anchor=(0.5, -0.2), loc='upper center', ncol=2)
             plt.tight_layout()
             if save_plots:
-                save_plot_to_pdf(fig, f"{plot_prefix}_pls_weights_barplot")
+                save_plot_to_svg(fig, f"{plot_prefix}_pls_weights_barplot")
             plt.show()
+
+            pls_coef_df_sorted = None
+
+        elif weights_plot_type == 'dotplot':
+            ## geneset x PLS component. scanpy's dotplot normally encodes (fraction of cells
+            ## expressing, mean expression); both channels are overridden here with
+            ## |weight| and signed weight, so the size legend has to be relabelled.
+            from scipy.cluster.hierarchy import leaves_list, linkage
+            from scipy.spatial.distance import pdist
+
+            abbrev = {
+                'EPITHELIAL_MESENCHYMAL_TRANSITION': 'EMT',
+                'TNFA_SIGNALING_VIA_NFKB': 'TNFa / NF-kB',
+                'INTERFERON_GAMMA_RESPONSE': 'IFN-g response',
+                'INTERFERON_ALPHA_RESPONSE': 'IFN-a response',
+                'REACTIVE_OXYGEN_SPECIES_PATHWAY': 'ROS pathway',
+                'OXIDATIVE_PHOSPHORYLATION': 'OxPhos',
+                'UNFOLDED_PROTEIN_RESPONSE': 'Unfolded protein resp.',
+            }
+
+            def _pretty(name):
+                return abbrev.get(name, name.replace('_', ' ').capitalize())
+
+            weights = pls_coef_df.T.copy()          # rows = genesets, cols = PLS components
+
+            ## column clustering is opt-in: it reorders the PLS components, breaking their
+            ## decreasing-covariance order and the link to the PLS_0/1/2 spatial panels
+            col_link = None
+            if weights_dendrogram == 'both' and weights.shape[1] > 2:
+                col_link = linkage(pdist(weights.T.to_numpy()), method='average')
+                weights = weights.iloc[:, leaves_list(col_link)]
+            ## with a row dendrogram scanpy sets the row order itself; otherwise pre-sort
+            if weights_dendrogram not in ('rows', 'both') and len(weights) > 2:
+                weights = weights.iloc[
+                    leaves_list(linkage(pdist(weights.to_numpy()), method='average'))
+                ]
+            weights.index = [_pretty(i) for i in weights.index]
+            weights.columns = [str(c).replace('PLS_', '') for c in weights.columns]
+
+            lim = float(np.abs(weights.to_numpy()).max())
+            size_df = weights.abs() / lim           # dot size must be a fraction in [0, 1]
+
+            weights_adata = sc.AnnData(
+                X=weights.to_numpy().astype(np.float32),
+                obs=pd.DataFrame(index=pd.Index(weights.index, name=None)),
+                var=pd.DataFrame(index=pd.Index(weights.columns, name=None)),
+            )
+            weights_adata.obs['geneset'] = pd.Categorical(
+                weights.index, categories=list(weights.index)
+            )
+
+            draw_row_dendrogram = weights_dendrogram in ('rows', 'both') and len(weights) > 2
+            if draw_row_dendrogram:
+                ## one observation per category, so the category means scanpy clusters on
+                ## are the weight rows themselves
+                sc.tl.dendrogram(
+                    weights_adata, groupby='geneset', use_rep='X', n_pcs=None,
+                    cor_method='pearson', linkage_method='average', optimal_ordering=True,
+                )
+
+            dp = sc.pl.DotPlot(
+                weights_adata,
+                var_names=list(weights.columns),
+                groupby='geneset',
+                categories_order=None if draw_row_dendrogram else list(weights.index),
+                dot_color_df=weights,
+                dot_size_df=size_df,
+                vmin=-lim, vmax=lim, vcenter=0,
+                ## ~1.7:1, matching the panel h slot to the right of the schematic and the
+                ## PLS spatial maps: wide enough to fill it, short enough that the geneset
+                ## rows do not stretch apart
+                figsize=(0.52 * weights.shape[1] + 3.2, 0.36 * weights.shape[0] + 2.1),
+            )
+            dp.style(cmap='RdBu_r', dot_edge_color='0.25', dot_edge_lw=0.4,
+                     largest_dot=210, smallest_dot=2, grid=True)
+            dp.legend(size_title='|PLS weight|\n(rel. to max)', colorbar_title='PLS weight',
+                      width=1.3)
+            if draw_row_dendrogram:
+                dp.add_dendrogram(size=0.9)
+            dp.make_figure()
+
+            main_ax = dp.get_axes().get('mainplot_ax')
+            if main_ax is not None:
+                main_ax.set_xlabel('PLS component', fontsize=13)
+                ## geneset names carry the meaning, so give them the larger size
+                main_ax.tick_params(axis='y', labelsize=12)
+                main_ax.tick_params(axis='x', labelsize=10)
+                ## component numbers are short; scanpy rotates them 90 degrees by default
+                plt.setp(main_ax.get_xticklabels(), rotation=0, ha='center')
+            fig = getattr(dp, 'fig', None) or plt.gcf()
+
+            ## scanpy has no var-axis dendrogram, so draw the column one onto its own axes
+            ## above the main plot. scipy places leaves at 10*i + 5, so an x range of
+            ## [0, 10*n_cols] lines the leaves up with the dot columns.
+            if col_link is not None and main_ax is not None:
+                from scipy.cluster.hierarchy import dendrogram as _scipy_dendrogram
+
+                box = main_ax.get_position()
+                dax = fig.add_axes([box.x0, box.y1 + 0.012, box.width, 0.085])
+                _scipy_dendrogram(col_link, ax=dax, no_labels=True, color_threshold=0,
+                                  above_threshold_color='0.4', orientation='top')
+                dax.set_xlim(0, 10 * weights.shape[1])
+                dax.axis('off')
+
+            plt.show()
+            if save_plots:
+                save_plot_to_svg(fig, f"{plot_prefix}_pls_weights_dotplot")
 
             pls_coef_df_sorted = None
 
@@ -5440,9 +5595,9 @@ def main():
     ax[1].set_title('ATAC')
     fig.tight_layout()
     plt.show()
-    save_plot_to_pdf(fig, '11_pls_source_target_correlation_heatmaps')
+    save_plot_to_svg(fig, '11_pls_source_target_correlation_heatmaps')
 
-    ## build shared Hallmark mouse net once
+    #%% build shared Hallmark mouse net once
     hallmark_human = dc.op.hallmark(organism="human")
     map_path = os.path.join(os.environ["DATAPATH"], "gene_annotations", "human_mouse_gene_orthologs.csv")
     map_df = (
