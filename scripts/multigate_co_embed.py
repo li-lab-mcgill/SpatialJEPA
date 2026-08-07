@@ -4805,11 +4805,184 @@ def main():
     import decoupler.op
     import liana as li
 
+    def _apply_pls_component_signs(pls, signs):
+        ## coef_ is a product of one x-side and one y-side factor, so it is already
+        ## invariant under this flip and must be left alone; flipping it would change
+        ## the model's predictions.
+        n_comp = pls.x_rotations_.shape[1]
+        for attr in ('x_weights_', 'x_loadings_', 'x_rotations_',
+                     'y_weights_', 'y_loadings_', 'y_rotations_',
+                     'x_scores_', 'y_scores_'):
+            mat = getattr(pls, attr, None)
+            if mat is None or np.ndim(mat) != 2 or mat.shape[1] != n_comp:
+                continue
+            try:
+                setattr(pls, attr, mat * signs)
+            except AttributeError:  # read-only in some sklearn versions
+                continue
+
+    def orient_pls_components_by_markers(pls, Z, X, var_names, markers,
+                                         components=(0,), label=''):
+        ## Sign alignment makes the four models agree with each other, but the shared
+        ## convention it settles on is still arbitrary. Anchor it to biology: flip a
+        ## component so the marker set it is meant to highlight -- myelin genes over the
+        ## fibre tracts, for PLS_0 -- lands on the positive end of the map. Applied to
+        ## the reference model only; the other three inherit it through the alignment.
+        n_comp = pls.x_rotations_.shape[1]
+        signs = np.ones(n_comp)
+
+        var_index = pd.Index(var_names)
+        present = [g for g in markers if g in var_index]
+        if not present:
+            print('  PLS marker orientation{}: no marker present, skipped'.format(
+                ' [{}]'.format(label) if label else ''))
+            return signs
+
+        ## z-score per gene before averaging, so the signature is not just whichever
+        ## marker happens to be most highly expressed (Mbp/Plp1 dominate otherwise)
+        marker_X = np.asarray(X[:, var_index.get_indexer(present)], dtype=float)
+        marker_sd = marker_X.std(axis=0)
+        marker_sd[marker_sd == 0] = 1.0
+        marker_score = ((marker_X - marker_X.mean(axis=0)) / marker_sd).mean(axis=1)
+
+        T = pls.transform(Z)
+        corrs = {}
+        for i in components:
+            if i >= n_comp:
+                continue
+            corrs[i] = np.corrcoef(T[:, i], marker_score)[0, 1]
+            if np.isfinite(corrs[i]) and corrs[i] < 0:
+                signs[i] = -1.0
+
+        _apply_pls_component_signs(pls, signs)
+        print('  PLS marker orientation{}: {} markers ({}); {}'.format(
+            ' [{}]'.format(label) if label else '', len(present), ', '.join(present),
+            ', '.join('PLS_{} r={:+.2f}{}'.format(i, r, ' -> flipped' if signs[i] < 0 else '')
+                      for i, r in corrs.items())
+        ))
+        return signs
+
+    def align_pls_component_signs(pls, reference_pls, reference_Z, label=''):
+        ## A PLS component is defined only up to sign: negating its x- and y-side
+        ## vectors together leaves the fitted model identical, so the independently
+        ## fitted source/target x RNA/ATAC models can paint the same spatial pattern in
+        ## opposite colours. All four regress from the same source-aligned embedding, so
+        ## pushing one common Z through both models puts their scores on the same points
+        ## and the sign of the correlation says whether the two components agree.
+        n_comp = pls.x_rotations_.shape[1]
+        n_shared = min(n_comp, reference_pls.x_rotations_.shape[1])
+        t_ref = reference_pls.transform(reference_Z)
+        t = pls.transform(reference_Z)
+
+        signs = np.ones(n_comp)
+        corrs = np.full(n_comp, np.nan)
+        for i in range(n_shared):
+            corrs[i] = np.corrcoef(t_ref[:, i], t[:, i])[0, 1]
+            if np.isfinite(corrs[i]) and corrs[i] < 0:
+                signs[i] = -1.0
+
+        _apply_pls_component_signs(pls, signs)
+
+        flipped = np.flatnonzero(signs < 0)
+        detail = ', '.join('PLS_{} (r={:+.2f})'.format(i, corrs[i]) for i in flipped)
+        print('  PLS sign alignment{}: flipped {}/{} components{}'.format(
+            ' [{}]'.format(label) if label else '', flipped.size, n_shared,
+            ': {}'.format(detail) if flipped.size else ''
+        ))
+        return signs, corrs
+
+    def pls_loadings_df(pls, var_names):
+        """Component x feature gene weights, in the model's current sign convention.
+
+        A snapshot, not a view: anything that re-signs the model afterwards (see
+        ``refine_pls_signs_across_models``) leaves an old frame stale, and a stale frame
+        is what makes the enrichment heatmap disagree with the spatial maps.
+        """
+        return pd.DataFrame(
+            pls.y_weights_.T,
+            index=[f'PLS_{i}' for i in range(pls.y_weights_.shape[1])],
+            columns=var_names,
+        )
+
+    def refine_pls_signs_across_models(models, common_Z, n_show=5, reference=0,
+                                       apply=True):
+        """Choose each component's signs jointly across all models, and report agreement.
+
+        ``align_pls_component_signs`` fixes every model against one reference, which is
+        enough while a component is strongly shared. For the weaker later components two
+        non-reference models can each pick the sign that suits the reference and still
+        disagree with each other, so the signs are re-chosen here to maximise total
+        pairwise agreement instead (the reference is held fixed, so PLS_0 keeps its
+        myelin orientation).
+
+        The printout also says when a sign is not the problem: if a model's component
+        correlates more strongly with a *different* reference component, the two fits
+        have ordered or mixed their components differently and no flip can align them.
+        """
+        labels = [label for label, _ in models]
+        scores = [pls.transform(common_Z) for _, pls in models]
+        n_models = len(models)
+        n_comp = min(n_show, min(T.shape[1] for T in scores))
+
+        print('\nPLS component agreement across models '
+              '(score-map correlation on the common embedding):')
+        for k in range(n_comp):
+            stacked = np.column_stack([T[:, k] for T in scores])
+            corr = np.corrcoef(stacked, rowvar=False)
+            corr = np.nan_to_num(corr)
+
+            ## exhaustive over the 2^(n_models-1) sign patterns with the reference
+            ## pinned: n_models is 4 here, and the objective (total pairwise agreement)
+            ## has no structure worth exploiting at that size
+            best_signs, best_score = None, -np.inf
+            for bits in range(2 ** (n_models - 1)):
+                signs = np.ones(n_models)
+                for j, other in enumerate(i for i in range(n_models) if i != reference):
+                    signs[other] = -1.0 if (bits >> j) & 1 else 1.0
+                total = float(np.sum(np.outer(signs, signs) * corr) - n_models) / 2
+                if total > best_score:
+                    best_signs, best_score = signs, total
+
+            flipped = [labels[i] for i in np.flatnonzero(best_signs < 0)]
+            n_pairs = n_models * (n_models - 1) / 2
+            print('  PLS_{}: mean pairwise r {:+.2f}{}'.format(
+                k, best_score / n_pairs,
+                '   [flip: {}]'.format(', '.join(flipped)) if flipped else '   [no flip]',
+            ))
+
+            ## a flip only helps if component k really is the same direction in both
+            ## fits; check each model against every reference component
+            t_ref = scores[reference][:, k]
+            for i in range(n_models):
+                if i == reference:
+                    continue
+                cross = np.array([
+                    np.corrcoef(t_ref, scores[i][:, j])[0, 1]
+                    for j in range(scores[i].shape[1])
+                ])
+                cross = np.nan_to_num(cross)
+                best_j = int(np.argmax(np.abs(cross)))
+                if best_j != k:
+                    print('    {} PLS_{} matches {} PLS_{} better '
+                          '(|r|={:.2f} vs {:.2f} on the diagonal): a permuted or mixed '
+                          'component, which no sign flip can align.'.format(
+                              labels[i], k, labels[reference], best_j,
+                              abs(cross[best_j]), abs(cross[k])))
+
+            if apply:
+                for i in np.flatnonzero(best_signs < 0):
+                    signs_full = np.ones(scores[i].shape[1])
+                    signs_full[k] = -1.0
+                    _apply_pls_component_signs(models[i][1], signs_full)
+                    scores[i] = models[i][1].transform(common_Z)
+
     def run_pls_embedding_to_gene_plots(
         adata, full_adata=None, umap_title=None, save_plots=False, plot_prefix='',
         umap_plot_prefix=None, spatial_leiden_plot_prefix=None,
         n_components=9, basis='spatial', weights_plot_type='staircase', top_n_genes=5, heatmap_cmap='YlGn',
-        censor_gene_from_plot=None, weights_dendrogram='rows'
+        censor_gene_from_plot=None, weights_dendrogram='rows',
+        sign_reference_pls=None, sign_reference_Z=None,
+        orient_markers=None, orient_components=(0,)
     ):
         ## weights_dendrogram (dotplot only): 'rows' draws a geneset dendrogram, 'both' also
         ## clusters and draws PLS components, None just orders rows by linkage without
@@ -4847,8 +5020,23 @@ def main():
         X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
         Z = adata.obsm['MultiGATE_source_aligned'].copy()
 
-        pls = PLSRegression(n_components=n_components)  
+        pls = PLSRegression(n_components=n_components)
         pls.fit(Z, X)
+        ## flip before anything is derived from the fit, so the spatial maps, the
+        ## loadings heatmap/dotplot and the returned coef df all share one convention.
+        ## A reference model already carries the marker orientation, so the two paths
+        ## are exclusive: matching the reference is the stronger constraint.
+        if sign_reference_pls is not None and sign_reference_pls is not pls:
+            align_pls_component_signs(
+                pls, sign_reference_pls,
+                Z if sign_reference_Z is None else sign_reference_Z,
+                label=plot_prefix,
+            )
+        elif orient_markers is not None:
+            orient_pls_components_by_markers(
+                pls, Z, X, adata.var_names, orient_markers,
+                components=orient_components, label=plot_prefix,
+            )
         T = pls.transform(Z)
 
         ## plot PLS loadings onto embedding
@@ -4912,11 +5100,7 @@ def main():
         plt.show()
 
         ## plot heatmap of PLS coef
-        pls_coef_df = pd.DataFrame(
-            pls.y_weights_.T,
-            index=[f'PLS_{i}' for i in range(pls.y_weights_.shape[1])],
-            columns=adata.var_names
-        )
+        pls_coef_df = pls_loadings_df(pls, adata.var_names)
         if weights_plot_type == 'staircase':
             top_genes_sort = pls_coef_df.abs().apply(
                 lambda x: x.nlargest(top_n_genes).index, axis=1, result_type='reduce'
@@ -5072,6 +5256,130 @@ def main():
 
         return pls, pls_coef_df, pls_coef_df_sorted
 
+    def plot_pls_spatial_panel(
+        rows, n_show=3, basis='spatial', size=25, panel_in=2.0,
+        col_gap_in=0.30, row_gap_in=0.06, cbar_loc='right',
+        cmap='viridis', clip_percentile=99, frame_color='0.85', frame_lw=0.4,
+        cbar_label='PLS score', save_plots=False, plot_prefix='12_pls_spatial_panel'
+    ):
+        """Grid of the leading PLS score maps: one row per model, one column per component.
+
+        ``rows`` is a list of ``(row_label, adata, pls)``. The models are sign-aligned
+        upstream, so a column is directly comparable down the rows; the grid therefore
+        shares one colour scale and one colorbar rather than one per subpanel.
+
+        ``cbar_loc`` puts the shared colorbar in the right margin ('right') or under the
+        grid ('bottom'). Which one wins is a question of the shape of the slot the panel
+        has to fill in the assembled figure: 'right' plus wide ``col_gap_in`` squares up
+        a few-column grid, 'bottom' plus tight gaps keeps a many-column grid compact.
+        """
+        if cbar_loc not in ('right', 'bottom'):
+            raise ValueError("cbar_loc must be 'right' or 'bottom', got {!r}".format(cbar_loc))
+        pls_cols = [f'PLS_{i}' for i in range(n_show)]
+
+        ## score every model up front: a shared colour scale has to see all of them
+        ## before the first subpanel is drawn. Re-projecting here rather than writing
+        ## PLS_* into the source adatas keeps stale columns out of them.
+        scored = [
+            (row_label, adata,
+             pls.transform(adata.obsm['MultiGATE_source_aligned'])[:, :n_show])
+            for row_label, adata, pls in rows
+        ]
+        ## symmetric about zero and percentile-clipped, so the handful of extreme spots
+        ## visible in the target rows cannot wash out the pattern everywhere else
+        lim = float(np.percentile(
+            np.abs(np.concatenate([T.ravel() for _, _, T in scored])), clip_percentile
+        ))
+
+        ## lay the grid out in inches so each slot is exactly square. With box_aspect(1)
+        ## any slot/axes aspect mismatch comes back as whitespace inside the slot, which
+        ## is the one thing tight_layout cannot take out.
+        n_grid_rows, n_grid_cols = len(scored), n_show
+        ## whichever margin carries the colorbar gets the room for bar, tick labels and
+        ## axis label; the opposite margin closes up to nothing.
+        cbar_pad_in, cbar_thick_in = 0.16, 0.13
+        left_in, top_in = 0.62, 0.30
+        if cbar_loc == 'right':
+            right_in = cbar_pad_in + cbar_thick_in + 0.72  # ticks + rotated label
+            bottom_in = 0.10
+        else:
+            right_in = 0.08
+            bottom_in = cbar_pad_in + cbar_thick_in + 0.56  # ticks + label
+        grid_w_in = n_grid_cols * panel_in + (n_grid_cols - 1) * col_gap_in
+        grid_h_in = n_grid_rows * panel_in + (n_grid_rows - 1) * row_gap_in
+        fig_w = left_in + grid_w_in + right_in
+        fig_h = top_in + grid_h_in + bottom_in
+
+        fig, axs = plt.subplots(
+            n_grid_rows, n_grid_cols, figsize=(fig_w, fig_h), squeeze=False
+        )
+        fig.subplots_adjust(
+            left=left_in / fig_w, right=1 - right_in / fig_w,
+            top=1 - top_in / fig_h, bottom=bottom_in / fig_h,
+            ## matplotlib takes these as fractions of the mean axes size
+            wspace=col_gap_in / panel_in, hspace=row_gap_in / panel_in,
+        )
+
+        for r, (row_label, adata, T) in enumerate(scored):
+            adata_scores = sc.AnnData(
+                X=np.zeros((adata.n_obs, 1)),
+                obs=pd.DataFrame(T, index=adata.obs_names, columns=pls_cols),
+                obsm={basis: adata.obsm[basis].copy()},
+            )
+            for c, col in enumerate(pls_cols):
+                ax = axs[r, c]
+                sc.pl.embedding(
+                    adata_scores, basis=basis, color=col, ax=ax, show=False,
+                    size=size, frameon=True, title=col if r == 0 else '',
+                    cmap=cmap, vmin=-lim, vmax=lim, colorbar_loc=None,
+                )
+                ## square subpanels, as in the assembled CIBB figure. box_aspect fixes
+                ## the axes box itself; 'equal' with adjustable='datalim' then pads the
+                ## shorter data axis to fill it, so the tissue keeps its true geometry
+                ## instead of being stretched into the square.
+                ax.set_box_aspect(1)
+                ax.set_aspect('equal', adjustable='datalim')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_xlabel('')
+                ax.set_ylabel(row_label if c == 0 else '')
+                for spine in ax.spines.values():
+                    spine.set_color(frame_color)
+                    spine.set_linewidth(frame_lw)
+
+        ## one shared colorbar, half the length of the side it sits on and centred on it
+        if cbar_loc == 'right':
+            cbar_len_in = 0.5 * grid_h_in
+            cbar_rect = [
+                (left_in + grid_w_in + cbar_pad_in) / fig_w,
+                (bottom_in + 0.5 * (grid_h_in - cbar_len_in)) / fig_h,
+                cbar_thick_in / fig_w,
+                cbar_len_in / fig_h,
+            ]
+        else:
+            cbar_len_in = 0.5 * grid_w_in
+            cbar_rect = [
+                (left_in + 0.5 * (grid_w_in - cbar_len_in)) / fig_w,
+                (bottom_in - cbar_pad_in - cbar_thick_in) / fig_h,
+                cbar_len_in / fig_w,
+                cbar_thick_in / fig_h,
+            ]
+        cbar = fig.colorbar(
+            mpl.cm.ScalarMappable(
+                norm=mpl.colors.Normalize(vmin=-lim, vmax=lim), cmap=cmap
+            ),
+            cax=fig.add_axes(cbar_rect),
+            orientation='vertical' if cbar_loc == 'right' else 'horizontal',
+        )
+        cbar.set_label(cbar_label, labelpad=2)
+        cbar.outline.set_linewidth(frame_lw)
+        cbar.outline.set_edgecolor(frame_color)
+
+        if save_plots:
+            save_plot_to_svg(fig, plot_prefix)
+        plt.show()
+        return fig
+
     def plot_pls_biological_annotation(
         source_adata,
         target_adata,
@@ -5083,14 +5391,23 @@ def main():
         n_permutations=2000,
         random_seed=42,
         fdr_threshold=0.05,
+        assume_aligned=True,
         save_path="/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis/12_pls_biological_annotation.svg",
     ):
-        """Plot matched, sign-aligned RNA PLS module enrichments.
+        """Plot matched RNA PLS module enrichments.
 
-        Source component signs remain unchanged. Target components are matched by
-        absolute gene-loading correlation and flipped when their signed loading
-        correlation with the source is negative. The identical target sign is
-        applied to new ``*_plot`` spatial-score columns in ``target_adata.obs``.
+        With ``assume_aligned`` (the default) the models are taken as already
+        sign- and index-matched by ``align_pls_component_signs``: component i is
+        paired with component i and neither side is re-signed, so a heatmap cell has
+        the sign of the spatial map above it. Disagreements with the gene-loading
+        correlation are reported rather than silently corrected.
+
+        With ``assume_aligned=False`` the original behaviour applies: source signs
+        are kept, targets are matched by absolute gene-loading correlation and
+        flipped where the signed correlation is negative.
+
+        The target sign is also applied to new ``*_plot`` spatial-score columns in
+        ``target_adata.obs``.
         """
         from scipy.optimize import linear_sum_assignment
 
@@ -5146,13 +5463,32 @@ def main():
         ]
         loading_corr = np.nan_to_num(loading_corr)
 
-        source_indices, target_indices = linear_sum_assignment(
-            -np.abs(loading_corr)
-        )
-        matched_indices = sorted(
-            zip(source_indices, target_indices),
-            key=lambda pair: pair[0],
-        )[:n_pairs]
+        if assume_aligned:
+            ## the spatial panel puts component i of every model in one column, so the
+            ## heatmap has to read the same way: pair i with i and keep the upstream
+            ## signs. Re-matching or re-flipping here would contradict the maps rather
+            ## than describe them, so a disagreement is reported instead.
+            n_matched = min(len(source_loadings), len(target_loadings))
+            matched_indices = [(i, i) for i in range(n_matched)][:n_pairs]
+            for source_i, _ in matched_indices:
+                best_i = int(np.argmax(np.abs(loading_corr[source_i])))
+                if loading_corr[source_i, source_i] < 0 or best_i != source_i:
+                    print(
+                        "[WARN] PLS_{}: signed loading correlation with target PLS_{} "
+                        "is {:+.2f}; strongest target match is PLS_{} ({:+.2f}). "
+                        "Keeping the upstream alignment.".format(
+                            source_i, source_i, loading_corr[source_i, source_i],
+                            best_i, loading_corr[source_i, best_i],
+                        )
+                    )
+        else:
+            source_indices, target_indices = linear_sum_assignment(
+                -np.abs(loading_corr)
+            )
+            matched_indices = sorted(
+                zip(source_indices, target_indices),
+                key=lambda pair: pair[0],
+            )[:n_pairs]
         if not matched_indices:
             raise ValueError("No source-target PLS component matches were found.")
 
@@ -5165,7 +5501,7 @@ def main():
             source_name = str(source_loadings.index[source_i])
             target_name = str(target_loadings.index[target_i])
             corr_value = float(loading_corr[source_i, target_i])
-            target_sign = -1.0 if corr_value < 0 else 1.0
+            target_sign = 1.0 if assume_aligned else (-1.0 if corr_value < 0 else 1.0)
 
             source_matched.append(
                 source_loadings.iloc[source_i].to_numpy(dtype=float)
@@ -5562,11 +5898,64 @@ def main():
         lrdata_genesets.obsm['spatial'] = lrdata[lrdata_genesets.obs_names].obsm['spatial'].copy()
         return lrdata_genesets
 
-    ## train PLS models on source and target data
-    pls_source_rna, pls_source_rna_coef_df, _ = run_pls_embedding_to_gene_plots(source_rna, save_plots=False, plot_prefix='01_source_rna_pls')
-    pls_target_rna, pls_target_rna_coef_df, _ = run_pls_embedding_to_gene_plots(target_rna, save_plots=False, plot_prefix='02_target_rna_pls', censor_gene_from_plot=['C530008M17Rik'])
-    pls_source_atac, pls_source_atac_coef_df, _ = run_pls_embedding_to_gene_plots(source_atac, save_plots=False, plot_prefix='03_source_atac_pls')
-    pls_target_atac, pls_target_atac_coef_df, _ = run_pls_embedding_to_gene_plots(target_atac, save_plots=False, plot_prefix='04_target_atac_pls')
+    ## train PLS models on source and target data. The four fits are independent, so
+    ## their component signs are arbitrary relative to each other; the source RNA model
+    ## is the reference and the other three are sign-matched to it over the union of all
+    ## four embeddings, so that a column of the spatial-map panel is one pattern rather
+    ## than a pattern and its negative. The reference itself is oriented on myelin, so
+    ## PLS_0 reads positive over the fibre tracts in every row.
+    MYELIN_MARKER_GENES = [
+        'Mbp', 'Plp1', 'Mobp', 'Mal', 'Cnp', 'Mog', 'Mag', 'Cldn11', 'Ermn', 'Sox10',
+    ]
+
+    pls_sign_reference_Z = np.concatenate([
+        source_rna.obsm['MultiGATE_source_aligned'],
+        target_rna.obsm['MultiGATE_source_aligned'],
+        source_atac.obsm['MultiGATE_source_aligned'],
+        target_atac.obsm['MultiGATE_source_aligned'],
+    ], axis=0)
+
+    pls_source_rna, pls_source_rna_coef_df, _ = run_pls_embedding_to_gene_plots(source_rna, save_plots=False, plot_prefix='01_source_rna_pls', orient_markers=MYELIN_MARKER_GENES, orient_components=(0,))
+    pls_target_rna, pls_target_rna_coef_df, _ = run_pls_embedding_to_gene_plots(target_rna, save_plots=False, plot_prefix='02_target_rna_pls', censor_gene_from_plot=['C530008M17Rik'], sign_reference_pls=pls_source_rna, sign_reference_Z=pls_sign_reference_Z)
+    pls_source_atac, pls_source_atac_coef_df, _ = run_pls_embedding_to_gene_plots(source_atac, save_plots=False, plot_prefix='03_source_atac_pls', sign_reference_pls=pls_source_rna, sign_reference_Z=pls_sign_reference_Z)
+    pls_target_atac, pls_target_atac_coef_df, _ = run_pls_embedding_to_gene_plots(target_atac, save_plots=False, plot_prefix='04_target_atac_pls', sign_reference_pls=pls_source_rna, sign_reference_Z=pls_sign_reference_Z)
+
+    ## the pairwise refinement matters for the later components: aligning each model to
+    ## the reference alone can leave two non-reference models disagreeing with each
+    ## other once a component is only weakly shared
+    refine_pls_signs_across_models(
+        [
+            ('source RNA', pls_source_rna),
+            ('source ATAC', pls_source_atac),
+            ('target RNA', pls_target_rna),
+            ('target ATAC', pls_target_atac),
+        ],
+        pls_sign_reference_Z,
+        n_show=5,
+    )
+
+    ## the refinement re-signs the models in place, so the loading frames captured at
+    ## fit time are stale: rebuild them before anything downstream (the enrichment
+    ## heatmap, the gene-peak link scoring) reads a sign the spatial maps no longer show
+    pls_source_rna_coef_df = pls_loadings_df(pls_source_rna, source_rna.var_names)
+    pls_target_rna_coef_df = pls_loadings_df(pls_target_rna, target_rna.var_names)
+    pls_source_atac_coef_df = pls_loadings_df(pls_source_atac, source_atac.var_names)
+    pls_target_atac_coef_df = pls_loadings_df(pls_target_atac, target_atac.var_names)
+
+    fig_pls_spatial_panel = plot_pls_spatial_panel(
+        [
+            ('source RNA', source_rna, pls_source_rna),
+            ('source ATAC', source_atac, pls_source_atac),
+            ('target RNA', target_rna, pls_target_rna),
+            ('target ATAC', target_atac, pls_target_atac),
+        ],
+        ## five components make the grid wide enough on its own, so the columns close
+        ## up and the colorbar goes underneath rather than into the right margin
+        n_show=5,
+        col_gap_in=0.06,
+        cbar_loc='bottom',
+        save_plots=True,
+    )
 
     pls_biological_annotation_results = plot_pls_biological_annotation(
         source_adata=source_rna,
@@ -5746,7 +6135,7 @@ def main():
     print(target_all_pls_scores_grouped_df.head(10))
 
     ## select PLS-gene combinations
-    pls_cmp = 'PLS_0'
+    pls_cmp = 'PLS_1'
     gene = 'Pde10a'
 
     # DORC plot and annotate the marker corresponding to 'gene'

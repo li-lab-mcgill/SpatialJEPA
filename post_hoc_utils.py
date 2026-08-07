@@ -4,6 +4,7 @@ from typing import Any, Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 
 from gene_peak_attention_utils import (
     add_gene_and_peak_columns,
