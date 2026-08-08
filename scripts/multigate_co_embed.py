@@ -6137,6 +6137,7 @@ print("Target PLS-weighted gene-peak attention links:")
 print(target_all_pls_scores_df.head(5))
 print(target_all_pls_scores_grouped_df.head(10))
 
+
 ## select PLS-gene combinations
 pls_cmp = 'PLS_0'
 gene = 'Mobp'
@@ -6179,22 +6180,114 @@ target_peak_scores = np.asarray(target_atac[:, target_gp_link_df['Peak']].X.mult
 source_atac.obs[f'{gene}-linked peaks'] = source_peak_scores
 target_atac.obs[f'{gene}-linked peaks'] = target_peak_scores
 
-## spatial plots of selected gene-peak links
+## spatial plots of selected gene-peak links.
+## The two peak panels share one colour scale so source and target are directly
+## comparable; it is taken from a pooled upper percentile rather than a fixed vmax,
+## which otherwise flattens the contrast whenever the score range shifts (e.g. when
+## the target is aggregated onto source spots). The gene panels keep their own
+## independent scales.
+peak_score_vmax = float(np.percentile(np.concatenate([source_peak_scores, target_peak_scores]), 99.9))
+
 fig, ax = plt.subplots(2, 2, figsize=(6, 6))
 sc.pl.embedding(source_rna, basis='spatial', color=gene, size=60, ax=ax[0, 0], show=False)
-sc.pl.embedding(target_rna, basis='spatial', color=gene, size=60, ax=ax[0, 1], show=False)
-sc.pl.embedding(source_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, cmap='magma', vmax=1.5, ax=ax[1, 0], show=False)
-sc.pl.embedding(target_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, cmap='magma', vmax=1.5, ax=ax[1, 1], show=False)
+sc.pl.embedding(target_rna, basis='spatial', color=gene, size=60, ax=ax[1, 0], show=False)
+sc.pl.embedding(source_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, cmap='magma', vmin=0, vmax=peak_score_vmax, ax=ax[0, 1], show=False)
+sc.pl.embedding(target_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, cmap='magma', vmin=0, vmax=peak_score_vmax, ax=ax[1, 1], show=False)
 fig.suptitle(f'{gene} - {pls_cmp}')
-ax[0, 0].set_title('Source gene'); ax[0, 0].set_xlabel(''); ax[0, 0].set_ylabel('')
-ax[0, 1].set_title('Target gene'); ax[0, 1].set_xlabel(''); ax[0, 1].set_ylabel('')
-ax[1, 0].set_title('Source peaks'); ax[1, 0].set_xlabel(''); ax[1, 0].set_ylabel('')
-ax[1, 1].set_title('Target peaks'); ax[1, 1].set_xlabel(''); ax[1, 1].set_ylabel('')
+for _axis, _title in [(ax[0, 0], 'Source gene'), (ax[1, 0], 'Target gene'),
+                      (ax[0, 1], 'Source peaks'), (ax[1, 1], 'Target peaks')]:
+    _axis.set_title(_title); _axis.set_xlabel(''); _axis.set_ylabel('')
 plt.tight_layout(); plt.show()
 
 ## save gene-peak links
 safe_pls_cmp = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in str(pls_cmp))
 safe_gene = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in str(gene))
+
+#%% ── Composite figure bottom row: h (paired Moran's I) | i (peaks) | j (arcs) ──
+## Panels are exported separately at matched heights for manual assembly. Panel h
+## generalises the single locus in i/j across genes, which is what a reader asks for
+## after seeing one exemplar.
+from gene_peak_attention_utils import (
+    linked_peak_score,
+    morans_i,
+    plot_paired_moran_columns,
+    spatial_knn_weights,
+)
+
+composite_dir = os.path.join(f"{os.getenv('OUTPATH')}/MultiGATE/attention_analysis", "composite")
+os.makedirs(composite_dir, exist_ok=True)
+COMPOSITE_PANEL_HEIGHT = 2.0        # shared height so the three panels line up
+MORAN_SCAN_N_GENES = 400
+MORAN_SCAN_MIN_PEAKS = 3
+MORAN_KNN_K = 6
+
+## ── Shared lattice ───────────────────────────────────────────────────────────
+## The target carries no coordinates of its own: they are transferred from source
+## spots. Comparing Moran's I across 9k spots and 23k nuclei at fixed k would compare
+## two different physical neighbourhood radii, so aggregate the target onto the source
+## spots first and score both domains on one identical graph.
+_src_xy = np.asarray(source_atac.obsm['spatial'], float)
+_spot_of_target = NearestNeighbors(n_neighbors=1).fit(_src_xy).kneighbors(
+    np.asarray(target_atac.obsm['spatial'], float)
+)[1].ravel()
+_occupied = np.unique(_spot_of_target)
+_W_shared = spatial_knn_weights(_src_xy[_occupied], k=MORAN_KNN_K)
+print(f"Shared lattice: {len(_occupied)}/{len(_src_xy)} source spots occupied, "
+      f"median {np.median(np.bincount(_spot_of_target)[_occupied]):.1f} target nuclei/spot")
+
+
+def _target_on_lattice(values):
+    """Mean of target nuclei per source spot, restricted to occupied spots."""
+    return pd.Series(values).groupby(_spot_of_target).mean().loc[_occupied].to_numpy()
+
+
+## ── Panel h: paired Moran's I across genes ───────────────────────────────────
+## Sampled at random rather than head-sliced by peak count, which would bias toward
+## the densest loci; the focal gene is forced in so it can be highlighted.
+_shared_genes = source_gene_peak_attention_links['Gene'].value_counts()
+_shared_genes = _shared_genes[_shared_genes >= MORAN_SCAN_MIN_PEAKS].index
+_rng = np.random.default_rng(0)
+_scan_genes = list(_rng.choice(_shared_genes, size=min(MORAN_SCAN_N_GENES, len(_shared_genes)),
+                               replace=False))
+if gene not in _scan_genes:
+    _scan_genes.append(gene)
+
+_scan_rows = []
+for _g in _scan_genes:
+    _sdf = source_gene_peak_attention_links.loc[source_gene_peak_attention_links['Gene'].eq(_g)]
+    _tdf = target_gene_peak_attention_links.loc[target_gene_peak_attention_links['Gene'].eq(_g)]
+    _s_score = linked_peak_score(source_atac, _sdf)
+    _t_score = linked_peak_score(target_atac, _tdf)
+    if _s_score is None or _t_score is None:
+        continue
+    _scan_rows.append((_g, len(_sdf),
+                       morans_i(_W_shared, _s_score[_occupied]),
+                       morans_i(_W_shared, _target_on_lattice(_t_score))))
+
+moran_scan_df = pd.DataFrame(_scan_rows, columns=['gene', 'n_peaks', 'I_source', 'I_target']).dropna()
+moran_scan_df.to_csv(os.path.join(composite_dir, 'moran_scan_linked_peaks.csv'), index=False)
+print(f"Moran's I scan: n={len(moran_scan_df)} genes, target > source in "
+      f"{(moran_scan_df.I_target > moran_scan_df.I_source).mean():.1%}; "
+      f"median I source={moran_scan_df.I_source.median():.3f} target={moran_scan_df.I_target.median():.3f}")
+
+panel_h_pdf = os.path.join(composite_dir, f'panel_h_paired_morans_{safe_gene}.pdf')
+plot_paired_moran_columns(moran_scan_df, out_path=panel_h_pdf, highlight=gene,
+                          figsize=(1.4, COMPOSITE_PANEL_HEIGHT))
+plt.show()
+
+## ── Panel i: linked-peak spatial maps, source over target ────────────────────
+## Stacked vertically (not side by side) to keep the panel narrow, and sharing the
+## colour scale from the 2x2 above so the two domains stay directly comparable.
+fig_i, ax_i = plt.subplots(2, 1, figsize=(1.35, COMPOSITE_PANEL_HEIGHT))
+sc.pl.embedding(source_atac, basis='spatial', color=f'{gene}-linked peaks', size=60,
+                cmap='magma', vmin=0, vmax=peak_score_vmax, ax=ax_i[0], show=False)
+sc.pl.embedding(target_atac, basis='spatial', color=f'{gene}-linked peaks', size=60,
+                cmap='magma', vmin=0, vmax=peak_score_vmax, ax=ax_i[1], show=False)
+for _axis, _title in [(ax_i[0], 'Source peaks'), (ax_i[1], 'Target peaks')]:
+    _axis.set_title(_title, fontsize=7); _axis.set_xlabel(''); _axis.set_ylabel('')
+    _axis.set_xticks([]); _axis.set_yticks([])
+panel_i_pdf = os.path.join(composite_dir, f'panel_i_peak_spatial_{safe_gene}.pdf')
+fig_i.tight_layout(); fig_i.savefig(panel_i_pdf, bbox_inches='tight'); plt.show()
 
 gp_link_prefix = f"source_gene_peak_links_{safe_pls_cmp}_{safe_gene}"
 gp_link_csv_path = os.path.join(source_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.csv")
@@ -6222,12 +6315,21 @@ stacked_signed_arcs_pdf = os.path.join(
     signed_arcs_out_dir, f"stacked_gene_peak_links_signed_{safe_pls_cmp}_{safe_gene}.pdf"
 )
 
+## Crop tightly on the left so the arcs fill the panel, but keep enough slack on the
+## right to expose gene body for the gene-name label. Set arc_neg_color to arc_pos_color
+## for a magnitude-only rendering (useful when a sign belongs to a near-zero weight).
+arc_kwargs = dict(padding_bp=1500, padding_bp_right=6000, max_xticks=4)
+arc_pos_color, arc_neg_color = "#cc4c02", "#1f77b4"
+
 plot_signed_arcs_stacked(
     {"Source": source_gp_link_df},
     pls_cmp=pls_cmp,
     gene=gene,
     out_path=source_signed_arcs_pdf,
+    pos_color=arc_pos_color,
+    neg_color=arc_pos_color,
     title=f"{gene} — {pls_cmp} (source)",
+    **arc_kwargs,
 )
 plt.show()
 plot_signed_arcs_stacked(
@@ -6235,7 +6337,10 @@ plot_signed_arcs_stacked(
     pls_cmp=pls_cmp,
     gene=gene,
     out_path=target_signed_arcs_pdf,
+    pos_color=arc_pos_color,
+    neg_color=arc_pos_color,
     title=f"{gene} — {pls_cmp} (target)",
+    **arc_kwargs,
 )
 plt.show()
 plot_signed_arcs_stacked(
@@ -6243,10 +6348,47 @@ plot_signed_arcs_stacked(
     pls_cmp=pls_cmp,
     gene=gene,
     out_path=stacked_signed_arcs_pdf,
+    pos_color=arc_pos_color,
+    neg_color=arc_pos_color,
     title=f"{gene} — {pls_cmp}",
+    **arc_kwargs,
 )
 plt.show()
 print(f"Saved signed-arc plots:\n {source_signed_arcs_pdf}\n {target_signed_arcs_pdf}\n {stacked_signed_arcs_pdf}")
+
+## ── Panel j: narrowed arcs for the composite row ─────────────────────────────
+## Arc shape is set by the axes width-to-height ratio, so narrowing the panel alone
+## would squash the domes. Scaling width and both heights by one factor keeps that
+## ratio fixed, i.e. narrower arcs of the same shape. Note the figure carries ~0.9"
+## of fixed overhead for ticks and labels, so total height does not scale linearly
+## with arc_scale: tune arc_scale until the printed height matches the other panels.
+arc_scale = 0.35
+arc_font_scale = 0.65   # text cannot shrink as far as the geometry before going illegible
+## The ~0.9" of fixed overhead does not shrink with arc_scale, so scaling the heights
+## by arc_scale alone still leaves the arc axes ~7% too tall for their width. This
+## factor removes that residual; it restores the default panel's width/height ratio
+## of 7.02 exactly at arc_scale=0.35 (measured, not derived -- recheck if arc_scale moves far).
+arc_height_correction = 0.933
+panel_j_pdf = os.path.join(composite_dir, f'panel_j_arcs_{safe_pls_cmp}_{safe_gene}.pdf')
+fig_j = plot_signed_arcs_stacked(
+    {"Source": source_gp_link_df, "Target": target_gp_link_df},
+    pls_cmp=pls_cmp,
+    gene=gene,
+    out_path=panel_j_pdf,
+    pos_color=arc_pos_color,
+    neg_color=arc_neg_color,
+    fig_width_inches=12.0 * arc_scale,
+    panel_height_inches=2.0 * arc_scale * arc_height_correction,
+    gene_panel_height_inches=0.5 * arc_scale * arc_height_correction,
+    font_scale=arc_font_scale,
+    title=None,
+    **arc_kwargs,
+)
+plt.show()
+print(f"Composite panels written to {composite_dir}")
+print(f"  h {panel_h_pdf}\n  i {panel_i_pdf}\n  j {panel_j_pdf}")
+print(f"  panel j figure size: {fig_j.get_size_inches()[0]:.2f} x {fig_j.get_size_inches()[1]:.2f} in "
+      f"(h/i are {COMPOSITE_PANEL_HEIGHT:.2f} in tall)")
 
 # Plot the saved BEDPE with CoolBox (run from MultiGATE/; env needs bgzip, tabix, pairix).
 # Need environment with CoolBox installed. (e.g. torch_env_py39)
@@ -6287,11 +6429,12 @@ _src_csv = {repr(source_signed_csv)}
 _tgt_csv = {repr(target_signed_csv)}
 _pls = {repr(pls_cmp)}
 _gene = {repr(gene)}
+_kw = dict({repr(arc_kwargs)}, pos_color={repr(arc_pos_color)}, neg_color={repr(arc_neg_color)})
 src = pd.read_csv(_src_csv)
 tgt = pd.read_csv(_tgt_csv)
-plot_signed_arcs_stacked({{"Source": src}}, pls_cmp=_pls, gene=_gene, out_path={repr(source_signed_arcs_pdf)}, title={repr(f"{gene} — {pls_cmp} (source)")})
-plot_signed_arcs_stacked({{"Target": tgt}}, pls_cmp=_pls, gene=_gene, out_path={repr(target_signed_arcs_pdf)}, title={repr(f"{gene} — {pls_cmp} (target)")})
-plot_signed_arcs_stacked({{"Source": src, "Target": tgt}}, pls_cmp=_pls, gene=_gene, out_path={repr(stacked_signed_arcs_pdf)}, title={repr(f"{gene} — {pls_cmp}")})
+plot_signed_arcs_stacked({{"Source": src}}, pls_cmp=_pls, gene=_gene, out_path={repr(source_signed_arcs_pdf)}, title={repr(f"{gene} — {pls_cmp} (source)")}, **_kw)
+plot_signed_arcs_stacked({{"Target": tgt}}, pls_cmp=_pls, gene=_gene, out_path={repr(target_signed_arcs_pdf)}, title={repr(f"{gene} — {pls_cmp} (target)")}, **_kw)
+plot_signed_arcs_stacked({{"Source": src, "Target": tgt}}, pls_cmp=_pls, gene=_gene, out_path={repr(stacked_signed_arcs_pdf)}, title={repr(f"{gene} — {pls_cmp}")}, **_kw)
 print("Saved signed-arc plots:")
 print({repr(source_signed_arcs_pdf)})
 print({repr(target_signed_arcs_pdf)})

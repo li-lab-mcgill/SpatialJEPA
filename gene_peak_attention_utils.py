@@ -12,6 +12,11 @@ from sklearn.mixture import GaussianMixture
 
 ArrayLike = Union[np.ndarray, Sequence[float]]
 
+# Alpha range used to encode |peak weight| on the arc plots. Shared by the arc
+# renderer and the weight colorbar so the two cannot drift apart.
+MIN_ARC_ALPHA = 0.10
+MAX_ARC_ALPHA = 0.85
+
 
 @dataclass(frozen=True)
 class GMMThresholdResult:
@@ -529,8 +534,8 @@ def _draw_signed_arcs_on_axes(
     pos_color: str,
     neg_color: str,
     max_abs_weight: Optional[float] = None,
-    min_alpha: float = 0.10,
-    max_alpha: float = 0.85,
+    min_alpha: float = MIN_ARC_ALPHA,
+    max_alpha: float = MAX_ARC_ALPHA,
     n_arc_points: int = 200,
 ) -> None:
     """Draw peak->TSS semi-elliptical arcs on a single matplotlib axes.
@@ -592,6 +597,11 @@ def plot_signed_arcs_stacked(
     panel_height_inches: float = 2.0,
     gene_panel_height_inches: float = 0.5,
     padding_bp: int = 10000,
+    padding_bp_right: Optional[int] = None,
+    max_xticks: int = 4,
+    weight_legend: str = "colorbar",
+    weight_legend_bbox: Tuple[float, float, float, float] = (0.78, 0.72, 0.20, 0.07),
+    font_scale: float = 1.0,
     share_alpha_scale: bool = True,
     title: Optional[str] = None,
 ):
@@ -614,6 +624,34 @@ def plot_signed_arcs_stacked(
         Destination PDF/PNG path.
     pos_color, neg_color
         Colors for arcs associated with positive / negative PLS peak weights.
+        Passing the same color for both renders magnitude only (alpha still
+        scales with ``|weight|``) and collapses the legend to a single entry.
+    padding_bp, padding_bp_right
+        Basepairs of slack added left / right of the arc anchors. ``padding_bp_right``
+        defaults to ``padding_bp``; widening it alone exposes enough gene body for the
+        gene-name label without pushing the arcs into a corner of the panel.
+    max_xticks
+        Upper bound on genomic tick count. Coordinate labels are long, so a wide
+        window in a narrow panel overlaps them unless the count is capped; units
+        live on the axis label rather than being repeated on every tick.
+    weight_legend
+        ``"colorbar"`` (default) draws a horizontal bar mapping arc transparency
+        back to peak weight, using the same alpha ramp the arcs are drawn with:
+        sequential ``0..max`` when ``pos_color == neg_color``, diverging
+        ``-max..max`` otherwise. ``"patches"`` restores the flat two-swatch legend,
+        which shows sign but not magnitude. ``None`` omits the key entirely.
+        Falls back to ``"patches"`` when ``share_alpha_scale=False`` leaves the
+        panels on different alpha scales.
+    weight_legend_bbox
+        ``(x0, y0, w, h)`` of the colorbar inside the first panel's axes, in axes
+        fractions. Inset rather than stolen from the panel so the arcs keep their
+        full width; move it if arcs reach into the upper right.
+    font_scale
+        Multiplier on every annotation size. Shrinking the panel for a composite
+        figure leaves the hard-coded text oversized, so scale this alongside
+        ``fig_width_inches``. Arc shape is set by the width-to-panel-height ratio,
+        so scale ``panel_height_inches`` and ``gene_panel_height_inches`` by the
+        same factor as the width to narrow the panel without reshaping the arcs.
     share_alpha_scale
         If True, scale alpha jointly across all panels using the global max
         ``|weight|``; otherwise each panel rescales independently.
@@ -623,8 +661,12 @@ def plot_signed_arcs_stacked(
     matplotlib.figure.Figure
     """
     import matplotlib.pyplot as plt
+    import warnings
+
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import ListedColormap, Normalize, to_rgba
     from matplotlib.patches import Patch, Rectangle
-    from matplotlib.ticker import FuncFormatter
+    from matplotlib.ticker import FuncFormatter, MaxNLocator
 
     if not gp_link_dfs:
         raise ValueError("gp_link_dfs must contain at least one entry.")
@@ -656,8 +698,9 @@ def plot_signed_arcs_stacked(
             f"Expected all links on a single chromosome, got: {sorted(chrom_values)}"
         )
     chrom = next(iter(chrom_values))
+    pad_right = float(padding_bp if padding_bp_right is None else padding_bp_right)
     x_min = max(0.0, float(min(lows)) - float(padding_bp))
-    x_max = float(max(highs)) + float(padding_bp)
+    x_max = float(max(highs)) + pad_right
 
     if share_alpha_scale:
         per_panel_max = [
@@ -705,7 +748,7 @@ def plot_signed_arcs_stacked(
         ax.set_ylim(0, 1.10)
         ax.set_yticks([])
         ax.set_xlim(x_min, x_max)
-        ax.set_title(str(label), loc="left", fontsize=11, pad=2)
+        ax.set_title(str(label), loc="left", fontsize=11 * font_scale, pad=2)
         for spine in ("top", "right", "left"):
             ax.spines[spine].set_visible(False)
         ax.tick_params(axis="x", labelbottom=False)
@@ -766,7 +809,7 @@ def plot_signed_arcs_stacked(
             (clipped_start + clipped_end) / 2.0,
             rect_y0 + rect_h + 0.08,
             strand_marker,
-            ha="center", va="bottom", fontsize=8, color="black",
+            ha="center", va="bottom", fontsize=8 * font_scale, color="black",
         )
 
     label_margin = (x_max - x_min) * 0.01
@@ -774,33 +817,192 @@ def plot_signed_arcs_stacked(
     label_x = float(np.clip(raw_label_x, x_min + label_margin, x_max - label_margin))
     ax_gene.text(
         label_x, rect_y0 + rect_h / 2.0, gene,
-        ha="center", va="center", fontsize=10, fontweight="bold", color="black",
+        ha="center", va="center", fontsize=10 * font_scale, fontweight="bold", color="black",
     )
     ax_gene.set_xlim(x_min, x_max)
     ax_gene.set_ylim(0, 1)
     ax_gene.set_yticks([])
     for spine in ("top", "right", "left"):
         ax_gene.spines[spine].set_visible(False)
-    ax_gene.set_xlabel(f"{chrom} (bp)")
-    ax_gene.xaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v / 1000:,.0f} Kb"))
+    ax_gene.set_xlabel(f"{chrom} position (Kb)", fontsize=10 * font_scale)
+    ax_gene.xaxis.set_major_locator(MaxNLocator(nbins=max_xticks))
+    ax_gene.xaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v / 1000:,.0f}"))
+    ax_gene.tick_params(axis="x", labelsize=10 * font_scale)
 
-    legend_handles = [
-        Patch(facecolor=pos_color, edgecolor="none", alpha=0.7, label=f"{weight_col} > 0"),
-        Patch(facecolor=neg_color, edgecolor="none", alpha=0.7, label=f"{weight_col} < 0"),
-    ]
-    axes[0].legend(
-        handles=legend_handles,
-        loc="upper right",
-        fontsize=8,
-        frameon=False,
-    )
+    # Arc alpha encodes |weight|, which a patch legend cannot express. Prefer a
+    # colorbar built from the same alpha ramp the arcs are drawn with: sequential
+    # 0..max when rendering magnitude only, diverging -max..max when signed (so the
+    # near-transparent middle reads as "weight near zero" rather than as a colour).
+    legend_mode = weight_legend
+    if legend_mode == "colorbar" and len(set(max_abs_weight_per_panel.values())) > 1:
+        warnings.warn(
+            "share_alpha_scale=False gives each panel its own alpha scale, so one "
+            "colorbar cannot describe them all; falling back to a patch legend.",
+            stacklevel=2,
+        )
+        legend_mode = "patches"
+
+    if legend_mode == "colorbar":
+        scale = float(next(iter(max_abs_weight_per_panel.values())))
+        ramp = np.linspace(MIN_ARC_ALPHA, MAX_ARC_ALPHA, 128)
+        if pos_color == neg_color:
+            colors = [to_rgba(pos_color, a) for a in ramp]
+            norm, cb_label = Normalize(0.0, scale), f"|{weight_col}|"
+        else:
+            colors = ([to_rgba(neg_color, a) for a in ramp[::-1]]
+                      + [to_rgba(pos_color, a) for a in ramp])
+            norm, cb_label = Normalize(-scale, scale), weight_col
+        sm = ScalarMappable(norm=norm, cmap=ListedColormap(colors))
+        cax = axes[0].inset_axes(weight_legend_bbox)
+        cbar = fig.colorbar(sm, cax=cax, orientation="horizontal")
+        cbar.outline.set_linewidth(0.4)
+        cbar.set_label(cb_label, fontsize=8 * font_scale, labelpad=2)
+        cbar.ax.tick_params(labelsize=7 * font_scale, length=2, pad=1)
+        cbar.locator = MaxNLocator(nbins=3)
+        cbar.update_ticks()
+    elif legend_mode == "patches":
+        if pos_color == neg_color:
+            # Magnitude-only rendering: a two-entry signed legend would be misleading.
+            legend_handles = [
+                Patch(facecolor=pos_color, edgecolor="none", alpha=0.7, label=f"|{weight_col}|"),
+            ]
+        else:
+            legend_handles = [
+                Patch(facecolor=pos_color, edgecolor="none", alpha=0.7, label=f"{weight_col} > 0"),
+                Patch(facecolor=neg_color, edgecolor="none", alpha=0.7, label=f"{weight_col} < 0"),
+            ]
+        axes[0].legend(
+            handles=legend_handles,
+            loc="upper right",
+            fontsize=8 * font_scale,
+            frameon=False,
+        )
 
     if title:
-        fig.suptitle(title, fontsize=12)
+        fig.suptitle(title, fontsize=12 * font_scale)
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, bbox_inches="tight")
+    return fig
+
+
+def spatial_knn_weights(coords: ArrayLike, k: int = 6):
+    """Row-standardised, symmetrised kNN spatial weight matrix.
+
+    Row standardisation makes Moran's I comparable across point sets of different
+    size; symmetrising keeps the graph undirected when k-nearest is not mutual.
+    """
+    from sklearn.neighbors import kneighbors_graph
+
+    adjacency = kneighbors_graph(
+        np.asarray(coords, dtype=float), int(k), mode="connectivity", include_self=False
+    )
+    adjacency = adjacency.maximum(adjacency.T)
+    row_sums = np.asarray(adjacency.sum(axis=1)).ravel()
+    row_sums[row_sums == 0] = 1.0
+    return sp.diags(1.0 / row_sums) @ adjacency
+
+
+def morans_i(weights, values: ArrayLike) -> float:
+    """Moran's I for ``values`` under a row-standardised weight matrix."""
+    z = np.asarray(values, dtype=float)
+    z = z - z.mean()
+    denominator = float(z @ z)
+    if denominator <= 0:
+        return float("nan")
+    return float(z @ (weights @ z) / denominator)
+
+
+def linked_peak_score(
+    adata_atac,
+    gp_link_df: pd.DataFrame,
+    *,
+    score_col: str = "Attention",
+) -> Optional[np.ndarray]:
+    """Attention-weighted accessibility summed over one gene's linked peaks.
+
+    Uses unsigned attention rather than signed PLS weights: signed weights cancel
+    across peaks and push scores negative, which hides the signal under the
+    zero-floor of a sequential colormap.
+    """
+    peaks = [p for p in gp_link_df["Peak"] if p in adata_atac.var_names]
+    if not peaks:
+        return None
+    w = gp_link_df.set_index("Peak").loc[peaks, score_col].to_numpy(float)
+    X = adata_atac[:, peaks].X
+    if sp.issparse(X):
+        return np.asarray(X.multiply(w).sum(axis=1)).ravel()
+    return (np.asarray(X, dtype=float) * w).sum(axis=1)
+
+
+def plot_paired_moran_columns(
+    scan_df: pd.DataFrame,
+    *,
+    out_path: Optional[Union[str, Path]] = None,
+    gene_col: str = "gene",
+    source_col: str = "I_source",
+    target_col: str = "I_target",
+    highlight: Optional[str] = None,
+    highlight_color: str = "#cc4c02",
+    line_color: str = "0.6",
+    ylabel: str = "Moran's $I$, linked peaks",
+    xticklabels: Tuple[str, str] = ("source", "target"),
+    xlim: Tuple[float, float] = (-0.22, 1.12),
+    figsize: Tuple[float, float] = (1.7, 2.0),
+    font_scale: float = 1.0,
+):
+    """Paired source/target columns, one connecting line per gene.
+
+    Both columns share a single y-axis, so unlike a source-vs-target scatter there
+    is no aspect or limit choice that can distort the comparison; the fraction of
+    upward-sloping lines *is* the effect. ``highlight`` draws one gene on top in
+    ``highlight_color`` with its label placed left of the marker, keeping the right
+    edge of the axes clear for an adjacent panel.
+    """
+    import matplotlib.pyplot as plt
+
+    if highlight is not None and highlight not in set(scan_df[gene_col]):
+        raise ValueError(
+            f"highlight={highlight!r} is not in scan_df[{gene_col!r}]; add the focal "
+            "gene to the scan rather than overlaying it from a separate computation."
+        )
+
+    fs = float(font_scale)
+    fig, ax = plt.subplots(figsize=figsize)
+    for _, row in scan_df.iterrows():
+        ax.plot([0, 1], [row[source_col], row[target_col]],
+                lw=0.3, color=line_color, alpha=0.5, zorder=1)
+    for x_pos, col in ((0, source_col), (1, target_col)):
+        ax.hlines(float(scan_df[col].median()), x_pos - 0.18, x_pos + 0.18,
+                  color="black", lw=1.2, zorder=3)
+
+    if highlight is not None:
+        row = scan_df.loc[scan_df[gene_col] == highlight].iloc[0]
+        y0, y1 = float(row[source_col]), float(row[target_col])
+        ax.plot([0, 1], [y0, y1], lw=1.4, color=highlight_color, zorder=4)
+        ax.scatter([0, 1], [y0, y1], s=18, color=highlight_color,
+                   edgecolor="black", linewidths=0.4, zorder=5)
+        ax.annotate(highlight, (1, y1), xytext=(-6, 0), textcoords="offset points",
+                    fontsize=6.5 * fs, fontweight="bold", color=highlight_color,
+                    va="center", ha="right")
+
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(list(xticklabels), fontsize=6.5 * fs)
+    # Columns sit at x=0/1, so the tick labels are only as far apart as the axes are
+    # wide. Padding below the median half-width (0.18) would clip the median bars;
+    # widen ``figsize`` rather than shrinking the padding if the labels still touch.
+    ax.set_xlim(*xlim)
+    ax.set_ylabel(ylabel, fontsize=7 * fs)
+    ax.tick_params(axis="y", labelsize=6 * fs)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+
+    if out_path is not None:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, bbox_inches="tight")
     return fig
 
 
@@ -814,13 +1016,17 @@ __all__ = [
     "filter_by_attention_threshold",
     "fit_attention_gmm",
     "get_gmm_attention_threshold",
+    "linked_peak_score",
     "load_attention_matrix",
     "merge_with_gene_annotations",
+    "morans_i",
     "parse_gtf_file",
     "parse_peak",
     "plot_attention_distribution",
     "plot_distance_distribution",
+    "plot_paired_moran_columns",
     "plot_signed_arcs_stacked",
+    "spatial_knn_weights",
     "save_attention_outputs",
     "save_gene_peak_links_bedpe",
 ]
