@@ -1794,4471 +1794,4469 @@ def run_alignment_and_spatial_plot(
     return source_target_adata, source_concat_adata, target_concat_adata
 
 
-#%% ─── Main ─────────────────────────────────────────────────────────────────────
+#%% main
 
-def main():
-    #%%
-    NOTEBOOK = is_notebook()
-    args = parse_args(notebook=NOTEBOOK)
-    
-    if args.stage2_run_name is not None and args.target_model != "stage2":
-        raise ValueError("--stage2-run-name is only valid with --target-model stage2.")
+NOTEBOOK = is_notebook()
+args = parse_args(notebook=NOTEBOOK)
 
-    pathway_embedding_results = None
+if args.stage2_run_name is not None and args.target_model != "stage2":
+    raise ValueError("--stage2-run-name is only valid with --target-model stage2.")
 
-    deterministic_seed = 0
-    random.seed(deterministic_seed)
-    np.random.seed(deterministic_seed)
-    sc.settings.n_jobs = 1
+pathway_embedding_results = None
 
-    torch.manual_seed(deterministic_seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(deterministic_seed)
-    if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-    try:
-        torch.use_deterministic_algorithms(True)
-    except Exception as exc:
-        warnings.warn("Could not enable full deterministic torch algorithms: {}".format(exc))
-    torch.set_num_threads(1)
+deterministic_seed = 0
+random.seed(deterministic_seed)
+np.random.seed(deterministic_seed)
+sc.settings.n_jobs = 1
 
-    # CPU inference avoids residual GPU sparse-op nondeterminism.
-    device = torch.device("cpu")
-    print("Device:", device, "(deterministic mode)")
+torch.manual_seed(deterministic_seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(deterministic_seed)
+if hasattr(torch.backends, "cudnn"):
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+try:
+    torch.use_deterministic_algorithms(True)
+except Exception as exc:
+    warnings.warn("Could not enable full deterministic torch algorithms: {}".format(exc))
+torch.set_num_threads(1)
 
-    #%% ── MLflow setup ────────────────────────────────────────────────────────
-    #bash /home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/scripts/start_mlflow_services.sh all
+# CPU inference avoids residual GPU sparse-op nondeterminism.
+device = torch.device("cpu")
+print("Device:", device, "(deterministic mode)")
 
-    args.run_name = '20260505_190037' #'20260402_153455'
-    args.stage2_run_name = '20260402_153455_stage2_20260402_165006'
-    sqlite_tracking_uri = "sqlite:////home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db"
-    postgres_tracking_uri = "http://127.0.0.1:5000"
-    args.tracking_uri = postgres_tracking_uri
-    args.target_model = "zero_shot" # for zero-shot co-embedding if stage2 model is not available
+#%% ── MLflow setup ────────────────────────────────────────────────────────
+#bash /home/mcb/users/dmannk/BAKLAVA_base/BAKLAVA/scripts/start_mlflow_services.sh all
 
-    #lsof /home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db
-    #curl -i http://127.0.0.1:5000
+args.run_name = '20260505_190037' #'20260402_153455'
+args.stage2_run_name = '20260402_153455_stage2_20260402_165006'
+sqlite_tracking_uri = "sqlite:////home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db"
+postgres_tracking_uri = "http://127.0.0.1:5000"
+args.tracking_uri = postgres_tracking_uri
+args.target_model = "zero_shot" # for zero-shot co-embedding if stage2 model is not available
 
-    tracking_config = setup_mlflow_tracking(
-        backend_type=args.mlflow_backend,
-        tracking_uri=args.tracking_uri,
-        mlflow_base_dir=args.mlflow_base_dir,
-        experiment_name=args.experiment_name,
+#lsof /home/mcb/users/dmannk/BAKLAVA_base/mlflow_tracking/MultiGATE/mlflow.db
+#curl -i http://127.0.0.1:5000
+
+tracking_config = setup_mlflow_tracking(
+    backend_type=args.mlflow_backend,
+    tracking_uri=args.tracking_uri,
+    mlflow_base_dir=args.mlflow_base_dir,
+    experiment_name=args.experiment_name,
+)
+client = MlflowClient()
+run_id = resolve_run_id_from_name(
+    client,
+    args.run_name,
+    experiment_name=args.experiment_name,
+    tracking_config=tracking_config,
+)
+run_params = load_run_params(client, run_id, args.run_name)
+parent_run = client.get_run(run_id)
+experiment_id = parent_run.info.experiment_id
+
+#%% Resolve graph type for the target (arg takes precedence over run param)
+spatial_graph_type = args.spatial_graph_type or run_params.get("stage1_student_graph", "identity")
+if spatial_graph_type in {"NA", "na", "None", "none", "", None}:
+    spatial_graph_type = "identity"
+print("Target spatial graph type:", spatial_graph_type)
+
+bp_width           = int(run_params.get("bp_width", 400))
+graph_type         = run_params.get("graph_type", "ATAC")
+dual_source_kd     = run_params.get("stage1_dual_source_kd", "False").lower() == "true"
+skip_gp_attention  = str(run_params.get("skip_gp_attention", "True")).lower() == "true"
+print("skip_gp_attention (from run params):", skip_gp_attention)
+legacy_target_subsample_n = int(run_params.get("target_subsample_n", 5000))
+legacy_target_subsample_seed = int(run_params.get("target_subsample_seed", 0))
+if legacy_target_subsample_n <= 0:
+    raise ValueError("--target-subsample-n must be a positive integer.")
+
+split_metadata = None
+with tempfile.TemporaryDirectory() as split_tmpdir:
+    split_metadata = load_domain_splits_artifact(client, run_id, split_tmpdir)
+if split_metadata is not None:
+    print(
+        "Loaded split artifact '{}' (evaluation split: {}). Using source/target eval subsets by default.".format(
+            SPLIT_ARTIFACT,
+            split_metadata.get("evaluation_split", "val_plus_test"),
+        )
     )
-    client = MlflowClient()
-    run_id = resolve_run_id_from_name(
-        client,
-        args.run_name,
-        experiment_name=args.experiment_name,
+else:
+    print(
+        "Split artifact '{}' not found. Falling back to legacy target subsampling.".format(
+            SPLIT_ARTIFACT
+        )
+    )
+
+# Validate model selections against available artifacts
+if args.source_model in ("stage1_teacher", "stage1_student") and not dual_source_kd:
+    raise ValueError(
+        "--source-model {} requires the training run to have used "
+        "--stage1-dual-source-kd, but 'stage1_dual_source_kd={}' in run params.".format(
+            args.source_model, run_params.get("stage1_dual_source_kd")
+        )
+    )
+resolved_stage2_run_id = None
+resolved_stage2_run_name = None
+resolved_stage2_source_kind = None
+if args.target_model == "stage2":
+    resolved_stage2_run_id, resolved_stage2_run_name, resolved_stage2_source_kind = resolve_stage2_model_run(
+        client=client,
+        experiment_id=experiment_id,
+        parent_run_id=run_id,
+        stage2_run_name=args.stage2_run_name,
         tracking_config=tracking_config,
     )
-    run_params = load_run_params(client, run_id, args.run_name)
-    parent_run = client.get_run(run_id)
-    experiment_id = parent_run.info.experiment_id
-
-    #%% Resolve graph type for the target (arg takes precedence over run param)
-    spatial_graph_type = args.spatial_graph_type or run_params.get("stage1_student_graph", "identity")
-    if spatial_graph_type in {"NA", "na", "None", "none", "", None}:
-        spatial_graph_type = "identity"
-    print("Target spatial graph type:", spatial_graph_type)
-
-    bp_width           = int(run_params.get("bp_width", 400))
-    graph_type         = run_params.get("graph_type", "ATAC")
-    dual_source_kd     = run_params.get("stage1_dual_source_kd", "False").lower() == "true"
-    skip_gp_attention  = str(run_params.get("skip_gp_attention", "True")).lower() == "true"
-    print("skip_gp_attention (from run params):", skip_gp_attention)
-    legacy_target_subsample_n = int(run_params.get("target_subsample_n", 5000))
-    legacy_target_subsample_seed = int(run_params.get("target_subsample_seed", 0))
-    if legacy_target_subsample_n <= 0:
-        raise ValueError("--target-subsample-n must be a positive integer.")
-
-    split_metadata = None
-    with tempfile.TemporaryDirectory() as split_tmpdir:
-        split_metadata = load_domain_splits_artifact(client, run_id, split_tmpdir)
-    if split_metadata is not None:
+    if resolved_stage2_source_kind == "child":
         print(
-            "Loaded split artifact '{}' (evaluation split: {}). Using source/target eval subsets by default.".format(
-                SPLIT_ARTIFACT,
-                split_metadata.get("evaluation_split", "val_plus_test"),
+            "Resolved stage2 model run: child '{}' (ID: {})".format(
+                resolved_stage2_run_name,
+                resolved_stage2_run_id,
             )
         )
     else:
-        print(
-            "Split artifact '{}' not found. Falling back to legacy target subsampling.".format(
-                SPLIT_ARTIFACT
+        if args.stage2_run_name and resolved_stage2_run_name:
+            print(
+                "Resolved stage2 model run: parent '{}' (ID: {}) [legacy {}; "
+                "not found on child '{}' — loading parent checkpoint]".format(
+                    args.run_name,
+                    run_id,
+                    STAGE2_MODEL_ARTIFACT,
+                    resolved_stage2_run_name,
+                )
             )
-        )
+        else:
+            print(
+                "Resolved stage2 model run: parent '{}' (ID: {}) [legacy fallback]".format(
+                    args.run_name,
+                    run_id,
+                )
+            )
 
-    # Validate model selections against available artifacts
-    if args.source_model in ("stage1_teacher", "stage1_student") and not dual_source_kd:
+# ── Output directory ────────────────────────────────────────────────────
+if args.output_dir is None:
+    outpath = os.getenv("OUTPATH", "/tmp")
+    output_dir = os.path.join(outpath, "MultiGATE", "co_embed", args.run_name)
+else:
+    output_dir = args.output_dir
+os.makedirs(output_dir, exist_ok=True)
+print("Output directory:", output_dir)
+
+# ── GTF path ────────────────────────────────────────────────────────────
+gtf_path = os.path.join(
+    os.getenv("DATAPATH"), "gene_annotations",
+    "gencode.vM25.chr_patch_hapl_scaff.annotation.gtf.gz",
+)
+if not os.path.exists(gtf_path):
+    raise FileNotFoundError("GTF annotation file not found: {}".format(gtf_path))
+
+#%% ── Load raw aligned datasets ────────────────────────────────────────────
+print("\nLoading source and target datasets...")
+source_rna  = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_SCT.h5ad"))
+source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned.h5ad"))
+target_rna  = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_SCT.h5ad"))
+target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
+if not target_rna.obs_names.equals(target_atac.obs_names):
+    raise AssertionError("Target RNA and ATAC must have matching obs_names")
+
+# Flip spatial coordinates (same convention as training)
+source_rna.obsm["spatial"]  = source_rna.obsm["spatial"] * -1
+source_atac.obsm["spatial"] = source_atac.obsm["spatial"] * -1
+
+# ── Gene-peak network ────────────────────────────────────────────────────
+print("\nComputing gene-peak network on source...")
+MultiGATE.Cal_gene_peak_Net_new(source_rna, source_atac, 150000, file=gtf_path)
+gp_net = source_atac.uns["gene_peak_Net"].copy()
+del source_atac.uns["gene_peak_Net"]
+
+# ── Feature selection ────────────────────────────────────────────────────
+print(
+    "Replicating feature selection "
+    "(top_n_genes={}, top_n_peaks={})...".format(run_params.get("n_genes"), run_params.get("n_peaks"))
+)
+use_sct_genes = True
+if use_sct_genes:
+    source_rna, source_atac, target_rna, target_atac, gp_net = get_sct_genes_and_gp_filtering(
+        source_rna=source_rna,
+        source_atac=source_atac,
+        target_rna=target_rna,
+        target_atac=target_atac,
+        gp_net=gp_net,
+    )
+else:
+    source_rna, source_atac, target_rna, target_atac, gp_net = apply_hvg_and_gp_filtering(
+        source_rna=source_rna,
+        source_atac=source_atac,
+        target_rna=target_rna,
+        target_atac=target_atac,
+        gp_net=gp_net,
+        top_n_genes=int(run_params.get("n_genes")),
+        top_n_peaks=int(run_params.get("n_peaks")),
+        rank_type="fused",
+    )
+
+# Attach gene-peak net before HVG slicing (needed by build_graph_inputs)
+source_rna.uns["gene_peak_Net"] = gp_net.copy()
+
+# Apply HVG filter
+source_rna  = source_rna[:,  source_rna.var["highly_variable"]].copy()
+source_atac = source_atac[:, source_atac.var["highly_variable"]].copy()
+target_rna  = target_rna[:,  target_rna.var["highly_variable"]].copy()
+target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
+
+# Re-attach gene-peak net after slicing
+source_rna.uns["gene_peak_Net"] = gp_net.copy()
+
+n_genes = source_rna.n_vars
+n_peaks = source_atac.n_vars
+print("After feature selection: {} genes, {} peaks".format(n_genes, n_peaks))
+
+#%% ── Download model artifacts ─────────────────────────────────────────────
+source_artifact_map = {
+    "stage1":         "model_stage1.pth",
+    "stage1_teacher": "model_stage1_teacher.pth",
+    "stage1_student": "model_stage1_student.pth",
+    'stage1_nonspatial': "model_stage1_nonspatial.pth",
+}
+source_artifact_name = source_artifact_map[args.source_model]
+#teacher_source_artifact_name = source_artifact_map["stage1_teacher"]
+
+print(
+    "\nDownloading model artifacts for run '{}' (ID: {})...".format(
+        args.run_name, run_id
+    )
+)
+with tempfile.TemporaryDirectory() as tmpdir:
+
+    print("Source model ({}) :".format(source_artifact_name))
+    source_mgate, hidden_dims1, hidden_dims2, source_vgp_anchor_mode = load_mgate(
+        client, run_id, source_artifact_name, device, tmpdir,
+        skip_gp_attention=skip_gp_attention,
+    )
+
+    if dual_source_kd:
+        teacher_source_mgate, _, _, _ = load_mgate(
+            client, run_id, source_artifact_map["stage1_teacher"], device, tmpdir,
+            skip_gp_attention=skip_gp_attention,
+        )
+        nonspatial_source_mgate, _, _, _ = load_mgate(
+            client, run_id, source_artifact_map["stage1_nonspatial"], device, tmpdir,
+            skip_gp_attention=skip_gp_attention,
+        )
+    else:
+        teacher_source_mgate = source_mgate
+
+    # Verify feature dimensions match after our feature-selection replication
+    expected_n_genes = hidden_dims1[0]
+    expected_n_peaks = hidden_dims2[0]
+    if n_genes != expected_n_genes or n_peaks != expected_n_peaks:
         raise ValueError(
-            "--source-model {} requires the training run to have used "
-            "--stage1-dual-source-kd, but 'stage1_dual_source_kd={}' in run params.".format(
-                args.source_model, run_params.get("stage1_dual_source_kd")
+            "Feature dimension mismatch — the loaded model expects "
+            "({} genes, {} peaks) but our feature selection produced "
+            "({} genes, {} peaks).\n"
+            "Adjust --top-n-genes / --top-n-peaks to match what was "
+            "used during training.".format(
+                expected_n_genes, expected_n_peaks, n_genes, n_peaks
             )
         )
-    resolved_stage2_run_id = None
-    resolved_stage2_run_name = None
-    resolved_stage2_source_kind = None
+    print("  Feature dimensions verified: {} genes, {} peaks".format(n_genes, n_peaks))
+
     if args.target_model == "stage2":
-        resolved_stage2_run_id, resolved_stage2_run_name, resolved_stage2_source_kind = resolve_stage2_model_run(
-            client=client,
-            experiment_id=experiment_id,
-            parent_run_id=run_id,
-            stage2_run_name=args.stage2_run_name,
-            tracking_config=tracking_config,
-        )
         if resolved_stage2_source_kind == "child":
             print(
-                "Resolved stage2 model run: child '{}' (ID: {})".format(
+                "Target model (model_stage2.pth) from child run '{}' (ID: {}):".format(
                     resolved_stage2_run_name,
                     resolved_stage2_run_id,
                 )
             )
         else:
-            if args.stage2_run_name and resolved_stage2_run_name:
-                print(
-                    "Resolved stage2 model run: parent '{}' (ID: {}) [legacy {}; "
-                    "not found on child '{}' — loading parent checkpoint]".format(
-                        args.run_name,
-                        run_id,
-                        STAGE2_MODEL_ARTIFACT,
-                        resolved_stage2_run_name,
-                    )
+            print(
+                "Target model (model_stage2.pth) from parent run '{}' (ID: {}) [legacy fallback]:".format(
+                    args.run_name,
+                    run_id,
                 )
-            else:
-                print(
-                    "Resolved stage2 model run: parent '{}' (ID: {}) [legacy fallback]".format(
-                        args.run_name,
-                        run_id,
-                    )
-                )
-
-    # ── Output directory ────────────────────────────────────────────────────
-    if args.output_dir is None:
-        outpath = os.getenv("OUTPATH", "/tmp")
-        output_dir = os.path.join(outpath, "MultiGATE", "co_embed", args.run_name)
-    else:
-        output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-    print("Output directory:", output_dir)
-
-    # ── GTF path ────────────────────────────────────────────────────────────
-    gtf_path = os.path.join(
-        os.getenv("DATAPATH"), "gene_annotations",
-        "gencode.vM25.chr_patch_hapl_scaff.annotation.gtf.gz",
-    )
-    if not os.path.exists(gtf_path):
-        raise FileNotFoundError("GTF annotation file not found: {}".format(gtf_path))
-
-    #%% ── Load raw aligned datasets ────────────────────────────────────────────
-    print("\nLoading source and target datasets...")
-    source_rna  = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_SCT.h5ad"))
-    source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned.h5ad"))
-    target_rna  = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_SCT.h5ad"))
-    target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
-    if not target_rna.obs_names.equals(target_atac.obs_names):
-        raise AssertionError("Target RNA and ATAC must have matching obs_names")
-
-    # Flip spatial coordinates (same convention as training)
-    source_rna.obsm["spatial"]  = source_rna.obsm["spatial"] * -1
-    source_atac.obsm["spatial"] = source_atac.obsm["spatial"] * -1
-
-    # ── Gene-peak network ────────────────────────────────────────────────────
-    print("\nComputing gene-peak network on source...")
-    MultiGATE.Cal_gene_peak_Net_new(source_rna, source_atac, 150000, file=gtf_path)
-    gp_net = source_atac.uns["gene_peak_Net"].copy()
-    del source_atac.uns["gene_peak_Net"]
-
-    # ── Feature selection ────────────────────────────────────────────────────
-    print(
-        "Replicating feature selection "
-        "(top_n_genes={}, top_n_peaks={})...".format(run_params.get("n_genes"), run_params.get("n_peaks"))
-    )
-    use_sct_genes = True
-    if use_sct_genes:
-        source_rna, source_atac, target_rna, target_atac, gp_net = get_sct_genes_and_gp_filtering(
-            source_rna=source_rna,
-            source_atac=source_atac,
-            target_rna=target_rna,
-            target_atac=target_atac,
-            gp_net=gp_net,
-        )
-    else:
-        source_rna, source_atac, target_rna, target_atac, gp_net = apply_hvg_and_gp_filtering(
-            source_rna=source_rna,
-            source_atac=source_atac,
-            target_rna=target_rna,
-            target_atac=target_atac,
-            gp_net=gp_net,
-            top_n_genes=int(run_params.get("n_genes")),
-            top_n_peaks=int(run_params.get("n_peaks")),
-            rank_type="fused",
-        )
-
-    # Attach gene-peak net before HVG slicing (needed by build_graph_inputs)
-    source_rna.uns["gene_peak_Net"] = gp_net.copy()
-
-    # Apply HVG filter
-    source_rna  = source_rna[:,  source_rna.var["highly_variable"]].copy()
-    source_atac = source_atac[:, source_atac.var["highly_variable"]].copy()
-    target_rna  = target_rna[:,  target_rna.var["highly_variable"]].copy()
-    target_atac = target_atac[:, target_atac.var["highly_variable"]].copy()
-
-    # Re-attach gene-peak net after slicing
-    source_rna.uns["gene_peak_Net"] = gp_net.copy()
-
-    n_genes = source_rna.n_vars
-    n_peaks = source_atac.n_vars
-    print("After feature selection: {} genes, {} peaks".format(n_genes, n_peaks))
-
-    #%% ── Download model artifacts ─────────────────────────────────────────────
-    source_artifact_map = {
-        "stage1":         "model_stage1.pth",
-        "stage1_teacher": "model_stage1_teacher.pth",
-        "stage1_student": "model_stage1_student.pth",
-        'stage1_nonspatial': "model_stage1_nonspatial.pth",
-    }
-    source_artifact_name = source_artifact_map[args.source_model]
-    #teacher_source_artifact_name = source_artifact_map["stage1_teacher"]
-
-    print(
-        "\nDownloading model artifacts for run '{}' (ID: {})...".format(
-            args.run_name, run_id
-        )
-    )
-    with tempfile.TemporaryDirectory() as tmpdir:
-
-        print("Source model ({}) :".format(source_artifact_name))
-        source_mgate, hidden_dims1, hidden_dims2, source_vgp_anchor_mode = load_mgate(
-            client, run_id, source_artifact_name, device, tmpdir,
+            )
+        target_mgate, _, _, _ = load_mgate(
+            client, resolved_stage2_run_id, "model_stage2.pth", device, tmpdir,
             skip_gp_attention=skip_gp_attention,
         )
-
-        if dual_source_kd:
-            teacher_source_mgate, _, _, _ = load_mgate(
-                client, run_id, source_artifact_map["stage1_teacher"], device, tmpdir,
-                skip_gp_attention=skip_gp_attention,
-            )
-            nonspatial_source_mgate, _, _, _ = load_mgate(
-                client, run_id, source_artifact_map["stage1_nonspatial"], device, tmpdir,
-                skip_gp_attention=skip_gp_attention,
-            )
-        else:
-            teacher_source_mgate = source_mgate
-
-        # Verify feature dimensions match after our feature-selection replication
-        expected_n_genes = hidden_dims1[0]
-        expected_n_peaks = hidden_dims2[0]
-        if n_genes != expected_n_genes or n_peaks != expected_n_peaks:
-            raise ValueError(
-                "Feature dimension mismatch — the loaded model expects "
-                "({} genes, {} peaks) but our feature selection produced "
-                "({} genes, {} peaks).\n"
-                "Adjust --top-n-genes / --top-n-peaks to match what was "
-                "used during training.".format(
-                    expected_n_genes, expected_n_peaks, n_genes, n_peaks
-                )
-            )
-        print("  Feature dimensions verified: {} genes, {} peaks".format(n_genes, n_peaks))
-
-        if args.target_model == "stage2":
-            if resolved_stage2_source_kind == "child":
-                print(
-                    "Target model (model_stage2.pth) from child run '{}' (ID: {}):".format(
-                        resolved_stage2_run_name,
-                        resolved_stage2_run_id,
-                    )
-                )
-            else:
-                print(
-                    "Target model (model_stage2.pth) from parent run '{}' (ID: {}) [legacy fallback]:".format(
-                        args.run_name,
-                        run_id,
-                    )
-                )
-            target_mgate, _, _, _ = load_mgate(
-                client, resolved_stage2_run_id, "model_stage2.pth", device, tmpdir,
-                skip_gp_attention=skip_gp_attention,
-            )
-        else:
-            # Zero-shot: built after download, outside the tmpdir block
-            target_mgate = None
-
-    #%% ── Source/Target graph preparation ─────────────────────────────────────
-    print("\nBuilding source spatial graph...")
-    MultiGATE.Cal_Spatial_Net(source_rna, rad_cutoff=40)
-    MultiGATE.Stats_Spatial_Net(source_rna)
-    MultiGATE.Cal_Spatial_Net(source_atac, rad_cutoff=40)
-    MultiGATE.Stats_Spatial_Net(source_atac)
-    source_atac.uns["gene_peak_Net"] = gp_net.copy()
-
-    print("Building target graph (type: '{}')...".format(spatial_graph_type))
-    target_rna, target_atac = prepare_target_for_spatial_graph_type(
-        target_rna=target_rna,
-        target_atac=target_atac,
-        source_rna=source_rna,
-        source_atac=source_atac,
-        spatial_graph_type=spatial_graph_type,
-        gtf_path=gtf_path,
-    )
-    '''
-    if split_metadata is not None:
-        source_rna, source_atac = subset_domain_to_saved_split(
-            source_rna,
-            source_atac,
-            split_metadata=split_metadata,
-            domain_name="source",
-            split_name="eval",
-        )
-        target_rna, target_atac = subset_domain_to_saved_split(
-            target_rna,
-            target_atac,
-            split_metadata=split_metadata,
-            domain_name="target",
-            split_name="eval",
-        )
-        print(
-            "Applied split artifact eval subsets: source={} cells, target={} cells".format(
-                source_rna.n_obs,
-                target_rna.n_obs,
-            )
-        )
     else:
-        print("\nPairing and subsampling target cells (legacy fallback)...")
-        target_rna, target_atac = pair_and_subsample_target(
-            target_rna,
-            target_atac,
-            subsample_n=legacy_target_subsample_n,
-            seed=legacy_target_subsample_seed,
-        )
-        print("  {} cells after pairing/subsampling".format(target_rna.n_obs))
-    '''
-    source_graph_tf, source_gp_tf, source_x1, source_x2 = build_graph_inputs(
-        source_rna, source_atac, bp_width=bp_width, graph_type=graph_type
-    )
-    print("  Source graph built: {} cells".format(source_rna.n_obs))
+        # Zero-shot: built after download, outside the tmpdir block
+        target_mgate = None
 
-    source_student_graph_type = run_params.get("stage1_student_graph", "identity")
-    if args.source_model == "stage1_teacher":
-        source_infer_graph_tf = source_graph_tf
-        source_graph_mode = "spatial_teacher_graph"
-    elif args.source_model == "stage1_student":
+#%% ── Source/Target graph preparation ─────────────────────────────────────
+print("\nBuilding source spatial graph...")
+MultiGATE.Cal_Spatial_Net(source_rna, rad_cutoff=40)
+MultiGATE.Stats_Spatial_Net(source_rna)
+MultiGATE.Cal_Spatial_Net(source_atac, rad_cutoff=40)
+MultiGATE.Stats_Spatial_Net(source_atac)
+source_atac.uns["gene_peak_Net"] = gp_net.copy()
+
+print("Building target graph (type: '{}')...".format(spatial_graph_type))
+target_rna, target_atac = prepare_target_for_spatial_graph_type(
+    target_rna=target_rna,
+    target_atac=target_atac,
+    source_rna=source_rna,
+    source_atac=source_atac,
+    spatial_graph_type=spatial_graph_type,
+    gtf_path=gtf_path,
+)
+'''
+if split_metadata is not None:
+    source_rna, source_atac = subset_domain_to_saved_split(
+        source_rna,
+        source_atac,
+        split_metadata=split_metadata,
+        domain_name="source",
+        split_name="eval",
+    )
+    target_rna, target_atac = subset_domain_to_saved_split(
+        target_rna,
+        target_atac,
+        split_metadata=split_metadata,
+        domain_name="target",
+        split_name="eval",
+    )
+    print(
+        "Applied split artifact eval subsets: source={} cells, target={} cells".format(
+            source_rna.n_obs,
+            target_rna.n_obs,
+        )
+    )
+else:
+    print("\nPairing and subsampling target cells (legacy fallback)...")
+    target_rna, target_atac = pair_and_subsample_target(
+        target_rna,
+        target_atac,
+        subsample_n=legacy_target_subsample_n,
+        seed=legacy_target_subsample_seed,
+    )
+    print("  {} cells after pairing/subsampling".format(target_rna.n_obs))
+'''
+source_graph_tf, source_gp_tf, source_x1, source_x2 = build_graph_inputs(
+    source_rna, source_atac, bp_width=bp_width, graph_type=graph_type
+)
+print("  Source graph built: {} cells".format(source_rna.n_obs))
+
+source_student_graph_type = run_params.get("stage1_student_graph", "identity")
+if args.source_model == "stage1_teacher":
+    source_infer_graph_tf = source_graph_tf
+    source_graph_mode = "spatial_teacher_graph"
+elif args.source_model == "stage1_student":
+    source_infer_graph_tf = build_source_student_graph_tf(
+        source_rna=source_rna,
+        spatial_graph_type=source_student_graph_type,
+    )
+    source_graph_mode = "student_graph({})".format(source_student_graph_type)
+else:
+    if dual_source_kd:
         source_infer_graph_tf = build_source_student_graph_tf(
             source_rna=source_rna,
             spatial_graph_type=source_student_graph_type,
         )
-        source_graph_mode = "student_graph({})".format(source_student_graph_type)
+        source_graph_mode = "stage1_primary_student_graph({})".format(source_student_graph_type)
     else:
-        if dual_source_kd:
-            source_infer_graph_tf = build_source_student_graph_tf(
-                source_rna=source_rna,
-                spatial_graph_type=source_student_graph_type,
-            )
-            source_graph_mode = "stage1_primary_student_graph({})".format(source_student_graph_type)
-        else:
-            source_infer_graph_tf = source_graph_tf
-            source_graph_mode = "stage1_primary_teacher_graph(spatial)"
-    print("  Source inference graph:", source_graph_mode)
+        source_infer_graph_tf = source_graph_tf
+        source_graph_mode = "stage1_primary_teacher_graph(spatial)"
+print("  Source inference graph:", source_graph_mode)
 
-    target_graph_tf, target_gp_tf, target_x1, target_x2 = build_graph_inputs(
-        target_rna, target_atac, bp_width=bp_width, graph_type=graph_type
+target_graph_tf, target_gp_tf, target_x1, target_x2 = build_graph_inputs(
+    target_rna, target_atac, bp_width=bp_width, graph_type=graph_type
+)
+print("  Target graph built: {} cells".format(target_rna.n_obs))
+
+# Build zero-shot target model after target pairing/subsampling so spot-anchored
+# vgp has the correct target cell count.
+if args.target_model == "zero_shot":
+    run_vgp_anchor_mode = run_params.get("vgp_anchor_mode")
+    effective_vgp_anchor_mode = (
+        args.vgp_anchor_mode
+        or run_vgp_anchor_mode
+        or source_vgp_anchor_mode
     )
-    print("  Target graph built: {} cells".format(target_rna.n_obs))
-
-    # Build zero-shot target model after target pairing/subsampling so spot-anchored
-    # vgp has the correct target cell count.
-    if args.target_model == "zero_shot":
-        run_vgp_anchor_mode = run_params.get("vgp_anchor_mode")
-        effective_vgp_anchor_mode = (
-            args.vgp_anchor_mode
-            or run_vgp_anchor_mode
-            or source_vgp_anchor_mode
+    print(
+        "\nBuilding zero-shot target model from source weights "
+        "(vgp_anchor_mode='{}')...".format(
+            effective_vgp_anchor_mode
         )
-        print(
-            "\nBuilding zero-shot target model from source weights "
-            "(vgp_anchor_mode='{}')...".format(
-                effective_vgp_anchor_mode
-            )
-        )
-        target_mgate = build_zero_shot_mgate(
-            source_mgate=source_mgate,
-            target_spot_num=target_rna.n_obs,
-            vgp_anchor_mode=effective_vgp_anchor_mode,
-            device=device,
-        )
-
-    #%% Celltypist predictions and data UMAP figures
-    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
-    sc.pl.embedding(source_rna, color='RNA_clusters', basis='spatial', size=40, ax=ax[0], show=False)
-    sc.pl.embedding(source_atac, color='ATAC_clusters', basis='spatial', size=40, ax=ax[1], show=False)
-    plt.tight_layout(); plt.show()
-
-    import celltypist
-    target_rna_ct = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
-
-    '''
-    import mudata
-    import muon
-    target_atac_ct = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
-    target_mudata_ct = mudata.MuData({
-        'rna': target_rna_ct,
-        'atac': target_atac_ct
-    })
-    muon.pp.neighbors(target_mudata_ct)
-    '''
-
-    # Ensure a neighborhood graph exists for clustering
-    if 'neighbors' not in target_rna_ct.uns:
-        if 'X_pca' not in target_rna_ct.obsm:
-            sc.pp.pca(target_rna_ct)
-        sc.pp.neighbors(target_rna_ct)
-
-    # Run leiden clustering with lower resolution for smoother majority voting
-    # (CellTypist defaults to res=15 for this dataset size, which is too high)
-    sc.tl.leiden(target_rna_ct, resolution=0.5, key_added='over_clustering')
-    predictions = celltypist.annotate(
-        target_rna_ct,
-        model='Mouse_Whole_Brain.pkl',
-        majority_voting = True,
-        over_clustering = 'over_clustering'
     )
-    # Strip the 3-digit numeric prefix (e.g. "001 CLA-EPd-CTX Car3 Glut" -> "CLA-EPd-CTX Car3 Glut")
-    cleaned_labels = predictions.predicted_labels['majority_voting'].str.replace(
-        r'^\d{3}\s+', '', regex=True
-    )
-    target_rna_ct.obs['celltypist_predictions'] = cleaned_labels
-
-    sc.tl.umap(target_rna_ct)
-
-    ax = sc.pl.embedding(
-        target_rna_ct, color='celltypist_predictions', basis='umap', size=40, show=False
-    )
-    plt.gcf().set_size_inches(6, 5)
-    # Force legend into a single column so all labels align on the same axis
-    handles, labels = ax.get_legend_handles_labels()
-    ax.legend(
-        handles=handles,
-        labels=labels,
-        loc='center left',
-        bbox_to_anchor=(1, 0.5),
-        ncol=1,
-        frameon=False,
-    )
-    save_figure_pdf_vector_raster(
-        plt.gcf(),
-        os.path.join(
-            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
-            "target_rna_umap_celltypist_predictions.pdf",
-        ),
-    )
-    plt.show()
-
-    target_rna.obs['celltypist_predictions'] = cleaned_labels
-    target_atac.obs['celltypist_predictions'] = cleaned_labels
-    del target_rna_ct
-
-    #%% ── Inference, by dataset ────────────────────────────────────────────────────────────
-
-    ## (teacher) source inference
-    teacher_source_rna_emb, teacher_source_atac_emb, _ = run_inference(
-        teacher_source_mgate, source_graph_tf, source_gp_tf, source_x1, source_x2, device
-    )
-    set_multigate_embeddings(source_rna, source_atac, teacher_source_rna_emb, teacher_source_atac_emb, key_added="MultiGATE_full_teacher")
-    print("  Teacher source embeddings: shape {}".format(teacher_source_rna_emb.shape))
-    
-    ## (student) source inference
-    source_rna_emb, source_atac_emb, _ = run_inference(
-        source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
-    )
-    set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
-    print("  Source embeddings: shape {}".format(source_rna_emb.shape))
-
-    ## nonspatial source inference
-    nonspatial_source_rna_emb, nonspatial_source_atac_emb, _ = run_inference(
-        nonspatial_source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
-    )
-    set_multigate_embeddings(source_rna, source_atac, nonspatial_source_rna_emb, nonspatial_source_atac_emb, key_added="MultiGATE_nonspatial")
-    print("  Nonspatial source embeddings: shape {}".format(nonspatial_source_rna_emb.shape))
-
-    # Plot source/target concat UMAPs with the same helper as training script.
-    teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_full_teacher")
-    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
-    nonspatial_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_nonspatial")
-
-    ## set leiden resolution
-    leiden_resolution = 0.5
-    leiden_neighbors = 10
-
-    ## compute UMAPs
-    compute_concat_umap(
-        teacher_source_concat_adata,
-        n_neighbors=leiden_neighbors,
-        resolution=leiden_resolution,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    compute_concat_umap(
-        source_concat_adata,
-        n_neighbors=leiden_neighbors,
-        resolution=leiden_resolution,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    compute_concat_umap(
-        nonspatial_source_concat_adata,
-        n_neighbors=leiden_neighbors,
-        resolution=leiden_resolution,
-        deterministic=True,
-        random_state=deterministic_seed,
+    target_mgate = build_zero_shot_mgate(
+        source_mgate=source_mgate,
+        target_spot_num=target_rna.n_obs,
+        vgp_anchor_mode=effective_vgp_anchor_mode,
+        device=device,
     )
 
-    # flip x-axis coordinates of source_concat_adata UMAP
-    source_concat_adata.obsm['X_umap'][:, 0] = -source_concat_adata.obsm['X_umap'][:, 0]
+#%% Celltypist predictions and data UMAP figures
+fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+sc.pl.embedding(source_rna, color='RNA_clusters', basis='spatial', size=40, ax=ax[0], show=False)
+sc.pl.embedding(source_atac, color='ATAC_clusters', basis='spatial', size=40, ax=ax[1], show=False)
+plt.tight_layout(); plt.show()
 
-    # plot teacher source UMAPs
-    teacher_source_umap_colors = ['modality', 'RNA_clusters', 'ATAC_clusters']
-    fig, axs = plt.subplots(1, len(teacher_source_umap_colors), figsize=(18, 5))
-    for i, color in enumerate(teacher_source_umap_colors):
-        sc.pl.umap(teacher_source_concat_adata, color=color, ncols=3, wspace=0.1, size=25, ax=axs[i], show=False)
-        axs[i].set_xlabel(''); axs[i].set_ylabel('')
-    plt.tight_layout()
-    save_figure_pdf_vector_raster(
-        fig,
-        os.path.join(
-            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
-            "teacher_source_concat_umap.pdf",
-        ),
-    )
-    plt.show()
+import celltypist
+target_rna_ct = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned.h5ad"))
 
-    # plot source UMAPs
-    source_umap_colors = ['modality', 'RNA_clusters', 'ATAC_clusters']
-    fig, axs = plt.subplots(1, len(source_umap_colors), figsize=(18, 5))
-    for i, color in enumerate(source_umap_colors):
-        sc.pl.umap(source_concat_adata, color=color, ncols=3, wspace=0.1, size=25, ax=axs[i], show=False)
-        axs[i].set_xlabel(''); axs[i].set_ylabel('')
-    plt.tight_layout()
-    save_figure_pdf_vector_raster(
-        fig,
-        os.path.join(
-            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
-            "source_concat_umap.pdf",
-        ),
-    )
-    plt.show()
+'''
+import mudata
+import muon
+target_atac_ct = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned.h5ad"))
+target_mudata_ct = mudata.MuData({
+    'rna': target_rna_ct,
+    'atac': target_atac_ct
+})
+muon.pp.neighbors(target_mudata_ct)
+'''
 
-    # plot nonspatial source UMAPs
-    nonspatial_source_umap_colors = ['modality', 'RNA_clusters', 'ATAC_clusters']
-    fig, axs = plt.subplots(1, len(nonspatial_source_umap_colors), figsize=(18, 5))
-    for i, color in enumerate(nonspatial_source_umap_colors):
-        sc.pl.umap(nonspatial_source_concat_adata, color=color, ncols=3, wspace=0.1, size=25, ax=axs[i], show=False)
-        axs[i].set_xlabel(''); axs[i].set_ylabel('')
-    plt.tight_layout()
-    save_figure_pdf_vector_raster(
-        fig,
-        os.path.join(
-            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
-            "nonspatial_source_concat_umap.pdf",
-        ),
-    )
-    plt.show()
+# Ensure a neighborhood graph exists for clustering
+if 'neighbors' not in target_rna_ct.uns:
+    if 'X_pca' not in target_rna_ct.obsm:
+        sc.pp.pca(target_rna_ct)
+    sc.pp.neighbors(target_rna_ct)
 
-    if args.target_model:
+# Run leiden clustering with lower resolution for smoother majority voting
+# (CellTypist defaults to res=15 for this dataset size, which is too high)
+sc.tl.leiden(target_rna_ct, resolution=0.5, key_added='over_clustering')
+predictions = celltypist.annotate(
+    target_rna_ct,
+    model='Mouse_Whole_Brain.pkl',
+    majority_voting = True,
+    over_clustering = 'over_clustering'
+)
+# Strip the 3-digit numeric prefix (e.g. "001 CLA-EPd-CTX Car3 Glut" -> "CLA-EPd-CTX Car3 Glut")
+cleaned_labels = predictions.predicted_labels['majority_voting'].str.replace(
+    r'^\d{3}\s+', '', regex=True
+)
+target_rna_ct.obs['celltypist_predictions'] = cleaned_labels
 
-        ## student target inference
-        target_rna_emb, target_atac_emb, _ = run_inference(
-            target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
-        )
-        set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
-        print("  Target embeddings: shape {}".format(target_rna_emb.shape))
+sc.tl.umap(target_rna_ct)
 
-        target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
+ax = sc.pl.embedding(
+    target_rna_ct, color='celltypist_predictions', basis='umap', size=40, show=False
+)
+plt.gcf().set_size_inches(6, 5)
+# Force legend into a single column so all labels align on the same axis
+handles, labels = ax.get_legend_handles_labels()
+ax.legend(
+    handles=handles,
+    labels=labels,
+    loc='center left',
+    bbox_to_anchor=(1, 0.5),
+    ncol=1,
+    frameon=False,
+)
+save_figure_pdf_vector_raster(
+    plt.gcf(),
+    os.path.join(
+        "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+        "target_rna_umap_celltypist_predictions.pdf",
+    ),
+)
+plt.show()
 
-        ## subsample target data to test obs
-        test_target_obs_names = split_metadata.get('domains').get('target').get('splits').get('test').get('obs_names')
-        target_concat_adata = target_concat_adata[target_concat_adata.obs_names.str.split('_').str[0].isin(test_target_obs_names)].copy()
+target_rna.obs['celltypist_predictions'] = cleaned_labels
+target_atac.obs['celltypist_predictions'] = cleaned_labels
+del target_rna_ct
 
-        sc.pp.neighbors(target_concat_adata, n_neighbors=30)
-        sc.tl.umap(target_concat_adata, min_dist=0.1, spread=1.5)
-        sc.tl.leiden(target_concat_adata, resolution=leiden_resolution)
+#%% ── Inference, by dataset ────────────────────────────────────────────────────────────
 
-        # plot target UMAPs
-        target_umap_colors = ['modality', 'celltypist_predictions']
-        fig, axs = plt.subplots(1, len(target_umap_colors), figsize=(12, 5))
-        for i, color in enumerate(target_umap_colors):
-            ax = axs[i]
-            sc.pl.umap(target_concat_adata, color=color, size=25, ax=ax, show=False)
-            ax.set_xlabel(''); ax.set_ylabel('')
-            
-            # Force legend into a single column
-            handles, labels = ax.get_legend_handles_labels()
-            if handles:  # Only modify if a legend exists
-                ax.legend(
-                    handles=handles,
-                    labels=labels,
-                    loc='center left',
-                    bbox_to_anchor=(1, 0.5),
-                    ncol=1,
-                    frameon=False,
-                )
-        plt.tight_layout()
-        save_figure_pdf_vector_raster(
-            fig,
-            os.path.join(
-                "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
-                "target_test_concat_umap.pdf",
-            ),
-        )
-        plt.show()
+## (teacher) source inference
+teacher_source_rna_emb, teacher_source_atac_emb, _ = run_inference(
+    teacher_source_mgate, source_graph_tf, source_gp_tf, source_x1, source_x2, device
+)
+set_multigate_embeddings(source_rna, source_atac, teacher_source_rna_emb, teacher_source_atac_emb, key_added="MultiGATE_full_teacher")
+print("  Teacher source embeddings: shape {}".format(teacher_source_rna_emb.shape))
 
-    #%% Inference, all same model (except nonspatial source inference)
+## (student) source inference
+source_rna_emb, source_atac_emb, _ = run_inference(
+    source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+)
+set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
+print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
-    model = source_mgate
+## nonspatial source inference
+nonspatial_source_rna_emb, nonspatial_source_atac_emb, _ = run_inference(
+    nonspatial_source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+)
+set_multigate_embeddings(source_rna, source_atac, nonspatial_source_rna_emb, nonspatial_source_atac_emb, key_added="MultiGATE_nonspatial")
+print("  Nonspatial source embeddings: shape {}".format(nonspatial_source_rna_emb.shape))
 
-    ## (teacher) source inference
-    teacher_source_rna_emb, teacher_source_atac_emb, teacher_source_att_lgp = run_inference(
-        model, source_graph_tf, source_gp_tf, source_x1, source_x2, device
-    )
-    set_multigate_embeddings(source_rna, source_atac, teacher_source_rna_emb, teacher_source_atac_emb, key_added="MultiGATE_teacher")
-    print("  Teacher source embeddings: shape {}".format(teacher_source_rna_emb.shape))
-    
-    ## (student) source inference
-    source_rna_emb, source_atac_emb, source_att_lgp = run_inference(
-        model, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
-    )
-    set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
-    print("  Source embeddings: shape {}".format(source_rna_emb.shape))
+# Plot source/target concat UMAPs with the same helper as training script.
+teacher_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_full_teacher")
+source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
+nonspatial_source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_nonspatial")
 
-    ## (target) inference
-    target_rna_emb, target_atac_emb, target_att_lgp = run_inference(
-        model, target_graph_tf, target_gp_tf, target_x1, target_x2, device
+## set leiden resolution
+leiden_resolution = 0.5
+leiden_neighbors = 10
+
+## compute UMAPs
+compute_concat_umap(
+    teacher_source_concat_adata,
+    n_neighbors=leiden_neighbors,
+    resolution=leiden_resolution,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
+compute_concat_umap(
+    source_concat_adata,
+    n_neighbors=leiden_neighbors,
+    resolution=leiden_resolution,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
+compute_concat_umap(
+    nonspatial_source_concat_adata,
+    n_neighbors=leiden_neighbors,
+    resolution=leiden_resolution,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
+
+# flip x-axis coordinates of source_concat_adata UMAP
+source_concat_adata.obsm['X_umap'][:, 0] = -source_concat_adata.obsm['X_umap'][:, 0]
+
+# plot teacher source UMAPs
+teacher_source_umap_colors = ['modality', 'RNA_clusters', 'ATAC_clusters']
+fig, axs = plt.subplots(1, len(teacher_source_umap_colors), figsize=(18, 5))
+for i, color in enumerate(teacher_source_umap_colors):
+    sc.pl.umap(teacher_source_concat_adata, color=color, ncols=3, wspace=0.1, size=25, ax=axs[i], show=False)
+    axs[i].set_xlabel(''); axs[i].set_ylabel('')
+plt.tight_layout()
+save_figure_pdf_vector_raster(
+    fig,
+    os.path.join(
+        "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+        "teacher_source_concat_umap.pdf",
+    ),
+)
+plt.show()
+
+# plot source UMAPs
+source_umap_colors = ['modality', 'RNA_clusters', 'ATAC_clusters']
+fig, axs = plt.subplots(1, len(source_umap_colors), figsize=(18, 5))
+for i, color in enumerate(source_umap_colors):
+    sc.pl.umap(source_concat_adata, color=color, ncols=3, wspace=0.1, size=25, ax=axs[i], show=False)
+    axs[i].set_xlabel(''); axs[i].set_ylabel('')
+plt.tight_layout()
+save_figure_pdf_vector_raster(
+    fig,
+    os.path.join(
+        "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+        "source_concat_umap.pdf",
+    ),
+)
+plt.show()
+
+# plot nonspatial source UMAPs
+nonspatial_source_umap_colors = ['modality', 'RNA_clusters', 'ATAC_clusters']
+fig, axs = plt.subplots(1, len(nonspatial_source_umap_colors), figsize=(18, 5))
+for i, color in enumerate(nonspatial_source_umap_colors):
+    sc.pl.umap(nonspatial_source_concat_adata, color=color, ncols=3, wspace=0.1, size=25, ax=axs[i], show=False)
+    axs[i].set_xlabel(''); axs[i].set_ylabel('')
+plt.tight_layout()
+save_figure_pdf_vector_raster(
+    fig,
+    os.path.join(
+        "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+        "nonspatial_source_concat_umap.pdf",
+    ),
+)
+plt.show()
+
+if args.target_model:
+
+    ## student target inference
+    target_rna_emb, target_atac_emb, _ = run_inference(
+        target_mgate, target_graph_tf, target_gp_tf, target_x1, target_x2, device
     )
     set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
     print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
-    ## nonspatial source inference
-    nonspatial_source_rna_emb, nonspatial_source_atac_emb, nonspatial_source_att_lgp = run_inference(
-        nonspatial_source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
-    )
-    set_multigate_embeddings(source_rna, source_atac, nonspatial_source_rna_emb, nonspatial_source_atac_emb, key_added="MultiGATE_nonspatial")
-    print("  Nonspatial source embeddings: shape {}".format(nonspatial_source_rna_emb.shape))
+    target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE")
 
-    #%% OT from target to source
-    import gc
+    ## subsample target data to test obs
+    test_target_obs_names = split_metadata.get('domains').get('target').get('splits').get('test').get('obs_names')
+    target_concat_adata = target_concat_adata[target_concat_adata.obs_names.str.split('_').str[0].isin(test_target_obs_names)].copy()
 
-    X = torch.tensor(target_rna.obsm['MultiGATE'], device='cuda')
-    Y = torch.tensor(source_rna.obsm['MultiGATE'], device='cuda')
-    res = ot.solve_sample(X, Y, metric='euclidean', reg=0.001)
-    X_to_Y = res.plan @ Y * len(X)
-    target_rna.obsm['MultiGATE_source_aligned'] = X_to_Y.detach().cpu().numpy()
-    del X, Y, res, X_to_Y
-
-    X = torch.tensor(target_atac.obsm['MultiGATE'], device='cuda')
-    Y = torch.tensor(source_atac.obsm['MultiGATE'], device='cuda')
-    res = ot.solve_sample(X, Y, metric='euclidean', reg=0.001)
-    X_to_Y = res.plan @ Y * len(X)
-    target_atac.obsm['MultiGATE_source_aligned'] = X_to_Y.detach().cpu().numpy()
-    del X, Y, res, X_to_Y
-
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE_source_aligned")
-
-    compute_concat_umap(
-        target_concat_adata,
-        n_neighbors=10,
-        resolution=0.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
+    sc.pp.neighbors(target_concat_adata, n_neighbors=30)
+    sc.tl.umap(target_concat_adata, min_dist=0.1, spread=1.5)
+    sc.tl.leiden(target_concat_adata, resolution=leiden_resolution)
 
     # plot target UMAPs
-    target_umap_colors = ['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster']
-    fig, axs = plt.subplots(1, len(target_umap_colors), figsize=(18, 5))
+    target_umap_colors = ['modality', 'celltypist_predictions']
+    fig, axs = plt.subplots(1, len(target_umap_colors), figsize=(12, 5))
     for i, color in enumerate(target_umap_colors):
-        sc.pl.umap(target_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
-    plt.tight_layout(); plt.show()
-
-    ## concatenate source and target data
-    source_rna.obsm['MultiGATE_source_aligned'] = source_rna.obsm['MultiGATE']
-    source_atac.obsm['MultiGATE_source_aligned'] = source_atac.obsm['MultiGATE']
-
-    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_source_aligned")
-    source_concat_adata.obs = source_concat_adata.obs.assign(source_obs_names = source_concat_adata.obs_names)
-    source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
-
-    source_target_adata, _, _ = run_alignment_and_spatial_plot(
-        model,
-        source_mgate,
-        target_mgate,
-        source_rna,
-        source_atac,
-        source_concat_adata,
-        target_concat_adata,
-        deterministic_seed,
+        ax = axs[i]
+        sc.pl.umap(target_concat_adata, color=color, size=25, ax=ax, show=False)
+        ax.set_xlabel(''); ax.set_ylabel('')
+        
+        # Force legend into a single column
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:  # Only modify if a legend exists
+            ax.legend(
+                handles=handles,
+                labels=labels,
+                loc='center left',
+                bbox_to_anchor=(1, 0.5),
+                ncol=1,
+                frameon=False,
+            )
+    plt.tight_layout()
+    save_figure_pdf_vector_raster(
+        fig,
+        os.path.join(
+            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+            "target_test_concat_umap.pdf",
+        ),
     )
+    plt.show()
 
-    ## transfer UMAP, spatial coordinates and ingest-transferred variables to original datasets
-    source_rna.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'rna']).all(1)].obsm['X_umap'].copy()
-    source_atac.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'atac']).all(1)].obsm['X_umap'].copy()
+#%% Inference, all same model (except nonspatial source inference)
 
-    source_rna.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'rna']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
-    source_atac.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'atac']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
+model = source_mgate
 
-    target_rna.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'rna']).all(1)].obsm['X_umap'].copy()
-    target_atac.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'atac']).all(1)].obsm['X_umap'].copy()
+## (teacher) source inference
+teacher_source_rna_emb, teacher_source_atac_emb, teacher_source_att_lgp = run_inference(
+    model, source_graph_tf, source_gp_tf, source_x1, source_x2, device
+)
+set_multigate_embeddings(source_rna, source_atac, teacher_source_rna_emb, teacher_source_atac_emb, key_added="MultiGATE_teacher")
+print("  Teacher source embeddings: shape {}".format(teacher_source_rna_emb.shape))
 
-    target_rna.obsm['spatial'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'rna']).all(1)].obsm['spatial'].copy()
-    target_atac.obsm['spatial'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'atac']).all(1)].obsm['spatial'].copy()
+## (student) source inference
+source_rna_emb, source_atac_emb, source_att_lgp = run_inference(
+    model, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+)
+set_multigate_embeddings(source_rna, source_atac, source_rna_emb, source_atac_emb)
+print("  Source embeddings: shape {}".format(source_rna_emb.shape))
 
-    target_rna.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'rna']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
-    target_atac.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'atac']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
+## (target) inference
+target_rna_emb, target_atac_emb, target_att_lgp = run_inference(
+    model, target_graph_tf, target_gp_tf, target_x1, target_x2, device
+)
+set_multigate_embeddings(target_rna, target_atac, target_rna_emb, target_atac_emb)
+print("  Target embeddings: shape {}".format(target_rna_emb.shape))
 
-    ## get top genes per leiden cluster
-    sc.tl.rank_genes_groups(
-        source_rna,
-        groupby="leiden",
-        method="t-test",   # or "t-test", "logreg"
-        reference="rest"
-    )
-    source_rna_rank_genes_leidens_df = sc.get.rank_genes_groups_df(source_rna, group=None)
-    
-    sc.tl.rank_genes_groups(
-        target_rna,
-        groupby="leiden",
-        method="t-test",   # or "t-test", "logreg"
-        reference="rest"
-    )
-    target_rna_rank_genes_leidens_df = sc.get.rank_genes_groups_df(target_rna, group=None)
+## nonspatial source inference
+nonspatial_source_rna_emb, nonspatial_source_atac_emb, nonspatial_source_att_lgp = run_inference(
+    nonspatial_source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+)
+set_multigate_embeddings(source_rna, source_atac, nonspatial_source_rna_emb, nonspatial_source_atac_emb, key_added="MultiGATE_nonspatial")
+print("  Nonspatial source embeddings: shape {}".format(nonspatial_source_rna_emb.shape))
 
-    ## merge source and target rank genes leidens dataframes, only keep significant genes
-    merged_rank_genes_leidens_df = pd.merge(
-        source_rna_rank_genes_leidens_df.drop(columns=['scores', 'logfoldchanges', 'pvals']),
-        target_rna_rank_genes_leidens_df.drop(columns=['scores', 'logfoldchanges', 'pvals']),
-        on=["group", "names"],
-        how="outer",
-        suffixes=("_source", "_target"),
-    )
-    prop_signif_per_leiden = merged_rank_genes_leidens_df.drop(columns=['group','names']).le(0.05).mean(axis=0)
-    print(prop_signif_per_leiden)
+#%% OT from target to source
+import gc
 
-    merged_rank_genes_leidens_df = merged_rank_genes_leidens_df[(
-        merged_rank_genes_leidens_df['pvals_adj_source'].le(0.05) &
-        merged_rank_genes_leidens_df['pvals_adj_target'].le(0.05)
-    )]
-    rank_genes_leidens_corr = merged_rank_genes_leidens_df.groupby('group')[['pvals_adj_source', 'pvals_adj_target']].corr(method='spearman')
-    rank_genes_leidens_corr = rank_genes_leidens_corr.groupby(level=0).apply(lambda df: df.iloc[0, 1])
+X = torch.tensor(target_rna.obsm['MultiGATE'], device='cuda')
+Y = torch.tensor(source_rna.obsm['MultiGATE'], device='cuda')
+res = ot.solve_sample(X, Y, metric='euclidean', reg=0.001)
+X_to_Y = res.plan @ Y * len(X)
+target_rna.obsm['MultiGATE_source_aligned'] = X_to_Y.detach().cpu().numpy()
+del X, Y, res, X_to_Y
 
-    # Prepare the data: rank-transform and then -log (as in original code)
-    ranked_df = merged_rank_genes_leidens_df[['pvals_adj_source', 'pvals_adj_target']].apply(lambda x: -np.log(x)).rank()
-    ranked_df['leiden'] = merged_rank_genes_leidens_df['group']
+X = torch.tensor(target_atac.obsm['MultiGATE'], device='cuda')
+Y = torch.tensor(source_atac.obsm['MultiGATE'], device='cuda')
+res = ot.solve_sample(X, Y, metric='euclidean', reg=0.001)
+X_to_Y = res.plan @ Y * len(X)
+target_atac.obsm['MultiGATE_source_aligned'] = X_to_Y.detach().cpu().numpy()
+del X, Y, res, X_to_Y
 
-    import seaborn as sns
-    from matplotlib.contour import QuadContourSet
+torch.cuda.empty_cache()
+gc.collect()
 
-    # Compatibility for seaborn 0.12.x with matplotlib >=3.10, where QuadContourSet
-    # no longer exposes the collections attribute that seaborn labels internally.
-    if not hasattr(QuadContourSet, 'collections'):
-        QuadContourSet.collections = property(lambda self: [self])
+target_concat_adata = build_concat_adata_for_umap(target_rna, target_atac, embedding_key="MultiGATE_source_aligned")
 
-    leiden_order = sorted(ranked_df['leiden'].dropna().unique())
-    leiden_palette = dict(zip(leiden_order, sns.color_palette(n_colors=len(leiden_order))))
-    from matplotlib.lines import Line2D
+compute_concat_umap(
+    target_concat_adata,
+    n_neighbors=10,
+    resolution=0.5,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
+target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"] = target_concat_adata.obs["arc_gex_kmeans_5_clusters_Cluster"].astype("category")
 
-    g = sns.jointplot(
-        data=ranked_df,
+# plot target UMAPs
+target_umap_colors = ['modality', 'leiden', 'arc_gex_kmeans_5_clusters_Cluster']
+fig, axs = plt.subplots(1, len(target_umap_colors), figsize=(18, 5))
+for i, color in enumerate(target_umap_colors):
+    sc.pl.umap(target_concat_adata, color=color, ncols=3, wspace=0.2, size=25, ax=axs[i], show=False)
+plt.tight_layout(); plt.show()
+
+## concatenate source and target data
+source_rna.obsm['MultiGATE_source_aligned'] = source_rna.obsm['MultiGATE']
+source_atac.obsm['MultiGATE_source_aligned'] = source_atac.obsm['MultiGATE']
+
+source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE_source_aligned")
+source_concat_adata.obs = source_concat_adata.obs.assign(source_obs_names = source_concat_adata.obs_names)
+source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
+
+source_target_adata, _, _ = run_alignment_and_spatial_plot(
+    model,
+    source_mgate,
+    target_mgate,
+    source_rna,
+    source_atac,
+    source_concat_adata,
+    target_concat_adata,
+    deterministic_seed,
+)
+
+## transfer UMAP, spatial coordinates and ingest-transferred variables to original datasets
+source_rna.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'rna']).all(1)].obsm['X_umap'].copy()
+source_atac.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'atac']).all(1)].obsm['X_umap'].copy()
+
+source_rna.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'rna']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
+source_atac.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['source', 'atac']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
+
+target_rna.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'rna']).all(1)].obsm['X_umap'].copy()
+target_atac.obsm['X_umap'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'atac']).all(1)].obsm['X_umap'].copy()
+
+target_rna.obsm['spatial'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'rna']).all(1)].obsm['spatial'].copy()
+target_atac.obsm['spatial'] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'atac']).all(1)].obsm['spatial'].copy()
+
+target_rna.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'rna']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
+target_atac.obs[['leiden', 'source_obs_names']] = source_target_adata[source_target_adata.obs[['source_or_target', 'modality']].eq(['target', 'atac']).all(1)].obs[['leiden', 'source_obs_names']].values.copy()
+
+## get top genes per leiden cluster
+sc.tl.rank_genes_groups(
+    source_rna,
+    groupby="leiden",
+    method="t-test",   # or "t-test", "logreg"
+    reference="rest"
+)
+source_rna_rank_genes_leidens_df = sc.get.rank_genes_groups_df(source_rna, group=None)
+
+sc.tl.rank_genes_groups(
+    target_rna,
+    groupby="leiden",
+    method="t-test",   # or "t-test", "logreg"
+    reference="rest"
+)
+target_rna_rank_genes_leidens_df = sc.get.rank_genes_groups_df(target_rna, group=None)
+
+## merge source and target rank genes leidens dataframes, only keep significant genes
+merged_rank_genes_leidens_df = pd.merge(
+    source_rna_rank_genes_leidens_df.drop(columns=['scores', 'logfoldchanges', 'pvals']),
+    target_rna_rank_genes_leidens_df.drop(columns=['scores', 'logfoldchanges', 'pvals']),
+    on=["group", "names"],
+    how="outer",
+    suffixes=("_source", "_target"),
+)
+prop_signif_per_leiden = merged_rank_genes_leidens_df.drop(columns=['group','names']).le(0.05).mean(axis=0)
+print(prop_signif_per_leiden)
+
+merged_rank_genes_leidens_df = merged_rank_genes_leidens_df[(
+    merged_rank_genes_leidens_df['pvals_adj_source'].le(0.05) &
+    merged_rank_genes_leidens_df['pvals_adj_target'].le(0.05)
+)]
+rank_genes_leidens_corr = merged_rank_genes_leidens_df.groupby('group')[['pvals_adj_source', 'pvals_adj_target']].corr(method='spearman')
+rank_genes_leidens_corr = rank_genes_leidens_corr.groupby(level=0).apply(lambda df: df.iloc[0, 1])
+
+# Prepare the data: rank-transform and then -log (as in original code)
+ranked_df = merged_rank_genes_leidens_df[['pvals_adj_source', 'pvals_adj_target']].apply(lambda x: -np.log(x)).rank()
+ranked_df['leiden'] = merged_rank_genes_leidens_df['group']
+
+import seaborn as sns
+from matplotlib.contour import QuadContourSet
+
+# Compatibility for seaborn 0.12.x with matplotlib >=3.10, where QuadContourSet
+# no longer exposes the collections attribute that seaborn labels internally.
+if not hasattr(QuadContourSet, 'collections'):
+    QuadContourSet.collections = property(lambda self: [self])
+
+leiden_order = sorted(ranked_df['leiden'].dropna().unique())
+leiden_palette = dict(zip(leiden_order, sns.color_palette(n_colors=len(leiden_order))))
+from matplotlib.lines import Line2D
+
+g = sns.jointplot(
+    data=ranked_df,
+    x='pvals_adj_source',
+    y='pvals_adj_target',
+    kind="hex",
+    joint_kws={
+        'gridsize': 10,   # smaller number = larger hex bins
+        'mincnt': 3,
+        'cmap': 'Greys',
+        'alpha': 0.5,
+    },
+)
+g.ax_marg_x.remove()
+g.ax_marg_y.remove()
+for leiden, leiden_df in ranked_df.groupby('leiden'):
+    sns.regplot(
+        data=leiden_df,
         x='pvals_adj_source',
         y='pvals_adj_target',
-        kind="hex",
-        joint_kws={
-            'gridsize': 10,   # smaller number = larger hex bins
-            'mincnt': 3,
-            'cmap': 'Greys',
-            'alpha': 0.5,
-        },
+        ax=g.ax_joint,
+        scatter=False,
+        ci=None,
+        color=leiden_palette[leiden],
+        lowess=True,
+        truncate=False,
+        line_kws={'linewidth': 3, 'alpha': 1., 'zorder': 3},
     )
-    g.ax_marg_x.remove()
-    g.ax_marg_y.remove()
-    for leiden, leiden_df in ranked_df.groupby('leiden'):
-        sns.regplot(
-            data=leiden_df,
-            x='pvals_adj_source',
-            y='pvals_adj_target',
-            ax=g.ax_joint,
-            scatter=False,
-            ci=None,
-            color=leiden_palette[leiden],
-            lowess=True,
-            truncate=False,
-            line_kws={'linewidth': 3, 'alpha': 1., 'zorder': 3},
-        )
-    legend_handles = [
-        Line2D([0], [0], color=leiden_palette[leiden], lw=3, label=leiden)
-        for leiden in leiden_order
-    ]
-    g.ax_joint.legend(
-        handles=legend_handles,
-        title='leiden',
-        loc='center left',
-        bbox_to_anchor=(1.02, 0.5),
-        frameon=False,
-    )
-    g.fig.subplots_adjust(right=0.78)
-    plt.gcf().set_size_inches(6, 4.5)
-    plt.xlabel('source gene rank'); plt.ylabel('target gene rank')
-    plt.tight_layout(); plt.show()
+legend_handles = [
+    Line2D([0], [0], color=leiden_palette[leiden], lw=3, label=leiden)
+    for leiden in leiden_order
+]
+g.ax_joint.legend(
+    handles=legend_handles,
+    title='leiden',
+    loc='center left',
+    bbox_to_anchor=(1.02, 0.5),
+    frameon=False,
+)
+g.fig.subplots_adjust(right=0.78)
+plt.gcf().set_size_inches(6, 4.5)
+plt.xlabel('source gene rank'); plt.ylabel('target gene rank')
+plt.tight_layout(); plt.show()
 
-    ## plot correlations per leiden as a stemplot
-    plt.figure(figsize=(5.5, 2.5))
-    x = rank_genes_leidens_corr.index
-    y = rank_genes_leidens_corr.values
+## plot correlations per leiden as a stemplot
+plt.figure(figsize=(5.5, 2.5))
+x = rank_genes_leidens_corr.index
+y = rank_genes_leidens_corr.values
 
-    # Calculate new vmax (upper y-limit) by increasing the max y by 0.01
-    ymax = y.max() + 0.03
+# Calculate new vmax (upper y-limit) by increasing the max y by 0.01
+ymax = y.max() + 0.03
 
-    markerline, stemlines, baseline = plt.stem(
-        x, y, linefmt='grey', markerfmt='o', bottom=0.)
-    markerline.set_visible(True)
-    marker_colors = [leiden_palette[leiden] for leiden in x]
-    plt.scatter(
-        x,
-        y,
-        marker='o',
-        s=80,
-        facecolors=marker_colors,
-        edgecolors='black',
-        linewidths=1.5,
-        zorder=3,
-    )
-    plt.xlabel('leiden'); plt.ylabel('Spearman corr.')
-    plt.ylim(plt.ylim()[0], ymax)
-    plt.tight_layout(); plt.show()
+markerline, stemlines, baseline = plt.stem(
+    x, y, linefmt='grey', markerfmt='o', bottom=0.)
+markerline.set_visible(True)
+marker_colors = [leiden_palette[leiden] for leiden in x]
+plt.scatter(
+    x,
+    y,
+    marker='o',
+    s=80,
+    facecolors=marker_colors,
+    edgecolors='black',
+    linewidths=1.5,
+    zorder=3,
+)
+plt.xlabel('leiden'); plt.ylabel('Spearman corr.')
+plt.ylim(plt.ylim()[0], ymax)
+plt.tight_layout(); plt.show()
 
-    ## combine p-values and get top genes per leiden cluster
-    from scipy.stats import combine_pvalues
-    merged_rank_genes_leidens_df['combined_pvals'] = merged_rank_genes_leidens_df.apply(
-        lambda row: combine_pvalues([row['pvals_adj_source'], row['pvals_adj_target']], method='pearson')[1], axis=1)
-    top_genes_per_leiden = merged_rank_genes_leidens_df.groupby('group').apply(
-        lambda group: group.nsmallest(1, 'combined_pvals', keep='all').loc[:,['names','combined_pvals']]
-    )
-    print(top_genes_per_leiden)
+## combine p-values and get top genes per leiden cluster
+from scipy.stats import combine_pvalues
+merged_rank_genes_leidens_df['combined_pvals'] = merged_rank_genes_leidens_df.apply(
+    lambda row: combine_pvalues([row['pvals_adj_source'], row['pvals_adj_target']], method='pearson')[1], axis=1)
+top_genes_per_leiden = merged_rank_genes_leidens_df.groupby('group').apply(
+    lambda group: group.nsmallest(1, 'combined_pvals', keep='all').loc[:,['names','combined_pvals']]
+)
+print(top_genes_per_leiden)
 
-    ## plot top genes per leiden cluster on UMAP
-    marker_leiden_genes = top_genes_per_leiden.names.unique()
-    striatal_markers = ['Pde10a', 'Rgs9', 'Gng7']
-    wm_markers = ['Mobp', 'Mal']
-    striatal_score_name = ','.join(striatal_markers)
-    wm_score_name = ','.join(wm_markers)
-    assert np.isin(striatal_markers, marker_leiden_genes).all() and np.isin(wm_markers, marker_leiden_genes).all()
-    sc.tl.score_genes(source_rna, gene_list=striatal_markers, score_name=striatal_score_name)
-    sc.tl.score_genes(source_rna, gene_list=wm_markers, score_name=wm_score_name)
-    sc.tl.score_genes(target_rna, gene_list=striatal_markers, score_name=striatal_score_name)
-    sc.tl.score_genes(target_rna, gene_list=wm_markers, score_name=wm_score_name)
+## plot top genes per leiden cluster on UMAP
+marker_leiden_genes = top_genes_per_leiden.names.unique()
+striatal_markers = ['Pde10a', 'Rgs9', 'Gng7']
+wm_markers = ['Mobp', 'Mal']
+striatal_score_name = ','.join(striatal_markers)
+wm_score_name = ','.join(wm_markers)
+assert np.isin(striatal_markers, marker_leiden_genes).all() and np.isin(wm_markers, marker_leiden_genes).all()
+sc.tl.score_genes(source_rna, gene_list=striatal_markers, score_name=striatal_score_name)
+sc.tl.score_genes(source_rna, gene_list=wm_markers, score_name=wm_score_name)
+sc.tl.score_genes(target_rna, gene_list=striatal_markers, score_name=striatal_score_name)
+sc.tl.score_genes(target_rna, gene_list=wm_markers, score_name=wm_score_name)
 
-    sc.pl.embedding(source_rna, color=[striatal_score_name, wm_score_name], basis='spatial', ncols=2, wspace=0.05, size=60)
-    sc.pl.embedding(target_rna, color=[striatal_score_name, wm_score_name], basis='spatial', ncols=2, wspace=0.05, size=60)
+sc.pl.embedding(source_rna, color=[striatal_score_name, wm_score_name], basis='spatial', ncols=2, wspace=0.05, size=60)
+sc.pl.embedding(target_rna, color=[striatal_score_name, wm_score_name], basis='spatial', ncols=2, wspace=0.05, size=60)
 
-    '''
-    source_target_rna = sc.concat([source_rna, target_rna], axis=0)
-    source_target_atac = sc.concat([source_atac, target_atac], axis=0)
-    source_target_adata = build_concat_adata_for_umap(source_target_rna, source_target_atac, embedding_key="MultiGATE_source_aligned")
+'''
+source_target_rna = sc.concat([source_rna, target_rna], axis=0)
+source_target_atac = sc.concat([source_atac, target_atac], axis=0)
+source_target_adata = build_concat_adata_for_umap(source_target_rna, source_target_atac, embedding_key="MultiGATE_source_aligned")
 
-    source_or_target = np.concatenate([
-        np.full(source_rna.n_obs, 'source'),
-        np.full(target_rna.n_obs, 'target'),
-        np.full(source_atac.n_obs, 'source'),
-        np.full(target_atac.n_obs, 'target'),
-        ])
-    source_target_adata.obs['source_or_target'] = source_or_target
-    
-    compute_concat_umap(
-        source_target_adata,
-        n_neighbors=10,
-        resolution=0.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
+source_or_target = np.concatenate([
+    np.full(source_rna.n_obs, 'source'),
+    np.full(target_rna.n_obs, 'target'),
+    np.full(source_atac.n_obs, 'source'),
+    np.full(target_atac.n_obs, 'target'),
+    ])
+source_target_adata.obs['source_or_target'] = source_or_target
 
-    sc.pl.umap(source_target_adata, color=['modality', 'leiden', 'source_or_target'], ncols=3, wspace=0.2, size=25)
-    '''
+compute_concat_umap(
+    source_target_adata,
+    n_neighbors=10,
+    resolution=0.5,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
 
-    ## [COMMENTED OUT] write to disk
-    # for keys in (source_rna.obsm.keys(), source_atac.obsm.keys(), target_rna.obsm.keys(), target_atac.obsm.keys()):
-    #     assert 'MultiGATE_source_aligned' in keys, f"MultiGATE_source_aligned not found in {keys}"
-    #source_rna.write_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
-    #source_atac.write_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
-    #target_rna.write_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
-    #target_atac.write_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
+sc.pl.umap(source_target_adata, color=['modality', 'leiden', 'source_or_target'], ncols=3, wspace=0.2, size=25)
+'''
 
-    ## [COMMENTED OUT] load from disk
-    #source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
-    #source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
-    #target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
-    #target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
+## [COMMENTED OUT] write to disk
+# for keys in (source_rna.obsm.keys(), source_atac.obsm.keys(), target_rna.obsm.keys(), target_atac.obsm.keys()):
+#     assert 'MultiGATE_source_aligned' in keys, f"MultiGATE_source_aligned not found in {keys}"
+#source_rna.write_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
+#source_atac.write_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
+#target_rna.write_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
+#target_atac.write_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
 
-    #%% load multivi data
-    import muon as mu
-    mdata = mu.read_h5mu(os.path.join(base_path, 'multivi_mdata.h5mu'))
-    mdata.mod['rna'].obsm['X_multivi'] = mdata.mod['rna'].obsm['X_multivi_rna']
-    mdata.mod['atac'].obsm['X_multivi'] = mdata.mod['atac'].obsm['X_multivi_atac']
-    mdata.update()
+## [COMMENTED OUT] load from disk
+#source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
+#source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
+#target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
+#target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
 
-    target_mdata = mu.read_h5mu(os.path.join(base_path, 'multivi_mdata_target.h5mu'))
-    target_mdata.mod['rna'].obsm['X_multivi'] = target_mdata.mod['rna'].obsm['X_multivi_rna']
-    target_mdata.mod['atac'].obsm['X_multivi'] = target_mdata.mod['atac'].obsm['X_multivi_atac']
+#%% load multivi data
+import muon as mu
+mdata = mu.read_h5mu(os.path.join(base_path, 'multivi_mdata.h5mu'))
+mdata.mod['rna'].obsm['X_multivi'] = mdata.mod['rna'].obsm['X_multivi_rna']
+mdata.mod['atac'].obsm['X_multivi'] = mdata.mod['atac'].obsm['X_multivi_atac']
+mdata.update()
 
-    # load zero-shot multivi data, but copy embeddings to non-zero-shot adata (will remove reliance on zero-shot adata)
-    target_mdata_zero_shot = mu.read_h5mu(os.path.join(base_path, 'multivi_mdata_zero_shot.h5mu'))
-    target_mdata.mod['rna'].obsm['X_multivi_zero_shot'] = target_mdata_zero_shot.mod['rna'].obsm['X_multivi_rna_zero_shot']
-    target_mdata.mod['atac'].obsm['X_multivi_zero_shot'] = target_mdata_zero_shot.mod['atac'].obsm['X_multivi_atac_zero_shot']
-    target_mdata.update()
-    del target_mdata_zero_shot
+target_mdata = mu.read_h5mu(os.path.join(base_path, 'multivi_mdata_target.h5mu'))
+target_mdata.mod['rna'].obsm['X_multivi'] = target_mdata.mod['rna'].obsm['X_multivi_rna']
+target_mdata.mod['atac'].obsm['X_multivi'] = target_mdata.mod['atac'].obsm['X_multivi_atac']
 
-    # create concat adatas for multivi and multivi zero-shot data
-    multivi_target_concat_adata = build_concat_adata_for_umap(
-        target_mdata.mod['rna'],
-        target_mdata.mod['atac'],
-        embedding_key="X_multivi",
-    )
-    compute_concat_umap(
-        multivi_target_concat_adata,
-        n_neighbors=leiden_neighbors,
-        resolution=leiden_resolution,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    multivi_target_zero_shot_concat_adata = build_concat_adata_for_umap(
-        target_mdata.mod['rna'],
-        target_mdata.mod['atac'],
-        embedding_key="X_multivi_zero_shot",
-    )
-    compute_concat_umap(
-        multivi_target_zero_shot_concat_adata,
-        n_neighbors=leiden_neighbors,
-        resolution=leiden_resolution,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
+# load zero-shot multivi data, but copy embeddings to non-zero-shot adata (will remove reliance on zero-shot adata)
+target_mdata_zero_shot = mu.read_h5mu(os.path.join(base_path, 'multivi_mdata_zero_shot.h5mu'))
+target_mdata.mod['rna'].obsm['X_multivi_zero_shot'] = target_mdata_zero_shot.mod['rna'].obsm['X_multivi_rna_zero_shot']
+target_mdata.mod['atac'].obsm['X_multivi_zero_shot'] = target_mdata_zero_shot.mod['atac'].obsm['X_multivi_atac_zero_shot']
+target_mdata.update()
+del target_mdata_zero_shot
 
-    # MultiVI source + student zero-shot target (OT overwrote target_concat_adata earlier)
-    multivi_source_concat_adata = build_concat_adata_for_umap(
-        mdata.mod["rna"],
-        mdata.mod["atac"],
-        embedding_key="X_multivi",
-    )
-    compute_concat_umap(
-        multivi_source_concat_adata,
-        n_neighbors=leiden_neighbors,
-        resolution=leiden_resolution,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    student_target_zs_concat = build_concat_adata_for_umap(
-        target_rna,
-        target_atac,
-        embedding_key="MultiGATE",
-    )
-    compute_concat_umap(
-        student_target_zs_concat,
-        n_neighbors=leiden_neighbors,
-        resolution=leiden_resolution,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
+# create concat adatas for multivi and multivi zero-shot data
+multivi_target_concat_adata = build_concat_adata_for_umap(
+    target_mdata.mod['rna'],
+    target_mdata.mod['atac'],
+    embedding_key="X_multivi",
+)
+compute_concat_umap(
+    multivi_target_concat_adata,
+    n_neighbors=leiden_neighbors,
+    resolution=leiden_resolution,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
+multivi_target_zero_shot_concat_adata = build_concat_adata_for_umap(
+    target_mdata.mod['rna'],
+    target_mdata.mod['atac'],
+    embedding_key="X_multivi_zero_shot",
+)
+compute_concat_umap(
+    multivi_target_zero_shot_concat_adata,
+    n_neighbors=leiden_neighbors,
+    resolution=leiden_resolution,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
 
-    #%% modality-colored UMAP grid: source (row 0) / target (row 1)
-    source_lineup = {
-        "source - teacher": teacher_source_concat_adata,
-        "source - student": source_concat_adata,
-        "source - MultiVI": multivi_source_concat_adata,
-        "source - nonspatial": nonspatial_source_concat_adata,
-    }
-    target_lineup = {
-        "target - student (OT)": target_concat_adata,
-        "target - student (ZS)": student_target_zs_concat,
-        "target - MultiVI (ZS)": multivi_target_zero_shot_concat_adata,
-        "target - MultiVI": multivi_target_concat_adata,
-    }
-    fig, axs = plot_methods_umap_rows(
-        source_lineup,
-        target_lineup,
-        color="modality",
-        legend_titles="Modality",
-        figsize_per_panel=6.0,
-    )
-    save_figure_svg(
-        fig,
-        os.path.join(
-            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
-            "methods_umap_modality_grid.svg",
-        ),
-    )
-    plt.show()
+# MultiVI source + student zero-shot target (OT overwrote target_concat_adata earlier)
+multivi_source_concat_adata = build_concat_adata_for_umap(
+    mdata.mod["rna"],
+    mdata.mod["atac"],
+    embedding_key="X_multivi",
+)
+compute_concat_umap(
+    multivi_source_concat_adata,
+    n_neighbors=leiden_neighbors,
+    resolution=leiden_resolution,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
+student_target_zs_concat = build_concat_adata_for_umap(
+    target_rna,
+    target_atac,
+    embedding_key="MultiGATE",
+)
+compute_concat_umap(
+    student_target_zs_concat,
+    n_neighbors=leiden_neighbors,
+    resolution=leiden_resolution,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
 
-    #%% celltype-colored UMAP grid:
-    # source RNA_clusters (row 0) / source ATAC_clusters (row 1) / target celltypist (row 2)
-    for _ad in (
-        teacher_source_concat_adata,
-        source_concat_adata,
-        nonspatial_source_concat_adata,
-    ):
-        ensure_concat_obs_from_modalities(
-            _ad, "RNA_clusters", source_rna, source_atac
-        )
-        ensure_concat_obs_from_modalities(
-            _ad, "ATAC_clusters", source_rna, source_atac
-        )
+#%% modality-colored UMAP grid: source (row 0) / target (row 1)
+source_lineup = {
+    "source - teacher": teacher_source_concat_adata,
+    "source - student": source_concat_adata,
+    "source - MultiVI": multivi_source_concat_adata,
+    "source - nonspatial": nonspatial_source_concat_adata,
+}
+target_lineup = {
+    "target - student (OT)": target_concat_adata,
+    "target - student (ZS)": student_target_zs_concat,
+    "target - MultiVI (ZS)": multivi_target_zero_shot_concat_adata,
+    "target - MultiVI": multivi_target_concat_adata,
+}
+fig, axs = plot_methods_umap_rows(
+    source_lineup,
+    target_lineup,
+    color="modality",
+    legend_titles="Modality",
+    figsize_per_panel=6.0,
+)
+save_figure_svg(
+    fig,
+    os.path.join(
+        "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+        "methods_umap_modality_grid.svg",
+    ),
+)
+plt.show()
+
+#%% celltype-colored UMAP grid:
+# source RNA_clusters (row 0) / source ATAC_clusters (row 1) / target celltypist (row 2)
+for _ad in (
+    teacher_source_concat_adata,
+    source_concat_adata,
+    nonspatial_source_concat_adata,
+):
     ensure_concat_obs_from_modalities(
-        multivi_source_concat_adata,
-        "RNA_clusters",
-        mdata.mod["rna"],
-        mdata.mod["atac"],
+        _ad, "RNA_clusters", source_rna, source_atac
     )
     ensure_concat_obs_from_modalities(
-        multivi_source_concat_adata,
-        "ATAC_clusters",
-        mdata.mod["rna"],
-        mdata.mod["atac"],
+        _ad, "ATAC_clusters", source_rna, source_atac
     )
-    for _ad in (
-        target_concat_adata,
-        student_target_zs_concat,
-        multivi_target_zero_shot_concat_adata,
-        multivi_target_concat_adata,
-    ):
-        ensure_concat_obs_from_modalities(
-            _ad, "celltypist_predictions", target_rna, target_atac
-        )
-
-    fig, axs = plot_methods_umap_rows(
-        source_lineup,
-        source_lineup,
-        target_lineup,
-        color=["RNA_clusters", "ATAC_clusters", "celltypist_predictions"],
-        legend_titles=["RNA clusters", "ATAC clusters", "CellTypist predictions"],
-        figsize_per_panel=5.0,
-    )
-    save_figure_svg(
-        fig,
-        os.path.join(
-            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
-            "methods_umap_celltype_grid.svg",
-        ),
-    )
-    plt.show()
-
-
-    #%% compute scib metrics for OT-aligned and nonspatial data, and plot model metrics
-
-    '''
-    #  ── Extract logged model metrics ──────────────────────────────────────
-    model_metrics_df = extract_logged_model_metrics(client, run_id, run_name=args.run_name)
-    model_metrics_df = model_metrics_df.loc[model_metrics_df['step'].eq(model_metrics_df['step'].max())]
-    model_metrics_df.drop(columns=['run_id', 'run_name', 'timestamp', 'logged_at', 'step'], inplace=True)
-    # columns now: metric_group, domain, metric_name, value
-    '''
-
-    ## ── bootstrap settings for the metric error bars ──────────────────────
-    ## defaults here must match the argparse defaults, so that an interactive
-    ## `args` namespace predating these flags still produces error bars
-    n_bootstrap = max(int(getattr(args, "n_bootstrap", 20) or 0), 0)
-    bootstrap_frac = float(getattr(args, "bootstrap_frac", 0.8))
-    bootstrap_seed = int(getattr(args, "bootstrap_seed", 0))
-    bootstrap_n_jobs = int(getattr(args, "bootstrap_n_jobs", 1))
-    bootstrap_ci = (2.5, 97.5)
-    bootstrap_enabled = n_bootstrap >= 2
-
-    def _percentile_ci(replicate_values):
-        """Percentile interval of a set of bootstrap replicates."""
-        replicate_values = np.asarray(
-            [v for v in replicate_values if np.isfinite(v)], dtype=float
-        )
-        if replicate_values.size < 2:
-            return np.nan, np.nan
-        return (
-            float(np.percentile(replicate_values, bootstrap_ci[0])),
-            float(np.percentile(replicate_values, bootstrap_ci[1])),
-        )
-
-    def _spread_ci(point_value, replicate_values, z=1.96):
-        """Error bar for a dataset-level metric, anchored at the full-data estimate.
-
-        Subsample replicates are *biased* relative to the full data -- fewer cells
-        shifts every kNN/Leiden-based metric -- so a percentile interval of the
-        replicates can sit entirely to one side of the point estimate. Take only
-        the replicate spread as the uncertainty and centre it on the point
-        estimate; sqrt(bootstrap_frac) rescales an m-out-of-n subsample spread
-        back to the full sample size.
-        """
-        replicate_values = np.asarray(
-            [v for v in replicate_values if np.isfinite(v)], dtype=float
-        )
-        if replicate_values.size < 2:
-            return np.nan, np.nan
-        half_width = z * float(replicate_values.std(ddof=1)) * float(np.sqrt(bootstrap_frac))
-        return float(point_value - half_width), float(point_value + half_width)
-
-    def _bootstrap_mean_ci(per_cell_values, seed):
-        """Nonparametric bootstrap of the mean of per-cell scores."""
-        per_cell_values = np.asarray(per_cell_values, dtype=float)
-        if not bootstrap_enabled or per_cell_values.size < 2:
-            return np.nan, np.nan
-        rng = np.random.default_rng(seed)
-        n = per_cell_values.size
-        boot_means = np.empty(n_bootstrap, dtype=float)
-        for b in range(n_bootstrap):
-            boot_means[b] = per_cell_values[rng.integers(0, n, size=n)].mean()
-        return _percentile_ci(boot_means)
-
-    ## calculate FOSCTTM scores
-    def _foscttm_per_cell_for_embedding(rna_adata, atac_adata, embedding_key, domain):
-        if rna_adata.n_obs != atac_adata.n_obs:
-            raise ValueError(
-                "FOSCTTM for domain '{}' requires paired RNA/ATAC rows; "
-                "got {} RNA cells and {} ATAC cells.".format(
-                    domain,
-                    rna_adata.n_obs,
-                    atac_adata.n_obs,
-                )
-            )
-        missing_keys = [
-            label
-            for label, adata in (("RNA", rna_adata), ("ATAC", atac_adata))
-            if embedding_key not in adata.obsm
-        ]
-        if missing_keys:
-            raise KeyError(
-                "Missing obsm['{}'] for {} in domain '{}'.".format(
-                    embedding_key,
-                    "/".join(missing_keys),
-                    domain,
-                )
-            )
-        foscttm_full = foscttm_moscot(
-            np.asarray(rna_adata.obsm[embedding_key]),
-            np.asarray(atac_adata.obsm[embedding_key]),
-        )
-        # per-cell FOSCTTM scores; the reported metric is their mean
-        return np.asarray(foscttm_full, dtype=float).ravel()
-
-    foscttm_metric_specs = [
-        ("teacher_source", source_rna, source_atac, "MultiGATE_full_teacher"),
-        ("source", source_rna, source_atac, "MultiGATE_source_aligned"),
-        ("target", target_rna, target_atac, "MultiGATE"),
-        ("target_ot", target_rna, target_atac, "MultiGATE_source_aligned"),
-        ("source_nonspatial", source_rna, source_atac, "MultiGATE_nonspatial"),
-        ("source_multivi", mdata.mod['rna'], mdata.mod['atac'], "X_multivi"),
-        ("target_multivi", target_mdata.mod['rna'], target_mdata.mod['atac'], "X_multivi"),
-        ("target_multivi_zero_shot", target_mdata.mod['rna'], target_mdata.mod['atac'], "X_multivi_zero_shot"),
-    ]
-
-    ## ── labels used by the scib bio-conservation metrics ──────────────────
-    ##
-    ## scib computes silhouette / NMI / ARI / cLISI on the POOLED RNA+ATAC
-    ## embedding, against a single label column. Handing it a different cluster
-    ## vocabulary per modality (R0..R10 vs C0..C13) makes the label perfectly
-    ## predictive of the modality: a well-mixed embedding surrounds every
-    ## R-labelled cell with C-labelled neighbours and is scored as a
-    ## bio-conservation *failure*, so bio_cons becomes anti-correlated with
-    ## iLISI by construction rather than by any real tradeoff.
-    ##
-    ## RNA and ATAC are paired row-for-row here (same spot / same nucleus -- the
-    ## same assumption FOSCTTM above relies on), so one annotation is valid for
-    ## both modalities:
-    ##   source -> RNA_clusters (the transcriptomic domains in the spatial map)
-    ##   target -> celltypist_predictions (already shared by both modalities)
-    ##
-    ## 'per_modality' keeps the old behaviour for comparison; resolve_scib_labels
-    ## now namespaces the two vocabularies before pooling them, because the
-    ## target's 10x graphclust keys are plain integers in BOTH assays and would
-    ## otherwise merge unrelated RNA and ATAC clusters under the same label.
-    from mouse_brain_spatial_rna_atac import (
-        SHARED_SCIB_LABEL_KEY,
-        assign_shared_modality_label,
+ensure_concat_obs_from_modalities(
+    multivi_source_concat_adata,
+    "RNA_clusters",
+    mdata.mod["rna"],
+    mdata.mod["atac"],
+)
+ensure_concat_obs_from_modalities(
+    multivi_source_concat_adata,
+    "ATAC_clusters",
+    mdata.mod["rna"],
+    mdata.mod["atac"],
+)
+for _ad in (
+    target_concat_adata,
+    student_target_zs_concat,
+    multivi_target_zero_shot_concat_adata,
+    multivi_target_concat_adata,
+):
+    ensure_concat_obs_from_modalities(
+        _ad, "celltypist_predictions", target_rna, target_atac
     )
 
-    scib_label_mode = str(getattr(args, "scib_label_mode", "shared"))
-    if scib_label_mode not in ("shared", "per_modality"):
+fig, axs = plot_methods_umap_rows(
+    source_lineup,
+    source_lineup,
+    target_lineup,
+    color=["RNA_clusters", "ATAC_clusters", "celltypist_predictions"],
+    legend_titles=["RNA clusters", "ATAC clusters", "CellTypist predictions"],
+    figsize_per_panel=5.0,
+)
+save_figure_svg(
+    fig,
+    os.path.join(
+        "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+        "methods_umap_celltype_grid.svg",
+    ),
+)
+plt.show()
+
+
+#%% compute scib metrics for OT-aligned and nonspatial data, and plot model metrics
+
+'''
+#  ── Extract logged model metrics ──────────────────────────────────────
+model_metrics_df = extract_logged_model_metrics(client, run_id, run_name=args.run_name)
+model_metrics_df = model_metrics_df.loc[model_metrics_df['step'].eq(model_metrics_df['step'].max())]
+model_metrics_df.drop(columns=['run_id', 'run_name', 'timestamp', 'logged_at', 'step'], inplace=True)
+# columns now: metric_group, domain, metric_name, value
+'''
+
+## ── bootstrap settings for the metric error bars ──────────────────────
+## defaults here must match the argparse defaults, so that an interactive
+## `args` namespace predating these flags still produces error bars
+n_bootstrap = max(int(getattr(args, "n_bootstrap", 20) or 0), 0)
+bootstrap_frac = float(getattr(args, "bootstrap_frac", 0.8))
+bootstrap_seed = int(getattr(args, "bootstrap_seed", 0))
+bootstrap_n_jobs = int(getattr(args, "bootstrap_n_jobs", 1))
+bootstrap_ci = (2.5, 97.5)
+bootstrap_enabled = n_bootstrap >= 2
+
+def _percentile_ci(replicate_values):
+    """Percentile interval of a set of bootstrap replicates."""
+    replicate_values = np.asarray(
+        [v for v in replicate_values if np.isfinite(v)], dtype=float
+    )
+    if replicate_values.size < 2:
+        return np.nan, np.nan
+    return (
+        float(np.percentile(replicate_values, bootstrap_ci[0])),
+        float(np.percentile(replicate_values, bootstrap_ci[1])),
+    )
+
+def _spread_ci(point_value, replicate_values, z=1.96):
+    """Error bar for a dataset-level metric, anchored at the full-data estimate.
+
+    Subsample replicates are *biased* relative to the full data -- fewer cells
+    shifts every kNN/Leiden-based metric -- so a percentile interval of the
+    replicates can sit entirely to one side of the point estimate. Take only
+    the replicate spread as the uncertainty and centre it on the point
+    estimate; sqrt(bootstrap_frac) rescales an m-out-of-n subsample spread
+    back to the full sample size.
+    """
+    replicate_values = np.asarray(
+        [v for v in replicate_values if np.isfinite(v)], dtype=float
+    )
+    if replicate_values.size < 2:
+        return np.nan, np.nan
+    half_width = z * float(replicate_values.std(ddof=1)) * float(np.sqrt(bootstrap_frac))
+    return float(point_value - half_width), float(point_value + half_width)
+
+def _bootstrap_mean_ci(per_cell_values, seed):
+    """Nonparametric bootstrap of the mean of per-cell scores."""
+    per_cell_values = np.asarray(per_cell_values, dtype=float)
+    if not bootstrap_enabled or per_cell_values.size < 2:
+        return np.nan, np.nan
+    rng = np.random.default_rng(seed)
+    n = per_cell_values.size
+    boot_means = np.empty(n_bootstrap, dtype=float)
+    for b in range(n_bootstrap):
+        boot_means[b] = per_cell_values[rng.integers(0, n, size=n)].mean()
+    return _percentile_ci(boot_means)
+
+## calculate FOSCTTM scores
+def _foscttm_per_cell_for_embedding(rna_adata, atac_adata, embedding_key, domain):
+    if rna_adata.n_obs != atac_adata.n_obs:
         raise ValueError(
-            "scib_label_mode must be 'shared' or 'per_modality'; got {!r}".format(
-                scib_label_mode
+            "FOSCTTM for domain '{}' requires paired RNA/ATAC rows; "
+            "got {} RNA cells and {} ATAC cells.".format(
+                domain,
+                rna_adata.n_obs,
+                atac_adata.n_obs,
             )
         )
-
-    ## each pair takes its own RNA annotation where it has one; the MultiVI
-    ## target mudata never saw CellTypist, so it borrows from target_rna
-    assign_shared_modality_label(
-        source_rna, source_atac,
-        source_key="RNA_clusters",
-        context="source (student/teacher)",
-    )
-    assign_shared_modality_label(
-        mdata.mod["rna"], mdata.mod["atac"],
-        source_key="RNA_clusters",
-        context="source (MultiVI)",
-    )
-    assign_shared_modality_label(
-        target_rna, target_atac,
-        source_key="celltypist_predictions",
-        context="target (student)",
-    )
-    assign_shared_modality_label(
-        target_mdata.mod["rna"], target_mdata.mod["atac"],
-        source_key="celltypist_predictions",
-        source_adata=target_rna,
-        context="target (MultiVI)",
-    )
-
-    shared_label_key = {"rna": SHARED_SCIB_LABEL_KEY, "atac": SHARED_SCIB_LABEL_KEY}
-    source_label_key_per_modality = {
-        "rna": "RNA_clusters",
-        "atac": "ATAC_clusters",
-    }
-    target_label_key_per_modality = {
-        "rna": "arc_gex_graphclust_Cluster",
-        "atac": "arc_atac_graphclust_Cluster",
-    }
-    if scib_label_mode == "shared":
-        source_label_key = shared_label_key
-        target_label_key = shared_label_key
-    else:
-        source_label_key = source_label_key_per_modality
-        target_label_key = target_label_key_per_modality
-    print(
-        "[scib] label mode '{}' -> source {}, target {}".format(
-            scib_label_mode, source_label_key, target_label_key
-        )
-    )
-
-    ## every scib panel is computed on the same set of (domain, embedding) pairs
-    scib_metric_specs = [
-        ("teacher_source", source_rna, source_atac, "source", source_label_key, "MultiGATE_full_teacher"),
-        ("source", source_rna, source_atac, "source", source_label_key, "MultiGATE_source_aligned"),
-        ("target", target_rna, target_atac, "target", target_label_key, "MultiGATE"),
-        ("target_ot", target_rna, target_atac, "target", target_label_key, "MultiGATE_source_aligned"),
-        ("source_nonspatial", source_rna, source_atac, "source", source_label_key, "MultiGATE_nonspatial"),
-        ("source_multivi", mdata.mod['rna'], mdata.mod['atac'], "source", source_label_key, "X_multivi"),
-        ("target_multivi", target_mdata.mod['rna'], target_mdata.mod['atac'], "target", target_label_key, "X_multivi"),
-        ("target_multivi_zero_shot", target_mdata.mod['rna'], target_mdata.mod['atac'], "target", target_label_key, "X_multivi_zero_shot"),
+    missing_keys = [
+        label
+        for label, adata in (("RNA", rna_adata), ("ATAC", atac_adata))
+        if embedding_key not in adata.obsm
     ]
-
-    ## ── where the metrics come from ───────────────────────────────────────
-    ## Computing the bootstrap in-process costs ~n_bootstrap x the point estimates
-    ## alone, and blocks the session for the duration. metrics_bootstrap.py runs
-    ## the identical computation as a detached background job.
-    ##
-    ##   'background' -- launch the worker, return immediately, plot later (default)
-    ##   'inline'     -- compute here and block
-    ##   'load'       -- read a finished worker CSV and plot
-    ## defaults here must match the argparse default, so that an interactive
-    ## `args` namespace predating this flag still runs non-blocking
-    metrics_mode = getattr(args, "metrics_mode", "background")
-    try:
-        _metrics_default_dir = os.path.join(output_dir, "metrics_bootstrap")
-    except NameError:  # cell run before the output-directory cell
-        _metrics_default_dir = os.path.join(os.getcwd(), "metrics_bootstrap")
-    metrics_work_dir = getattr(args, "metrics_work_dir", None) or _metrics_default_dir
-    metrics_csv_path = getattr(args, "metrics_csv", None)
-
-    if metrics_mode == "background":
-        from metrics_bootstrap import launch_background_bootstrap
-
-        ## non-blocking: keep running the cells below while this computes
-        metrics_job = launch_background_bootstrap(
-            scib_metric_specs,
-            metrics_work_dir,
-            n_bootstrap=n_bootstrap,
-            bootstrap_frac=bootstrap_frac,
-            bootstrap_seed=bootstrap_seed,
-            n_jobs=max(bootstrap_n_jobs, 1),
-        )
-        model_metrics_df = None
-
-    elif metrics_mode == "load" or (metrics_csv_path and os.path.exists(metrics_csv_path)):
-        from metrics_bootstrap import load_bootstrap_metrics
-
-        ## precomputed by metrics_bootstrap.py; its foscttm rows are already 1-FOSCTTM
-        if metrics_csv_path and os.path.exists(metrics_csv_path):
-            model_metrics_df = pd.read_csv(metrics_csv_path)
-            print("Loaded metrics from {}".format(metrics_csv_path))
-        else:
-            model_metrics_df = load_bootstrap_metrics(metrics_work_dir)
-            print("Loaded metrics from {}".format(metrics_work_dir))
-
-    else:
-        ## the FOSCTTM error bars come from resampling the per-cell scores with replacement
-        ## (subsampling cells would shrink the set of competing cells and bias the score itself)
-        foscttm_rows = []
-        for spec_idx, (domain, rna_adata, atac_adata, embedding_key) in enumerate(foscttm_metric_specs):
-            per_cell = _foscttm_per_cell_for_embedding(rna_adata, atac_adata, embedding_key, domain)
-            ci_low, ci_high = _bootstrap_mean_ci(per_cell, seed=bootstrap_seed + spec_idx)
-            foscttm_rows.append(
-                {
-                    "domain": domain,
-                    "metric_name": "foscttm",
-                    "value": float(per_cell.mean()),
-                    "ci_low": ci_low,
-                    "ci_high": ci_high,
-                }
+    if missing_keys:
+        raise KeyError(
+            "Missing obsm['{}'] for {} in domain '{}'.".format(
+                embedding_key,
+                "/".join(missing_keys),
+                domain,
             )
-        foscttm_metrics_df = pd.DataFrame(
-            foscttm_rows, columns=["domain", "metric_name", "value", "ci_low", "ci_high"]
         )
+    foscttm_full = foscttm_moscot(
+        np.asarray(rna_adata.obsm[embedding_key]),
+        np.asarray(atac_adata.obsm[embedding_key]),
+    )
+    # per-cell FOSCTTM scores; the reported metric is their mean
+    return np.asarray(foscttm_full, dtype=float).ravel()
 
-        ## convert FOSCTTM scores to 1 - FOSCTTM, such that the higher the better
-        ## (the interval flips too: [lo, hi] -> [1 - hi, 1 - lo])
-        foscttm_metrics_df[['value', 'ci_low', 'ci_high']] = np.column_stack(
-            [
-                1 - foscttm_metrics_df['value'].to_numpy(),
-                1 - foscttm_metrics_df['ci_high'].to_numpy(),
-                1 - foscttm_metrics_df['ci_low'].to_numpy(),
-            ]
+foscttm_metric_specs = [
+    ("teacher_source", source_rna, source_atac, "MultiGATE_full_teacher"),
+    ("source", source_rna, source_atac, "MultiGATE_source_aligned"),
+    ("target", target_rna, target_atac, "MultiGATE"),
+    ("target_ot", target_rna, target_atac, "MultiGATE_source_aligned"),
+    ("source_nonspatial", source_rna, source_atac, "MultiGATE_nonspatial"),
+    ("source_multivi", mdata.mod['rna'], mdata.mod['atac'], "X_multivi"),
+    ("target_multivi", target_mdata.mod['rna'], target_mdata.mod['atac'], "X_multivi"),
+    ("target_multivi_zero_shot", target_mdata.mod['rna'], target_mdata.mod['atac'], "X_multivi_zero_shot"),
+]
+
+## ── labels used by the scib bio-conservation metrics ──────────────────
+##
+## scib computes silhouette / NMI / ARI / cLISI on the POOLED RNA+ATAC
+## embedding, against a single label column. Handing it a different cluster
+## vocabulary per modality (R0..R10 vs C0..C13) makes the label perfectly
+## predictive of the modality: a well-mixed embedding surrounds every
+## R-labelled cell with C-labelled neighbours and is scored as a
+## bio-conservation *failure*, so bio_cons becomes anti-correlated with
+## iLISI by construction rather than by any real tradeoff.
+##
+## RNA and ATAC are paired row-for-row here (same spot / same nucleus -- the
+## same assumption FOSCTTM above relies on), so one annotation is valid for
+## both modalities:
+##   source -> RNA_clusters (the transcriptomic domains in the spatial map)
+##   target -> celltypist_predictions (already shared by both modalities)
+##
+## 'per_modality' keeps the old behaviour for comparison; resolve_scib_labels
+## now namespaces the two vocabularies before pooling them, because the
+## target's 10x graphclust keys are plain integers in BOTH assays and would
+## otherwise merge unrelated RNA and ATAC clusters under the same label.
+from mouse_brain_spatial_rna_atac import (
+    SHARED_SCIB_LABEL_KEY,
+    assign_shared_modality_label,
+)
+
+scib_label_mode = str(getattr(args, "scib_label_mode", "shared"))
+if scib_label_mode not in ("shared", "per_modality"):
+    raise ValueError(
+        "scib_label_mode must be 'shared' or 'per_modality'; got {!r}".format(
+            scib_label_mode
         )
+    )
 
-        _SCIB_NUMERIC_KEYS = {
-            "silhouette_label", "ilisi", "clisi", "graph_connectivity", "bras",
-            "bio_conservation", "batch_correction", "total",
-        }
+## each pair takes its own RNA annotation where it has one; the MultiVI
+## target mudata never saw CellTypist, so it borrows from target_rna
+assign_shared_modality_label(
+    source_rna, source_atac,
+    source_key="RNA_clusters",
+    context="source (student/teacher)",
+)
+assign_shared_modality_label(
+    mdata.mod["rna"], mdata.mod["atac"],
+    source_key="RNA_clusters",
+    context="source (MultiVI)",
+)
+assign_shared_modality_label(
+    target_rna, target_atac,
+    source_key="celltypist_predictions",
+    context="target (student)",
+)
+assign_shared_modality_label(
+    target_mdata.mod["rna"], target_mdata.mod["atac"],
+    source_key="celltypist_predictions",
+    source_adata=target_rna,
+    context="target (MultiVI)",
+)
 
-        def _subsample_adata(adata, rng):
-            n_sub = max(int(round(bootstrap_frac * adata.n_obs)), 2)
-            n_sub = min(n_sub, adata.n_obs)
-            idx = rng.choice(adata.n_obs, size=n_sub, replace=False)
-            idx.sort()
-            return adata[idx].copy()
+shared_label_key = {"rna": SHARED_SCIB_LABEL_KEY, "atac": SHARED_SCIB_LABEL_KEY}
+source_label_key_per_modality = {
+    "rna": "RNA_clusters",
+    "atac": "ATAC_clusters",
+}
+target_label_key_per_modality = {
+    "rna": "arc_gex_graphclust_Cluster",
+    "atac": "arc_atac_graphclust_Cluster",
+}
+if scib_label_mode == "shared":
+    source_label_key = shared_label_key
+    target_label_key = shared_label_key
+else:
+    source_label_key = source_label_key_per_modality
+    target_label_key = target_label_key_per_modality
+print(
+    "[scib] label mode '{}' -> source {}, target {}".format(
+        scib_label_mode, source_label_key, target_label_key
+    )
+)
 
-        def _scib_replicate(rna_adata, atac_adata, domain_name, label_key, embedding_key, seed):
-            """One scib replicate on a random subsample of cells.
+## every scib panel is computed on the same set of (domain, embedding) pairs
+scib_metric_specs = [
+    ("teacher_source", source_rna, source_atac, "source", source_label_key, "MultiGATE_full_teacher"),
+    ("source", source_rna, source_atac, "source", source_label_key, "MultiGATE_source_aligned"),
+    ("target", target_rna, target_atac, "target", target_label_key, "MultiGATE"),
+    ("target_ot", target_rna, target_atac, "target", target_label_key, "MultiGATE_source_aligned"),
+    ("source_nonspatial", source_rna, source_atac, "source", source_label_key, "MultiGATE_nonspatial"),
+    ("source_multivi", mdata.mod['rna'], mdata.mod['atac'], "source", source_label_key, "X_multivi"),
+    ("target_multivi", target_mdata.mod['rna'], target_mdata.mod['atac'], "target", target_label_key, "X_multivi"),
+    ("target_multivi_zero_shot", target_mdata.mod['rna'], target_mdata.mod['atac'], "target", target_label_key, "X_multivi_zero_shot"),
+]
 
-            scib metrics are dataset-level (kNN graph + Leiden), so they cannot be
-            recomputed from per-cell scores. We resample *without* replacement instead
-            of a textbook bootstrap because duplicated cells sit at distance zero from
-            each other and would corrupt every neighbourhood-based metric.
-            """
-            rng = np.random.default_rng(seed)
-            try:
-                return compute_scib_metrics_for_domain(
-                    rna_adata=_subsample_adata(rna_adata, rng),
-                    atac_adata=_subsample_adata(atac_adata, rng),
-                    domain_name=domain_name,
-                    label_key=label_key,
-                    scib_n_jobs=1,
-                    embedding_key=embedding_key,
-                )
-            except Exception as exc:  # a subsample can drop a label entirely
-                warnings.warn(
-                    "scib bootstrap replicate failed for domain '{}' (embedding '{}'): {}".format(
-                        domain_name, embedding_key, exc
-                    )
-                )
-                return None
+## ── where the metrics come from ───────────────────────────────────────
+## Computing the bootstrap in-process costs ~n_bootstrap x the point estimates
+## alone, and blocks the session for the duration. metrics_bootstrap.py runs
+## the identical computation as a detached background job.
+##
+##   'background' -- launch the worker, return immediately, plot later (default)
+##   'inline'     -- compute here and block
+##   'load'       -- read a finished worker CSV and plot
+## defaults here must match the argparse default, so that an interactive
+## `args` namespace predating this flag still runs non-blocking
+metrics_mode = getattr(args, "metrics_mode", "background")
+try:
+    _metrics_default_dir = os.path.join(output_dir, "metrics_bootstrap")
+except NameError:  # cell run before the output-directory cell
+    _metrics_default_dir = os.path.join(os.getcwd(), "metrics_bootstrap")
+metrics_work_dir = getattr(args, "metrics_work_dir", None) or _metrics_default_dir
+metrics_csv_path = getattr(args, "metrics_csv", None)
 
-        scib_metrics_frames = []
-        for spec_idx, (domain, rna_adata, atac_adata, domain_name, label_key, embedding_key) in enumerate(
-            scib_metric_specs
-        ):
-            ## point estimate on the full data
-            point_metrics = compute_scib_metrics_for_domain(
-                rna_adata=rna_adata,
-                atac_adata=atac_adata,
+if metrics_mode == "background":
+    from metrics_bootstrap import launch_background_bootstrap
+
+    ## non-blocking: keep running the cells below while this computes
+    metrics_job = launch_background_bootstrap(
+        scib_metric_specs,
+        metrics_work_dir,
+        n_bootstrap=n_bootstrap,
+        bootstrap_frac=bootstrap_frac,
+        bootstrap_seed=bootstrap_seed,
+        n_jobs=max(bootstrap_n_jobs, 1),
+    )
+    model_metrics_df = None
+
+elif metrics_mode == "load" or (metrics_csv_path and os.path.exists(metrics_csv_path)):
+    from metrics_bootstrap import load_bootstrap_metrics
+
+    ## precomputed by metrics_bootstrap.py; its foscttm rows are already 1-FOSCTTM
+    if metrics_csv_path and os.path.exists(metrics_csv_path):
+        model_metrics_df = pd.read_csv(metrics_csv_path)
+        print("Loaded metrics from {}".format(metrics_csv_path))
+    else:
+        model_metrics_df = load_bootstrap_metrics(metrics_work_dir)
+        print("Loaded metrics from {}".format(metrics_work_dir))
+
+else:
+    ## the FOSCTTM error bars come from resampling the per-cell scores with replacement
+    ## (subsampling cells would shrink the set of competing cells and bias the score itself)
+    foscttm_rows = []
+    for spec_idx, (domain, rna_adata, atac_adata, embedding_key) in enumerate(foscttm_metric_specs):
+        per_cell = _foscttm_per_cell_for_embedding(rna_adata, atac_adata, embedding_key, domain)
+        ci_low, ci_high = _bootstrap_mean_ci(per_cell, seed=bootstrap_seed + spec_idx)
+        foscttm_rows.append(
+            {
+                "domain": domain,
+                "metric_name": "foscttm",
+                "value": float(per_cell.mean()),
+                "ci_low": ci_low,
+                "ci_high": ci_high,
+            }
+        )
+    foscttm_metrics_df = pd.DataFrame(
+        foscttm_rows, columns=["domain", "metric_name", "value", "ci_low", "ci_high"]
+    )
+
+    ## convert FOSCTTM scores to 1 - FOSCTTM, such that the higher the better
+    ## (the interval flips too: [lo, hi] -> [1 - hi, 1 - lo])
+    foscttm_metrics_df[['value', 'ci_low', 'ci_high']] = np.column_stack(
+        [
+            1 - foscttm_metrics_df['value'].to_numpy(),
+            1 - foscttm_metrics_df['ci_high'].to_numpy(),
+            1 - foscttm_metrics_df['ci_low'].to_numpy(),
+        ]
+    )
+
+    _SCIB_NUMERIC_KEYS = {
+        "silhouette_label", "ilisi", "clisi", "graph_connectivity", "bras",
+        "bio_conservation", "batch_correction", "total",
+    }
+
+    def _subsample_adata(adata, rng):
+        n_sub = max(int(round(bootstrap_frac * adata.n_obs)), 2)
+        n_sub = min(n_sub, adata.n_obs)
+        idx = rng.choice(adata.n_obs, size=n_sub, replace=False)
+        idx.sort()
+        return adata[idx].copy()
+
+    def _scib_replicate(rna_adata, atac_adata, domain_name, label_key, embedding_key, seed):
+        """One scib replicate on a random subsample of cells.
+
+        scib metrics are dataset-level (kNN graph + Leiden), so they cannot be
+        recomputed from per-cell scores. We resample *without* replacement instead
+        of a textbook bootstrap because duplicated cells sit at distance zero from
+        each other and would corrupt every neighbourhood-based metric.
+        """
+        rng = np.random.default_rng(seed)
+        try:
+            return compute_scib_metrics_for_domain(
+                rna_adata=_subsample_adata(rna_adata, rng),
+                atac_adata=_subsample_adata(atac_adata, rng),
                 domain_name=domain_name,
                 label_key=label_key,
                 scib_n_jobs=1,
                 embedding_key=embedding_key,
             )
-
-            ## bootstrap replicates on subsampled cells
-            replicate_metrics = []
-            if bootstrap_enabled:
-                replicate_seeds = [
-                    bootstrap_seed + 1000 * (spec_idx + 1) + b for b in range(n_bootstrap)
-                ]
-                replicate_metrics = Parallel(n_jobs=bootstrap_n_jobs)(
-                    delayed(_scib_replicate)(
-                        rna_adata, atac_adata, domain_name, label_key, embedding_key, seed
-                    )
-                    for seed in replicate_seeds
-                )
-                replicate_metrics = [m for m in replicate_metrics if m is not None]
-
-            rows = []
-            for metric_name, value in point_metrics.items():
-                if metric_name not in _SCIB_NUMERIC_KEYS:
-                    continue
-                ci_low, ci_high = _spread_ci(
-                    float(value),
-                    [m[metric_name] for m in replicate_metrics if metric_name in m],
-                )
-                rows.append(
-                    {
-                        "domain": domain,
-                        "metric_name": metric_name,
-                        "value": float(value),
-                        "ci_low": ci_low,
-                        "ci_high": ci_high,
-                    }
-                )
-            scib_metrics_frames.append(
-                pd.DataFrame(rows, columns=["domain", "metric_name", "value", "ci_low", "ci_high"])
-            )
-
-        model_metrics_df = pd.concat(
-            scib_metrics_frames + [foscttm_metrics_df],
-            ignore_index=True,
-        )
-
-    #%% [RESUME FROM BOOTSTRAP SCIB] plot the scib / FOSCTTM barplot
-    ##
-    ## This cell only needs `model_metrics_df`, so it can be re-run on its own
-    ## once a background bootstrap has finished:
-    ##     from metrics_bootstrap import bootstrap_status, load_bootstrap_metrics
-    ##     bootstrap_status(metrics_work_dir)
-    ##     model_metrics_df = load_bootstrap_metrics(metrics_work_dir)
-    if model_metrics_df is None:
-        print(
-            "Metrics are still computing in the background; skipping the barplot.\n"
-            "  from metrics_bootstrap import bootstrap_status, load_bootstrap_metrics\n"
-            "  bootstrap_status({d!r})\n"
-            "  model_metrics_df = load_bootstrap_metrics({d!r})\n"
-            "then re-run this cell.".format(d=metrics_work_dir)
-        )
-    else:
-        ## Work on a local copy so re-running this cell does not permanently
-        ## rename metric_name in the session-level model_metrics_df (otherwise
-        ## a second pass keeps only 'total', the one name shared by both the
-        ## raw and display vocabularies).
-        plot_metrics_df = model_metrics_df.loc[
-            model_metrics_df['metric_name'].isin(
-                ['foscttm', 'ilisi', 'clisi', 'graph_connectivity',
-                 'bio_conservation', 'total',
-                 # already-renamed names from a prior pass of this cell
-                 '1-FOSCTTM', 'iLISI', 'cLISI', 'graph conn.', 'bio_cons.']
-            )
-        ].copy()
-        plot_metrics_df['metric_name'] = plot_metrics_df['metric_name'].replace({
-            'bio_conservation': 'bio_cons.',
-            'foscttm': '1-FOSCTTM',
-            'ilisi': 'iLISI',
-            'clisi': 'cLISI',
-            'graph_connectivity': 'graph conn.',
-        })
-        ## cLISI sits next to iLISI on purpose: iLISI alone cannot distinguish
-        ## "modalities mixed, biology preserved" from "modalities mixed because
-        ## the embedding discarded the biology"; graph connectivity catches the
-        ## fragmented embeddings both LISIs are blind to. A CSV from an older
-        ## bootstrap run predates them, so keep only the metrics actually present.
-        metric_sort_order = [
-            m for m in ['1-FOSCTTM', 'iLISI', 'cLISI', 'graph conn.', 'bio_cons.', 'total']
-            if m in set(plot_metrics_df['metric_name'])
-        ]
-        plot_metrics_df = plot_metrics_df.set_index('metric_name').loc[metric_sort_order].reset_index()
-
-        ## ── domains, grouped into source / target blocks ───────────────────
-        ##
-        ## Source bars are scored against RNA_clusters (spatial domains of the
-        ## source replicate) and target bars against celltypist_predictions
-        ## (cell types of a different sample): different vocabularies, different
-        ## granularity, different tissue. bio_cons./cLISI/total are therefore
-        ## comparable WITHIN a block only, so the blocks get their own ROW of
-        ## panels (one row per block, one column per metric, independent y axes)
-        ## instead of sharing an axis that invites the cross-block read.
-        available_domains = set(plot_metrics_df['domain'])
-
-        ## `target_multivi` is MultiVI retrained from scratch on the target
-        ## sample. It is not solving the transfer task every other entry solves,
-        ## and it is scored on its own training cells, so it wins by
-        ## construction; it is excluded from the figures rather than presented as
-        ## a competitor. It stays in model_metrics_df / the CSV for reference.
-        excluded_domains = {"target_multivi"}
-        multivi_domains = {"source_multivi", "target_multivi", "target_multivi_zero_shot"}
-
-        block_layout = [
-            ("source", ["teacher_source", "source", "source_nonspatial", "source_multivi"]),
-            ("target", ["target", "target_ot", "target_multivi_zero_shot", "target_multivi"]),
-        ]
-        plotted_domains = [
-            d
-            for _, doms in block_layout
-            for d in doms
-            if d in available_domains and d not in excluded_domains
-        ]
-        ## anything new in the specs still gets plotted, in its own block
-        leftover = [
-            d for d in (spec[0] for spec in foscttm_metric_specs)
-            if d in available_domains and d not in excluded_domains and d not in plotted_domains
-        ]
-        if leftover:
+        except Exception as exc:  # a subsample can drop a label entirely
             warnings.warn(
-                "Domains {} are not assigned to a source/target block; appending them.".format(
-                    leftover
+                "scib bootstrap replicate failed for domain '{}' (embedding '{}'): {}".format(
+                    domain_name, embedding_key, exc
                 )
-            )
-            block_layout = block_layout + [("other", leftover)]
-            plotted_domains = plotted_domains + leftover
-
-        ## Domains whose embedding was trained on the very cells being scored.
-        ## For MultiVI this matters twice over: its loss contains an explicit
-        ## alignment term between the RNA and ATAC posteriors of the same paired
-        ## cell, which is (up to a monotone transform) what FOSCTTM measures --
-        ## so `source_multivi` reports a training objective evaluated on training
-        ## data, not held-out integration quality. The target block is the honest
-        ## cross-dataset comparison: every model there is applied to a sample it
-        ## never saw.
-        in_sample_domains = {
-            "teacher_source",
-            "source",
-            "source_nonspatial",
-            "source_multivi",
-            "target_multivi",
-        }
-        in_sample_hatch = "//"
-
-        ## fixed colour per domain, so the two figure variants stay comparable
-        domain_palette = dict(
-            zip(plotted_domains, sns.color_palette("Set2", n_colors=max(len(plotted_domains), 3)))
-        )
-
-        ## (metric, domain) -> point estimate + bootstrap interval
-        metric_lookup = {
-            (row.metric_name, row.domain): (row.value, row.ci_low, row.ci_high)
-            for row in plot_metrics_df.itertuples()
-        }
-
-        def plot_scib_barplot(domains_to_plot, filename, panel_width=0.81, panel_height=0.732):
-            """One row of panels per domain block, one column per metric."""
-            blocks = [
-                (name, [d for d in doms if d in domains_to_plot])
-                for name, doms in block_layout
-            ]
-            blocks = [(name, doms) for name, doms in blocks if doms]
-            if not blocks:
-                warnings.warn("No domains left to plot for {}; skipping.".format(filename))
-                return None
-
-            n_rows, n_cols = len(blocks), len(metric_sort_order)
-            fig, axes = plt.subplots(
-                n_rows, n_cols,
-                figsize=(panel_width * n_cols, panel_height * n_rows),
-                squeeze=False,
-            )
-
-            for row_idx, (block_name, block_domains) in enumerate(blocks):
-                for col_idx, metric_name in enumerate(metric_sort_order):
-                    ax = axes[row_idx][col_idx]
-                    extrema = []
-                    for bar_idx, domain in enumerate(block_domains):
-                        value, ci_low, ci_high = metric_lookup.get(
-                            (metric_name, domain), (np.nan, np.nan, np.nan)
-                        )
-                        if not np.isfinite(value):
-                            continue
-                        extrema.append(value)
-                        patch = ax.bar(
-                            bar_idx, value, width=0.8,
-                            color=domain_palette[domain],
-                            edgecolor='#555555' if domain in in_sample_domains else '#cccccc',
-                            linewidth=0.4,
-                            ## hatched = scored on the cells the model was trained on
-                            hatch=in_sample_hatch if domain in in_sample_domains else None,
-                        )[0]
-                        if np.isfinite(ci_low) and np.isfinite(ci_high):
-                            ax.errorbar(
-                                patch.get_x() + patch.get_width() / 2,
-                                value,
-                                yerr=[[max(value - ci_low, 0.0)], [max(ci_high - value, 0.0)]],
-                                fmt='none', ecolor='#444444', elinewidth=0.4, capsize=0.8, zorder=3,
-                            )
-                            extrema.extend([ci_low, ci_high])
-
-                    ax.set_xticks([])
-                    ax.set_xlim(-0.7, len(block_domains) - 0.3)
-                    ax.tick_params(axis='y', labelsize=4.5, width=0.3, length=1.5, pad=1)
-                    for spine in ax.spines.values():
-                        spine.set_linewidth(0.25)
-                    if row_idx == 0:
-                        ax.set_title(metric_name, fontsize=5.5)
-                    if col_idx == 0:
-                        ax.set_ylabel(block_name, fontweight='bold', fontsize=5.5, labelpad=2)
-
-                    # Zoom the y axis onto the range actually occupied (error bars included)
-                    extrema = [v for v in extrema if np.isfinite(v) and v > 0]
-                    if extrema:
-                        min_val, max_val = min(extrema), max(extrema)
-                        margin = (max_val - min_val) * 0.2
-                        if margin == 0:
-                            margin = min_val * 0.1
-                        ax.set_ylim(bottom=max(0, min_val - margin), top=max_val + margin)
-
-            legend_handles = [
-                mpl.patches.Patch(
-                    facecolor=domain_palette[d],
-                    edgecolor='#555555' if d in in_sample_domains else '#cccccc',
-                    hatch=in_sample_hatch if d in in_sample_domains else None,
-                    label=d,
-                )
-                for d in plotted_domains if d in domains_to_plot
-            ]
-            ## explicit key for the hatch, so the in-sample caveat travels with the figure
-            legend_handles.append(
-                mpl.patches.Patch(
-                    facecolor='white', edgecolor='#555555', hatch=in_sample_hatch,
-                    label='scored on training cells',
-                )
-            )
-            fig.legend(
-                handles=legend_handles,
-                bbox_to_anchor=(0.5, 1.02), loc='lower center',
-                ncol=min(4, len(legend_handles)), borderaxespad=0.,
-                fontsize=5.0,
-            )
-            fig.tight_layout(pad=0.2, w_pad=0.5, h_pad=0.3)
-            if len(blocks) > 1:
-                ## bbox_inches='tight' in the save helper keeps this note in the PDF
-                fig.text(
-                    0.5, -0.02,
-                    "cLISI / bio_cons. / total use a different label set per row "
-                    "(source: RNA_clusters, target: CellTypist);\ncompare within a "
-                    "row only. Rows have independent y axes.",
-                    ha="center", va="top", fontsize=4.5, color="#444444",
-                )
-            save_figure_svg(
-                fig,
-                os.path.join(
-                    "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
-                    filename,
-                ),
-            )
-            plt.show()
-            return fig
-
-        ## two variants: the MultiGATE-only lineup, and the same plus the MultiVI
-        ## baselines that are actually solving the transfer task
-        plot_scib_barplot(plotted_domains, "scib_metrics_barplot.svg")
-        plot_scib_barplot(
-            [d for d in plotted_domains if d not in multivi_domains],
-            "scib_metrics_barplot_no_multivi.svg",
-        )
-
-
-    #%% spatial structure metrics
-    #
-    # Three "absolute score per model" spatial metrics for the RNA-ATAC lineup:
-    #   1. Niche recovery             -> predict each spot's neighbours' cluster
-    #                                    composition (excluding self) from the
-    #                                    joint embedding; report Spearman rho.
-    #   2. Within-cluster coherence   -> inside each transcriptomic cluster,
-    #                                    correlate embedding distance with physical
-    #                                    distance (Spearman rho).
-    #   3. Orthogonal-target recovery -> predict the held-out modality's (ATAC)
-    #                                    spatial pattern from the RNA-only
-    #                                    embedding; report Spearman rho.
-    #
-    # Scoring is on the SOURCE replicate: the teacher and no-distillation
-    # (nonspatial) embeddings only exist there. Spatial-block cross-validation
-    # holds out contiguous tissue, providing both the "held-out" signal and the
-    # per-fold values used for bootstrap CIs and the paired significance test.
-    # Coordinates are used only to build targets / CV blocks, never as model input.
-    from sklearn.neighbors import NearestNeighbors
-    from sklearn.cluster import KMeans
-    from sklearn.linear_model import Ridge
-    from sklearn.decomposition import TruncatedSVD
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import r2_score
-    from scipy.stats import spearmanr, wilcoxon
-
-    _spatial_key = "spatial"
-    n_spatial_blocks = 10
-    niche_k = 15
-    ssm_rng = np.random.default_rng(0)
-
-    # --- reference geometry: source replicate (RNA coords / clusters) ---
-    # RNA and ATAC are paired row-for-row, so the ATAC cluster labels align to
-    # the same spots and are used alongside RNA clusters (both modalities define
-    # the microenvironment and a "near-flat" partition for the coherence test).
-    ref_obs_names = pd.Index(source_rna.obs_names)
-    coords = np.asarray(source_rna.obsm[_spatial_key], dtype=float)
-    n_ref = ref_obs_names.size
-
-    def _codes_and_onehot(labels):
-        cat = pd.Series(np.asarray(labels)).astype("category")
-        return cat.cat.codes.to_numpy(), pd.get_dummies(cat).to_numpy().astype(float)
-
-    rna_cluster_codes, rna_cluster_onehot = _codes_and_onehot(source_rna.obs["RNA_clusters"])
-    atac_cluster_codes, atac_cluster_onehot = _codes_and_onehot(source_atac.obs["ATAC_clusters"])
-    # partitions reused by the within-cluster coherence metric (pooled)
-    cluster_partitions = [rna_cluster_codes, atac_cluster_codes]
-
-    # contiguous spatial blocks (KMeans on coordinates) shared across all models
-    block_labels = KMeans(
-        n_clusters=n_spatial_blocks, random_state=0, n_init=10
-    ).fit_predict(coords)
-
-    def _to_pca(adata, n_comps=30):
-        """Top components of a modality (TruncatedSVD == PCA on centred input)."""
-        X = adata.X
-        if sp.issparse(X):
-            n = min(n_comps, X.shape[1] - 1)
-            return TruncatedSVD(n_components=n, random_state=0).fit_transform(X)
-        X = StandardScaler().fit_transform(np.asarray(X, dtype=float))
-        n = min(n_comps, X.shape[1] - 1)
-        return TruncatedSVD(n_components=n, random_state=0).fit_transform(X)
-
-    def _standardize(X):
-        return StandardScaler().fit_transform(X)
-
-    def _align_to_ref(rna_adata, atac_adata, key):
-        """Return (rna_emb, atac_emb, valid) aligned to ref_obs_names.
-
-        RNA is matched by obs_name; ATAC is taken at the SAME positional index
-        (RNA/ATAC are paired row-for-row, see FOSCTTM above).
-        """
-        if key not in rna_adata.obsm or key not in atac_adata.obsm:
-            return None
-        rna_e = np.asarray(rna_adata.obsm[key], dtype=float)
-        atac_e = np.asarray(atac_adata.obsm[key], dtype=float)
-        pos = pd.Index(rna_adata.obs_names).get_indexer(ref_obs_names)
-        valid = pos >= 0
-        if valid.mean() < 0.5:
-            warnings.warn(
-                "Embedding '{}' overlaps <50% of reference spots; skipping.".format(key)
             )
             return None
-        rna_al = np.full((n_ref, rna_e.shape[1]), np.nan)
-        atac_al = np.full((n_ref, atac_e.shape[1]), np.nan)
-        rna_al[valid] = rna_e[pos[valid]]
-        atac_al[valid] = atac_e[pos[valid]]
-        return rna_al, atac_al, valid
 
-    # ── assemble the lineup ──────────────────────────────────────────────
-    # each entry -> (rna_emb, atac_emb, valid); joint = concat([rna, atac]),
-    # the RNA-only emb (for orthogonal-target) is the rna_emb.
-    model_specs = [
-        ("teacher",    source_rna,        source_atac,        "MultiGATE_full_teacher"),
-        ("student",    source_rna,        source_atac,        "MultiGATE"),
-        ("nonspatial", source_rna,        source_atac,        "MultiGATE_nonspatial"),
-        ("multivi",    mdata.mod['rna'],  mdata.mod['atac'],  "X_multivi"),
-    ]
-
-    # confirm that the multivi embeddings are the same as the rna and atac embeddings, not the joint embedding from mdata.obsm['X_multivi']
-    assert (mdata.mod['rna'].obsm['X_multivi'] == mdata.mod['rna'].obsm['X_multivi_rna']).all()
-    assert (mdata.mod['atac'].obsm['X_multivi'] == mdata.mod['atac'].obsm['X_multivi_atac']).all()
-    assert not (mdata.mod['rna'].obsm['X_multivi'] == mdata.mod['atac'].obsm['X_multivi']).any()
-
-    lineup = {}
-    for name, rna_ad, atac_ad, key in model_specs:
-        aligned = _align_to_ref(rna_ad, atac_ad, key)
-        if aligned is None:
-            warnings.warn("Lineup model '{}' unavailable; skipping.".format(name))
-            continue
-        rna_al, atac_al, valid = aligned
-        lineup[name] = {
-            "rna": rna_al,
-            "joint": np.concatenate([rna_al, atac_al], axis=1),
-            "valid": valid,
-        }
-
-    # raw-feature floor: PCA of each modality (RNA-only = RNA PCA, joint = concat)
-    rna_pca = _to_pca(source_rna, 30)
-    atac_pca = _to_pca(source_atac, 30)
-    lineup["pca"] = {
-        "rna": rna_pca,
-        "joint": np.concatenate([rna_pca, atac_pca], axis=1),
-        "valid": np.ones(n_ref, dtype=bool),
-    }
-
-    # standardize embeddings so distances / ridge are comparable across models
-    for name in lineup:
-        v = lineup[name]["valid"]
-        for k in ("rna", "joint"):
-            X = lineup[name][k]
-            Xs = np.full_like(X, np.nan)
-            Xs[v] = _standardize(X[v])
-            lineup[name][k] = Xs
-
-    def _sample_pairs(idx, max_pairs, rng):
-        """Random unordered index pairs drawn from `idx`."""
-        m = idx.size
-        n_pairs = min(max_pairs, m * (m - 1) // 2)
-        a = rng.integers(0, m, size=n_pairs)
-        b = rng.integers(0, m, size=n_pairs)
-        keep = a != b
-        return idx[a[keep]], idx[b[keep]]
-
-    # ── per-fold metric computations (one scalar per spatial block) ──────
-    def _r2_vw(y_true, y_pred):
-        # variance_weighted avoids near-constant output columns (e.g. a cluster
-        # nearly absent from a held-out block) dominating the score.
-        return float(r2_score(y_true, y_pred, multioutput="variance_weighted"))
-
-    def _mean_spearman(y_true, y_pred):
-        """Mean over output columns of Spearman(pred, true); robust to the
-        scale/mean shift that drives R^2 negative under spatial-block CV."""
-        rhos = []
-        for j in range(y_true.shape[1]):
-            rho, _ = spearmanr(y_true[:, j], y_pred[:, j])
-            if np.isfinite(rho):
-                rhos.append(rho)
-        return float(np.mean(rhos)) if rhos else np.nan
-
-    def _cv_predict_per_block(X, Y, valid, scorer):
-        """Ridge predict Y from X holding out one spatial block at a time;
-        return {block: scorer(y_true, y_pred)}."""
-        out = {}
-        for b in np.unique(block_labels):
-            test = (block_labels == b) & valid
-            train = (block_labels != b) & valid
-            if test.sum() < 5 or train.sum() < 20:
-                continue
-            scaler = StandardScaler().fit(X[train])
-            ridge = Ridge(alpha=1.0).fit(scaler.transform(X[train]), Y[train])
-            pred = ridge.predict(scaler.transform(X[test]))
-            out[b] = scorer(Y[test], pred)
-        return out
-
-    def _coherence_per_block(Xjoint, valid, coords_for_dist):
-        """Within-cluster Spearman(embedding dist, physical dist), per block,
-        pooled over both the RNA and ATAC cluster partitions."""
-        out = {}
-        for b in np.unique(block_labels):
-            mask = (block_labels == b) & valid
-            idx = np.where(mask)[0]
-            if idx.size < 30:
-                continue
-            rhos, weights = [], []
-            for codes in cluster_partitions:
-                for c in np.unique(codes[idx]):
-                    ci = idx[codes[idx] == c]
-                    if ci.size < 8:
-                        continue
-                    pa, pb = _sample_pairs(ci, max_pairs=2000, rng=ssm_rng)
-                    if pa.size < 10:
-                        continue
-                    ed = np.linalg.norm(Xjoint[pa] - Xjoint[pb], axis=1)
-                    pdist = np.linalg.norm(coords_for_dist[pa] - coords_for_dist[pb], axis=1)
-                    rho, _ = spearmanr(ed, pdist)
-                    if np.isfinite(rho):
-                        rhos.append(rho)
-                        weights.append(ci.size)
-            if rhos:
-                out[b] = float(np.average(rhos, weights=weights))
-        return out
-
-    def _build_targets(coords_for_targets):
-        """Niche (neighbour cluster composition) and orthogonal (neighbour-
-        averaged ATAC PCA) targets for the given coordinate set."""
-        nn = NearestNeighbors(n_neighbors=niche_k + 1).fit(coords_for_targets)
-        nbr = nn.kneighbors(coords_for_targets, return_distance=False)[:, 1:]
-        # neighbour composition over BOTH modalities' clusters (joint niche)
-        y_niche = np.concatenate(
-            [rna_cluster_onehot[nbr].mean(axis=1), atac_cluster_onehot[nbr].mean(axis=1)],
-            axis=1,
+    scib_metrics_frames = []
+    for spec_idx, (domain, rna_adata, atac_adata, domain_name, label_key, embedding_key) in enumerate(
+        scib_metric_specs
+    ):
+        ## point estimate on the full data
+        point_metrics = compute_scib_metrics_for_domain(
+            rna_adata=rna_adata,
+            atac_adata=atac_adata,
+            domain_name=domain_name,
+            label_key=label_key,
+            scib_n_jobs=1,
+            embedding_key=embedding_key,
         )
-        y_orth = _standardize(atac_pca[nbr].mean(axis=1))
-        return y_niche, y_orth
 
-    def _score_lineup(coords_for_dist, coords_for_targets, tag):
-        """Compute the three per-fold metrics for every model in the lineup."""
-        y_niche, y_orth = _build_targets(coords_for_targets)
+        ## bootstrap replicates on subsampled cells
+        replicate_metrics = []
+        if bootstrap_enabled:
+            replicate_seeds = [
+                bootstrap_seed + 1000 * (spec_idx + 1) + b for b in range(n_bootstrap)
+            ]
+            replicate_metrics = Parallel(n_jobs=bootstrap_n_jobs)(
+                delayed(_scib_replicate)(
+                    rna_adata, atac_adata, domain_name, label_key, embedding_key, seed
+                )
+                for seed in replicate_seeds
+            )
+            replicate_metrics = [m for m in replicate_metrics if m is not None]
+
         rows = []
-        for name, d in lineup.items():
-            valid = d["valid"]
-            niche = _cv_predict_per_block(d["joint"], y_niche, valid, _mean_spearman)
-            orth = _cv_predict_per_block(d["rna"], y_orth, valid, _mean_spearman)
-            coher = _coherence_per_block(d["joint"], valid, coords_for_dist)
-            for metric, per_block in (
-                ("niche_recovery_r2", niche),
-                ("orthogonal_target_spearman", orth),
-                ("within_cluster_coherence", coher),
-            ):
-                for fold, value in per_block.items():
-                    rows.append(
-                        {"setting": tag, "model": name, "metric": metric,
-                         "fold": int(fold), "value": value}
-                    )
-        return pd.DataFrame(rows)
+        for metric_name, value in point_metrics.items():
+            if metric_name not in _SCIB_NUMERIC_KEYS:
+                continue
+            ci_low, ci_high = _spread_ci(
+                float(value),
+                [m[metric_name] for m in replicate_metrics if metric_name in m],
+            )
+            rows.append(
+                {
+                    "domain": domain,
+                    "metric_name": metric_name,
+                    "value": float(value),
+                    "ci_low": ci_low,
+                    "ci_high": ci_high,
+                }
+            )
+        scib_metrics_frames.append(
+            pd.DataFrame(rows, columns=["domain", "metric_name", "value", "ci_low", "ci_high"])
+        )
 
-    # real scores + coordinate-permutation control (scoring-side shuffle)
-    perm = ssm_rng.permutation(n_ref)
-    spatial_metrics_df = pd.concat(
-        [
-            _score_lineup(coords, coords, tag="real"),
-            _score_lineup(coords[perm], coords[perm], tag="coord_permuted"),
-        ],
+    model_metrics_df = pd.concat(
+        scib_metrics_frames + [foscttm_metrics_df],
         ignore_index=True,
     )
-    # NOTE: the teacher-graph-shuffle control requires retraining the student
-    # with a permuted teacher graph and is run upstream, not in this scoring cell.
 
-    # ── absolute scores (mean over folds) + bootstrap 95% CI ─────────────
-    def _bootstrap_ci(values, n_boot=2000, alpha=0.05):
-        values = np.asarray(values, dtype=float)
-        if values.size == 0:
-            return (np.nan, np.nan)
-        boot = ssm_rng.choice(values, size=(n_boot, values.size), replace=True).mean(axis=1)
-        return (float(np.quantile(boot, alpha / 2)), float(np.quantile(boot, 1 - alpha / 2)))
-
-    summary_rows = []
-    for (setting, model, metric), grp in spatial_metrics_df.groupby(["setting", "model", "metric"]):
-        lo, hi = _bootstrap_ci(grp["value"].to_numpy())
-        summary_rows.append(
-            {"setting": setting, "model": model, "metric": metric,
-             "mean": float(grp["value"].mean()), "ci_lo": lo, "ci_hi": hi,
-             "n_folds": int(grp.shape[0])}
+#%% [RESUME FROM BOOTSTRAP SCIB] plot the scib / FOSCTTM barplot
+##
+## This cell only needs `model_metrics_df`, so it can be re-run on its own
+## once a background bootstrap has finished:
+##     from metrics_bootstrap import bootstrap_status, load_bootstrap_metrics
+##     bootstrap_status(metrics_work_dir)
+##     model_metrics_df = load_bootstrap_metrics(metrics_work_dir)
+if model_metrics_df is None:
+    print(
+        "Metrics are still computing in the background; skipping the barplot.\n"
+        "  from metrics_bootstrap import bootstrap_status, load_bootstrap_metrics\n"
+        "  bootstrap_status({d!r})\n"
+        "  model_metrics_df = load_bootstrap_metrics({d!r})\n"
+        "then re-run this cell.".format(d=metrics_work_dir)
+    )
+else:
+    ## Work on a local copy so re-running this cell does not permanently
+    ## rename metric_name in the session-level model_metrics_df (otherwise
+    ## a second pass keeps only 'total', the one name shared by both the
+    ## raw and display vocabularies).
+    plot_metrics_df = model_metrics_df.loc[
+        model_metrics_df['metric_name'].isin(
+            ['foscttm', 'ilisi', 'clisi', 'graph_connectivity',
+                'bio_conservation', 'total',
+                # already-renamed names from a prior pass of this cell
+                '1-FOSCTTM', 'iLISI', 'cLISI', 'graph conn.', 'bio_cons.']
         )
-    spatial_metrics_summary_df = pd.DataFrame(summary_rows)
-    print("\n[spatial structure metrics] absolute scores (mean over folds):")
-    print(
-        spatial_metrics_summary_df[spatial_metrics_summary_df["setting"] == "real"]
-        .pivot(index="model", columns="metric", values="mean")
-        .round(3)
-        .to_string()
-    )
-    print("\n[spatial structure metrics] coordinate-permutation control (should be ~chance):")
-    print(
-        spatial_metrics_summary_df[spatial_metrics_summary_df["setting"] == "coord_permuted"]
-        .pivot(index="model", columns="metric", values="mean")
-        .round(3)
-        .to_string()
-    )
+    ].copy()
+    plot_metrics_df['metric_name'] = plot_metrics_df['metric_name'].replace({
+        'bio_conservation': 'bio_cons.',
+        'foscttm': '1-FOSCTTM',
+        'ilisi': 'iLISI',
+        'clisi': 'cLISI',
+        'graph_connectivity': 'graph conn.',
+    })
+    ## cLISI sits next to iLISI on purpose: iLISI alone cannot distinguish
+    ## "modalities mixed, biology preserved" from "modalities mixed because
+    ## the embedding discarded the biology"; graph connectivity catches the
+    ## fragmented embeddings both LISIs are blind to. A CSV from an older
+    ## bootstrap run predates them, so keep only the metrics actually present.
+    metric_sort_order = [
+        m for m in ['1-FOSCTTM', 'iLISI', 'cLISI', 'graph conn.', 'bio_cons.', 'total']
+        if m in set(plot_metrics_df['metric_name'])
+    ]
+    plot_metrics_df = plot_metrics_df.set_index('metric_name').loc[metric_sort_order].reset_index()
 
-    # ── paired significance test: student vs nonspatial (across folds) ───
-    sig_rows = []
-    real_df = spatial_metrics_df[spatial_metrics_df["setting"] == "real"]
-    if {"student", "nonspatial"}.issubset(set(real_df["model"])):
-        for metric in real_df["metric"].unique():
-            a = real_df[(real_df["model"] == "student") & (real_df["metric"] == metric)]
-            b = real_df[(real_df["model"] == "nonspatial") & (real_df["metric"] == metric)]
-            merged = a.merge(b, on="fold", suffixes=("_student", "_nonspatial"))
-            if merged.shape[0] >= 3:
-                diff = merged["value_student"] - merged["value_nonspatial"]
-                try:
-                    stat, p = wilcoxon(diff)
-                except ValueError:
-                    stat, p = np.nan, np.nan
-                sig_rows.append(
-                    {"metric": metric, "n_folds": int(merged.shape[0]),
-                     "mean_diff_student_minus_nonspatial": float(diff.mean()),
-                     "wilcoxon_p": float(p)}
-                )
-    spatial_metrics_sig_df = pd.DataFrame(sig_rows)
-    if not spatial_metrics_sig_df.empty:
-        print("\n[spatial structure metrics] student vs nonspatial (paired over folds):")
-        print(spatial_metrics_sig_df.round(4).to_string(index=False))
+    ## ── domains, grouped into source / target blocks ───────────────────
+    ##
+    ## Source bars are scored against RNA_clusters (spatial domains of the
+    ## source replicate) and target bars against celltypist_predictions
+    ## (cell types of a different sample): different vocabularies, different
+    ## granularity, different tissue. bio_cons./cLISI/total are therefore
+    ## comparable WITHIN a block only, so the blocks get their own ROW of
+    ## panels (one row per block, one column per metric, independent y axes)
+    ## instead of sharing an axis that invites the cross-block read.
+    available_domains = set(plot_metrics_df['domain'])
 
-    # ── figure: absolute scores per model per metric (CI over folds) ─────
-    _metric_titles = {
-        "niche_recovery_r2": "Niche recovery",
-        "within_cluster_coherence": "Within-cluster coherence",
-        "orthogonal_target_spearman": "Orthogonal-target recovery",
+    ## `target_multivi` is MultiVI retrained from scratch on the target
+    ## sample. It is not solving the transfer task every other entry solves,
+    ## and it is scored on its own training cells, so it wins by
+    ## construction; it is excluded from the figures rather than presented as
+    ## a competitor. It stays in model_metrics_df / the CSV for reference.
+    excluded_domains = {"target_multivi"}
+    multivi_domains = {"source_multivi", "target_multivi", "target_multivi_zero_shot"}
+
+    block_layout = [
+        ("source", ["teacher_source", "source", "source_nonspatial", "source_multivi"]),
+        ("target", ["target", "target_ot", "target_multivi_zero_shot", "target_multivi"]),
+    ]
+    plotted_domains = [
+        d
+        for _, doms in block_layout
+        for d in doms
+        if d in available_domains and d not in excluded_domains
+    ]
+    ## anything new in the specs still gets plotted, in its own block
+    leftover = [
+        d for d in (spec[0] for spec in foscttm_metric_specs)
+        if d in available_domains and d not in excluded_domains and d not in plotted_domains
+    ]
+    if leftover:
+        warnings.warn(
+            "Domains {} are not assigned to a source/target block; appending them.".format(
+                leftover
+            )
+        )
+        block_layout = block_layout + [("other", leftover)]
+        plotted_domains = plotted_domains + leftover
+
+    ## Domains whose embedding was trained on the very cells being scored.
+    ## For MultiVI this matters twice over: its loss contains an explicit
+    ## alignment term between the RNA and ATAC posteriors of the same paired
+    ## cell, which is (up to a monotone transform) what FOSCTTM measures --
+    ## so `source_multivi` reports a training objective evaluated on training
+    ## data, not held-out integration quality. The target block is the honest
+    ## cross-dataset comparison: every model there is applied to a sample it
+    ## never saw.
+    in_sample_domains = {
+        "teacher_source",
+        "source",
+        "source_nonspatial",
+        "source_multivi",
+        "target_multivi",
     }
-    _metric_order = ["niche_recovery_r2", "within_cluster_coherence", "orthogonal_target_spearman"]
-    _model_order = [m for m in ["teacher", "student", "nonspatial", "multivi", "pca"]
-                    if m in set(real_df["model"])]
-    g = sns.catplot(
-        data=real_df, x="model", y="value", col="metric",
-        order=_model_order,
-        col_order=_metric_order,
-        kind="bar", palette="Set2", height=4, aspect=0.8,
-        errorbar=("ci", 95), capsize=0.15, sharey=False,
+    in_sample_hatch = "//"
+
+    ## fixed colour per domain, so the two figure variants stay comparable
+    domain_palette = dict(
+        zip(plotted_domains, sns.color_palette("Set2", n_colors=max(len(plotted_domains), 3)))
     )
-    for ax, metric in zip(g.axes.flat, _metric_order):
-        ax.set_title(_metric_titles.get(metric, metric))
-        ax.set_xlabel("")
-        ax.set_ylabel("")
-        ax.axhline(0.0, color="#999999", lw=0.8, ls="--")
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
-        for patch in ax.patches:
-            patch.set_edgecolor("#cccccc")
-            patch.set_linewidth(1)
-    g.fig.set_size_inches(10, 4)
-    plt.tight_layout()
-    save_figure_pdf_vector_raster(
-        plt.gcf(),
-        os.path.join(
-            "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
-            "spatial_structure_metrics_barplot.pdf",
-        ),
-    )
-    ax = g.axes.flat[0]
-    ax.set_ylabel('Correlation coefficient ($\\rho$)')
-    plt.show()
 
-    #%% LIANA+ inflow analysis
-    import plotnine as p9
-    import gc
-    from sklearn.model_selection import StratifiedShuffleSplit
+    ## (metric, domain) -> point estimate + bootstrap interval
+    metric_lookup = {
+        (row.metric_name, row.domain): (row.value, row.ci_low, row.ci_high)
+        for row in plot_metrics_df.itertuples()
+    }
 
-    def make_full_spatial_nmf_plot_adata(nmf, full_adata, spatial_key="spatial", preserve_obs_cols=None):
-        nmf_scores = nmf.X.toarray() if sp.issparse(nmf.X) else np.asarray(nmf.X)
-        nmf_scores_df = pd.DataFrame(
-            nmf_scores,
-            index=nmf.obs_names,
-            columns=nmf.var_names,
+    def plot_scib_barplot(domains_to_plot, filename, panel_width=0.81, panel_height=0.732):
+        """One row of panels per domain block, one column per metric."""
+        blocks = [
+            (name, [d for d in doms if d in domains_to_plot])
+            for name, doms in block_layout
+        ]
+        blocks = [(name, doms) for name, doms in blocks if doms]
+        if not blocks:
+            warnings.warn("No domains left to plot for {}; skipping.".format(filename))
+            return None
+
+        n_rows, n_cols = len(blocks), len(metric_sort_order)
+        fig, axes = plt.subplots(
+            n_rows, n_cols,
+            figsize=(panel_width * n_cols, panel_height * n_rows),
+            squeeze=False,
         )
 
-        full_obs = full_adata.obs.copy()
-        overlapping_score_cols = full_obs.columns.intersection(nmf_scores_df.columns)
-        if len(overlapping_score_cols) > 0:
-            full_obs = full_obs.drop(columns=overlapping_score_cols)
-        full_obs = full_obs.join(nmf_scores_df, how='left')
+        for row_idx, (block_name, block_domains) in enumerate(blocks):
+            for col_idx, metric_name in enumerate(metric_sort_order):
+                ax = axes[row_idx][col_idx]
+                extrema = []
+                for bar_idx, domain in enumerate(block_domains):
+                    value, ci_low, ci_high = metric_lookup.get(
+                        (metric_name, domain), (np.nan, np.nan, np.nan)
+                    )
+                    if not np.isfinite(value):
+                        continue
+                    extrema.append(value)
+                    patch = ax.bar(
+                        bar_idx, value, width=0.8,
+                        color=domain_palette[domain],
+                        edgecolor='#555555' if domain in in_sample_domains else '#cccccc',
+                        linewidth=0.4,
+                        ## hatched = scored on the cells the model was trained on
+                        hatch=in_sample_hatch if domain in in_sample_domains else None,
+                    )[0]
+                    if np.isfinite(ci_low) and np.isfinite(ci_high):
+                        ax.errorbar(
+                            patch.get_x() + patch.get_width() / 2,
+                            value,
+                            yerr=[[max(value - ci_low, 0.0)], [max(ci_high - value, 0.0)]],
+                            fmt='none', ecolor='#444444', elinewidth=0.4, capsize=0.8, zorder=3,
+                        )
+                        extrema.extend([ci_low, ci_high])
 
-        preserve_obs_cols = set(preserve_obs_cols or [])
-        for col in nmf.obs.columns:
-            if col in preserve_obs_cols and col in full_obs.columns:
-                continue
-            full_obs[col] = nmf.obs[col].reindex(full_obs.index)
+                ax.set_xticks([])
+                ax.set_xlim(-0.7, len(block_domains) - 0.3)
+                ax.tick_params(axis='y', labelsize=4.5, width=0.3, length=1.5, pad=1)
+                for spine in ax.spines.values():
+                    spine.set_linewidth(0.25)
+                if row_idx == 0:
+                    ax.set_title(metric_name, fontsize=5.5)
+                if col_idx == 0:
+                    ax.set_ylabel(block_name, fontweight='bold', fontsize=5.5, labelpad=2)
 
-        return sc.AnnData(
-            X=np.zeros((full_adata.n_obs, 1)),
-            obs=full_obs,
-            obsm={spatial_key: full_adata.obsm[spatial_key].copy()},
-        )
+                # Zoom the y axis onto the range actually occupied (error bars included)
+                extrema = [v for v in extrema if np.isfinite(v) and v > 0]
+                if extrema:
+                    min_val, max_val = min(extrema), max(extrema)
+                    margin = (max_val - min_val) * 0.2
+                    if margin == 0:
+                        margin = min_val * 0.1
+                    ax.set_ylim(bottom=max(0, min_val - margin), top=max_val + margin)
 
-    def liana_spatial_analysis(
-        adata,
-        subsample_n=5000,
-        resource=None,
-        spatial_key="spatial",
-        cell_type_col="RNA_clusters",
-        labels=["R2", "R4", "R7"], interaction=None, ncomps=30, bandwidth=40, s=60
-        ):
-        """
-        Performs LIANA+ inflow and associated spatial ligand-receptor analyses on `source_rna` AnnData object.
-
-        Parameters:
-            source_rna: AnnData
-                Source RNA AnnData object with spatial information.
-            source_rna_emb: np.ndarray
-                Embedding array for reference for GW distance computation.
-            labels: list
-                Labels for feature_by_group (cell types).
-            interaction: str
-                Ligand-receptor interaction string to visualize, e.g., 'R1^Mdk^Alk'.
-            ncomps: int
-                Number of NMF components for factorization.
-            bandwidth: int
-                Bandwidth for spatial neighbors.
-            s: int
-                Dot size for spatial plots.
-            cell_type_col: str
-                Column in .obs with cell type/cluster labels.
-            spatial_key: str
-                Key in .obsm for spatial coordinates.
-        Returns:
-            dict of intermediate outputs (optional).
-        """
-
-        sc.pl.embedding(adata, basis=spatial_key, color=[cell_type_col], wspace=0.4, s=s)
-
-        plot, df = li.ut.query_bandwidth(
-            coordinates=adata.obsm[spatial_key],
-            start=5,         
-            end=60,           
-            interval_n=40    
-        )
-        plot + p9.scale_y_continuous(breaks=range(int(df.neighbours.min()), int(df.neighbours.max())+1))
-
-        li.ut.spatial_neighbors(adata=adata, bandwidth=bandwidth, spatial_key=spatial_key)
-        li.pl.connectivity(adata, idx=5500, size=1, figure_size=(6, 5), spatial_key=spatial_key)
-
-        sq.gr.spatial_autocorr(adata, mode='moran', use_raw=False, show_progress_bar=True)
-        svgs = adata.uns['moranI'].index[(adata.uns['moranI']['pval_norm_fdr_bh'] < 0.05) & (adata.uns['moranI']['I'] > 0.01)]
-        adata = adata[:, svgs]
-        print(f"Number of spatially variable genes: {len(svgs)}")
-
-        map_df = pd.read_csv(os.path.join(os.environ.get('DATAPATH'), 'gene_annotations', 'human_mouse_gene_orthologs.csv')) 
-        map_df = map_df.rename(columns={"Gene name": "source", "Mouse gene name": "target"})
-        map_df = map_df.drop(columns=["Gene stable ID", "Mouse gene stable ID"])
-
-        if resource is None:
-            resource = li.rs.select_resource('mouseconsensus') # NOTE: mouse_consensus could be used in future
-            '''
-            resource = li.rs.translate_resource(
-                resource,
-                map_df=map_df,
-                columns=['ligand', 'receptor'],
-                replace=True,
-                one_to_many=2,
+        legend_handles = [
+            mpl.patches.Patch(
+                facecolor=domain_palette[d],
+                edgecolor='#555555' if d in in_sample_domains else '#cccccc',
+                hatch=in_sample_hatch if d in in_sample_domains else None,
+                label=d,
             )
-            '''
-
-        lrdata = li.mt.inflow(
-            adata,
-            groupby=cell_type_col,
-            resource=resource,
-            use_raw=False,
-        )
-
-        fused_I = None
-        if interaction is not None:
-
-            sq.gr.spatial_autocorr(lrdata, mode='moran', use_raw=False)
-            svis = lrdata.uns['moranI'].index[(lrdata.uns['moranI']['pval_norm_fdr_bh'] <= 0.05) & (lrdata.uns['moranI']['I'] > 0.01)]
-            print(f"Number of spatially variable ligand-receptor interactions: {len(svis)}")
-            lrdata = lrdata[:, svis]
-            lrdata.uns['moranI'].sort_values("I").tail(30)
-
-            try:
-                ligands = lrdata.var_names.str.split("^").str[1]
-                receptors = lrdata.var_names.str.split("^").str[2]
-                fused_I = adata.uns['moranI'].loc[ligands, 'I'].values * adata.uns['moranI'].loc[receptors, 'I'].values
-                print(lrdata.var_names[np.flip(fused_I.argsort())])
-            except:
-                fused_I = None
-
-            comp = interaction.split("^")
-
-            sc.pl.embedding(
-                lrdata,
-                basis=spatial_key,
-                color=interaction,
-                s=s,
-                ncols=2,
+            for d in plotted_domains if d in domains_to_plot
+        ]
+        ## explicit key for the hatch, so the in-sample caveat travels with the figure
+        legend_handles.append(
+            mpl.patches.Patch(
+                facecolor='white', edgecolor='#555555', hatch=in_sample_hatch,
+                label='scored on training cells',
             )
-
-            sc.pl.embedding(
-                adata,
-                basis=spatial_key,
-                color=[comp[1], comp[2]],
-                s=s,
-                use_raw=False,
-                ncols=2,
+        )
+        fig.legend(
+            handles=legend_handles,
+            bbox_to_anchor=(0.5, 1.02), loc='lower center',
+            ncol=min(4, len(legend_handles)), borderaxespad=0.,
+            fontsize=5.0,
+        )
+        fig.tight_layout(pad=0.2, w_pad=0.5, h_pad=0.3)
+        if len(blocks) > 1:
+            ## bbox_inches='tight' in the save helper keeps this note in the PDF
+            fig.text(
+                0.5, -0.02,
+                "cLISI / bio_cons. / total use a different label set per row "
+                "(source: RNA_clusters, target: CellTypist);\ncompare within a "
+                "row only. Rows have independent y axes.",
+                ha="center", va="top", fontsize=4.5, color="#444444",
             )
-
-            fig, ax = plt.subplots(figsize=(14, 5)) 
-            sc.pl.violin(lrdata, groupby=cell_type_col, keys=interaction, size=0.5, rotation=90, ax=ax)
-            plt.tight_layout()
-            plt.show()
-
-            li.pl.feature_by_group(
-                adata=lrdata,
-                spatial_key=spatial_key,
-                feature=interaction,
-                groupby=cell_type_col,
-                percentile_scaling=(1,97),
-                labels=labels,
-                show_counts=False,
-                normalize=True,
-                figure_size=(10,8),
-            )
-            ## stopped at "Global Summaries"
-
-        ## NMF
-        li.multi.nmf(lrdata, n_components=ncomps, inplace=True, random_state=0, max_iter=200, verbose=True)
-        lr_loadings = li.ut.get_variable_loadings(lrdata, varm_key='NMF_H').set_index('index')
-        factor_scores = li.ut.get_factor_scores(lrdata, obsm_key='NMF_W')
-
-        X_nmf = lrdata.obsm['NMF_W']
-        keep_nmf = X_nmf.sum(axis=1) > 0
-        lrdata_nmf = lrdata[keep_nmf].copy()
-        nmf = sc.AnnData(X=lrdata_nmf.obsm['NMF_W'],
-                        obs=lrdata_nmf.obs,
-                        var=pd.DataFrame(index=lr_loadings.columns),
-                        uns=lrdata.uns,
-                        obsm=lrdata_nmf.obsm)
-        lr_loadings.head(10)
-
-        sc.pp.neighbors(nmf, use_rep='X', metric='euclidean', n_neighbors=30)
-        sc.tl.leiden(nmf, resolution=0.1)
-        sc.tl.umap(nmf, min_dist=0.5)
-        sc.pl.umap(nmf, color=[cell_type_col, 'leiden'], size=25, ncols=2)
-
-        nmf_spatial = make_full_spatial_nmf_plot_adata(
-            nmf,
-            adata,
-            spatial_key=spatial_key,
-            preserve_obs_cols=[cell_type_col],
+        save_figure_svg(
+            fig,
+            os.path.join(
+                "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+                filename,
+            ),
         )
-        sc.pl.embedding(
-            nmf_spatial,
-            basis=spatial_key,
-            color=[cell_type_col, 'leiden'],
-            size=s,
-            ncols=2,
-            na_color='darkgray',
-        )
-
-        stratified_subsample_applied = False
-        if subsample_n is not None and subsample_n < nmf.n_obs:
-            y = nmf.obs[cell_type_col].astype(str).to_numpy()
-            try:
-                sss = StratifiedShuffleSplit(
-                    n_splits=1, train_size=subsample_n, random_state=0
-                )
-                train_idx, _ = next(sss.split(np.zeros((nmf.n_obs, 1)), y))
-            except ValueError:
-                # Too few cells per class (or similar) for stratified split.
-                train_idx = np.random.default_rng(0).choice(
-                    nmf.n_obs, size=subsample_n, replace=False
-                )
-            chosen = nmf.obs_names[train_idx].tolist()
-            nmf = nmf[chosen].copy()
-            adata = adata[chosen].copy()
-            stratified_subsample_applied = True
-
-        '''
-        ## GW distance
-        X_nmf = nmf.X
-        if stratified_subsample_applied:
-            X_source = np.asarray(adata.obsm["MultiGATE"])
-        else:
-            X_source = adata.obsm["MultiGATE"][keep_nmf]
-        C_nmf = ot.utils.dist(X_nmf, metric='euclidean')
-        C_source = ot.utils.dist(X_source, metric='euclidean')
-        C_nmf = torch.from_numpy(C_nmf / C_nmf.max()).to('cuda:2', dtype=torch.float64)
-        C_source = torch.from_numpy(C_source / C_source.max()).to('cuda:2', dtype=torch.float64)
-        gw_distance = ot.gromov.entropic_gromov_wasserstein2(C_nmf, C_source, eps=1e-2)
-        #gw_distance = ot.gaussian.gaussian_gromov_wasserstein_distance(C_nmf, C_source, log=True)[0]
-        gw_distance = 0.5 * gw_distance.sqrt().item()
-
-        del C_nmf, C_source
-        torch.cuda.empty_cache()
-        gc.collect()
-        '''
-
-        # Return a dictionary of useful results, or could just not return if only for plotting side-effects
-        return {
-            "adata": adata,
-            "lrdata": lrdata,
-            "nmf": nmf,
-            "nmf_spatial": nmf_spatial,
-            "fused_I": fused_I,
-            "svgs": svgs,
-            "lr_loadings": lr_loadings,
-            "factor_scores": factor_scores
-        }
-
-    '''
-    ## map ATAC peaks to genes
-    gpnet = source_atac.uns['gene_peak_Net'].copy()
-    gpmap = gpnet.groupby("Gene", sort=True)["Peak"].unique()
-    missing_genes = set(source_rna.var_names) - set(gpmap.index)
-    gene_names = pd.Index(gpmap.index).intersection(source_rna.var_names, sort=False)
-
-    gp_distances = pd.pivot(gpnet, index='Gene', columns='Peak', values='Distance').fillna(np.inf)
-    for gene in missing_genes:
-        gp_distances.loc[gene] = np.inf
-    gp_distances = gp_distances.loc[source_rna.var_names, source_atac.var_names]
-    gp_weights = 1 / (gp_distances + 1)
-
-    gp_pairs = gpmap.loc[gene_names].explode().reset_index().rename(columns={"index": "Gene"})
-    peak_indexer = source_atac.var_names.get_indexer(gp_pairs["Peak"])
-    missing_peak_mask = peak_indexer < 0
-    if missing_peak_mask.any():
-        missing_peaks = gp_pairs.loc[missing_peak_mask, "Peak"].unique()
-        raise KeyError(
-            "gene_peak_Net contains peaks not present in source_atac.var_names: "
-            f"{missing_peaks[:10].tolist()}"
-        )
-
-    gene_indexer = gene_names.get_indexer(gp_pairs["Gene"])
-    weight_row_indexer = source_rna.var_names.get_indexer(gp_pairs["Gene"])
-    edge_weights = gp_weights.to_numpy()[weight_row_indexer, peak_indexer].astype(
-        np.float32,
-        copy=False,
-    )
-
-    peak_to_gene = sp.coo_matrix(
-        (edge_weights, (peak_indexer, gene_indexer)),
-        shape=(source_atac.n_vars, gene_names.size),
-    ).tocsc()
-
-    atac_matrix = source_atac.X.tocsr() if sp.issparse(source_atac.X) else np.asarray(source_atac.X)
-    n_jobs = min(os.cpu_count() or 1, gene_names.size)
-    chunk_size = max(1, (gene_names.size + n_jobs - 1) // n_jobs)
-    chunk_bounds = [
-        (start, min(start + chunk_size, gene_names.size))
-        for start in range(0, gene_names.size, chunk_size)
-    ]
-
-    def _score_gene_chunk(start: int, stop: int) -> np.ndarray:
-        peak_to_gene_chunk = peak_to_gene[:, start:stop]
-        if sp.issparse(atac_matrix):
-            chunk_scores = atac_matrix @ peak_to_gene_chunk
-            return chunk_scores.toarray()
-        return np.asarray(atac_matrix @ peak_to_gene_chunk.toarray())
-
-    gp_score_chunks = Parallel(n_jobs=n_jobs, prefer="threads")(
-        delayed(_score_gene_chunk)(start, stop) for start, stop in chunk_bounds
-    )
-    gp_scores = pd.DataFrame(
-        np.concatenate(gp_score_chunks, axis=1),
-        index=source_rna.obs_names,
-        columns=gene_names,
-    )
-
-    for missing_gene in missing_genes:
-        gp_scores[missing_gene] = np.nan
-
-    gp_scores = gp_scores.loc[:, source_rna.var_names]
-
-    assert gp_scores.index.equals(source_rna.obs_names)
-    assert gp_scores.columns.equals(source_rna.var_names)
-
-    from scipy.sparse import csr_matrix
-    source_rna.layers['fusion_scores'] = \
-        csr_matrix(gp_scores.values.astype(source_rna.X.dtype)).multiply(
-        source_rna.X
-    )
-
-    source_fusion = source_rna.copy()
-    source_fusion.X = source_fusion.layers['fusion_scores'].copy()
-    del source_rna.layers['fusion_scores']
-    '''
-
-    ## format combined_gp_dict to adapt to LIANA+
-    resource = li.rs.select_resource('mouseconsensus')
-
-    ## ingest RNA_cluster assign RNA_clusters to target_rna
-    print("Ingesting RNA_clusters to target_rna...")
-    sc.tl.ingest(target_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters', inplace=True)
-    print("RNA_clusters ingested to target_rna")
-
-    ingested_rna_clusters = target_concat_adata.obs.loc[
-        target_concat_adata.obs['modality'].eq('rna'), 'RNA_clusters'
-    ]
-    ingested_rna_clusters.index = ingested_rna_clusters.index.str.replace('_rna', '')
-    target_rna.obs['RNA_clusters'] = ingested_rna_clusters
-
-    ## set SCT_data as default assay
-    source_rna_liana = source_rna.copy()
-    source_rna_liana.X = source_rna_liana.layers['SCT_data'].copy()
-    target_rna_liana = target_rna.copy()
-    target_rna_liana.X = target_rna_liana.layers['SCT_data'].copy()
-
-    ## LIANA+ inflow analysis
-    source_liana_results = liana_spatial_analysis(
-        source_rna_liana,
-        subsample_n=5000,
-        resource=resource,
-        labels=None, interaction=None, ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
-        )
-
-    '''
-    target_liana_results = liana_spatial_analysis(
-        target_rna_liana,
-        subsample_n=5000,
-        resource=resource,
-        labels=None, interaction=None, ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
-        )
-    '''
-
-    ## LIANA-MultiGATE heatmaps
-    from scipy.stats import rankdata
-    adata = source_liana_results['adata'].copy()
-    nmf = source_liana_results['nmf'].copy()
-    nmf_spatial = source_liana_results['nmf_spatial'].copy()
-
-    ## Held-out spatial reconstruction: the primary ground-truth spatial claim.
-    ## Hide half the source spots, match each hidden spot to its nearest retained spot in
-    ## embedding space, and inherit that neighbour's real coordinates as the prediction --
-    ## 1-NN regression on position, with the matching done in a space holding no coordinates.
-    ## Only source_rna.obsm['spatial'] and the embeddings enter: no imputed target
-    ## coordinates, no ingested labels, no OT, no Inflow-NMF, so nothing being compared was
-    ## produced by the models under test.
-    ## Caveat for the caption: the split is held out at evaluation time, not training time,
-    ## so this shows position is recoverable from the embedding, not that the model
-    ## generalises to unseen tissue. The teacher sees the spatial graph and is a scale
-    ## reference, not a competitor; the no-KD ablation is the control that isolates
-    ## distillation (same architecture, same data, no teacher).
-    def plot_heldout_spatial_reconstruction(
-        source_rna,
-        multivi_rna,
-        n_splits=5,
-        seed=0,
-        pitch_ref=2.0,
-        panel='d_heldout_cdf',
-        save_dir=CIBB_PLS_FIGURES_DIR,
-        show_summary_table=False,
-        dpi=600,
-    ):
-        from sklearn.neighbors import NearestNeighbors
-
-        rng = np.random.default_rng(seed)
-
-        ## restrict to spots every method covers, so the arms are comparable
-        pos = pd.Series(
-            np.arange(multivi_rna.n_obs), index=multivi_rna.obs_names
-        ).reindex(source_rna.obs_names)
-        mask = pos.notna().to_numpy()
-        xy = np.asarray(source_rna.obsm['spatial'])[mask]
-        ## NearestNeighbors.kneighbors returns (distances, indices) in that order
-        d_nn, _ = NearestNeighbors(n_neighbors=2).fit(xy).kneighbors(xy)
-        pitch = float(np.median(d_nn[:, 1]))
-        print(f'held-out reconstruction: {mask.sum()} spots, pitch {pitch:.1f} units')
-
-        arms = {
-            'MultiGATE teacher (spatial graph)': (
-                np.asarray(source_rna.obsm['MultiGATE_full_teacher'])[mask],
-                '#00441b', 1.4, '--'),
-            'MultiGATE student (identity graph)': (
-                np.asarray(source_rna.obsm['MultiGATE'])[mask], '#1b7837', 2.4, '-'),
-            'MultiGATE no-KD ablation': (
-                np.asarray(source_rna.obsm['MultiGATE_nonspatial'])[mask], '#a6dba0', 1.4, '-'),
-            'MultiVI': (
-                np.asarray(multivi_rna.obsm['X_multivi'])[pos[mask].astype(int).to_numpy()],
-                '#762a83', 2.4, '-'),
-        }
-        for name, (Z, *_rest) in arms.items():
-            assert np.isfinite(Z).all(), f'{name} has non-finite values'
-
-        def _heldout_error(Z):
-            out = []
-            for r in range(n_splits):
-                perm = np.random.default_rng(seed + r).permutation(len(Z))
-                ref, qry = perm[: len(perm) // 2], perm[len(perm) // 2:]
-                _, i = NearestNeighbors(n_neighbors=1).fit(Z[ref]).kneighbors(Z[qry])
-                out.append(np.linalg.norm(xy[ref[i[:, 0]]] - xy[qry], axis=1) / pitch)
-            return np.concatenate(out)
-
-        curves = {name: _heldout_error(Z) for name, (Z, *_rest) in arms.items()}
-        n_q = len(next(iter(curves.values())))
-        ## floor: guess a random spot rather than the embedding's nearest neighbour
-        curves['random floor'] = np.linalg.norm(
-            xy[rng.integers(0, len(xy), n_q)] - xy[rng.integers(0, len(xy), n_q)], axis=1
-        ) / pitch
-        arms['random floor'] = (None, '#999999', 1.4, ':')
-
-        ## legend keys are kept long for the printed summary, short on the panel: at the
-        ## size this panel is placed, the full arm names would take half the axes width.
-        short = {'MultiGATE teacher (spatial graph)': 'MultiGATE teacher',
-                 'MultiGATE student (identity graph)': 'MultiGATE student',
-                 'MultiGATE no-KD ablation': 'MultiGATE no-KD',
-                 'MultiVI': 'MultiVI', 'random floor': 'random floor'}
-
-        with plt.rc_context(PANEL_RC):
-            fig = panel_figure(panel)
-            ## explicit rectangle rather than tight_layout: the panel has to keep the
-            ## figsize it declares, since that is what makes it drop into the assembled
-            ## figure at 100% next to the other panels. The left and right edges match
-            ## panel c's, which stacks directly above it, so the two plot boxes line up.
-            ax = fig.add_axes([0.21, 0.155, 0.765, 0.825])
-
-            rows = []
-            for name, (_Z, color, lw, ls) in arms.items():
-                v = np.sort(curves[name])
-                frac = np.arange(1, len(v) + 1) / len(v)
-                ax.plot(v, frac, lw=lw * 0.62, ls=ls, color=color, label=short[name],
-                        zorder=3)
-                within, med = float((v <= pitch_ref).mean()), float(np.median(v))
-                ## mark where each curve crosses the two reference lines
-                ax.plot([pitch_ref, med], [within, 0.5], ls='none', marker='o', ms=2.4,
-                        color=color, mec='w', mew=0.4, zorder=5)
-                rows.append({'method': name, 'median_err': med,
-                             f'within_{pitch_ref:g}_pitch': within})
-            summary = pd.DataFrame(rows).set_index('method')
-
-            ## log scale and limits first: a text artist anchored at a linear-scale xlim
-            ## would sit at a negative x, which a log axis cannot represent, and autoscale
-            ## then blows the range out to a blank, extremely wide plot
-            ax.set_xscale('log')
-            ## exact hits give an error of 0, which a log axis cannot take as a limit
-            lo = min((v[v > 0].min() for v in curves.values() if (v > 0).any()), default=1.0)
-            ax.set_xlim(lo * 0.9, max(v.max() for v in curves.values()) * 1.1)
-            ax.set_ylim(-0.02, 1.02)
-            ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
-
-            ax.axvline(pitch_ref, ls=':', lw=0.6, color='0.35', zorder=1)
-            ## both reference labels go into the bottom-left wedge, the only region of a
-            ## CDF panel this size that no curve and not the legend passes through;
-            ## x in data coords, y in axes fraction
-            ax.text(pitch_ref, 0.015, f' ≤{pitch_ref:g} sp',
-                    transform=ax.get_xaxis_transform(),
-                    fontsize=PANEL_FS['annot'], color='0.35', va='bottom', ha='left')
-            ax.axhline(0.5, ls=':', lw=0.6, color='0.6', zorder=1)
-            ## x in axes fraction, y in data coords, so this never enters the x data range
-            ax.text(0.985, 0.515, 'median', transform=ax.get_yaxis_transform(),
-                    fontsize=PANEL_FS['annot'], color='0.55', va='bottom', ha='right')
-
-            ## short axis labels: the full sentences are caption material, and at 6.5 pt
-            ## they would overrun the 1.4 in axes they have to sit against
-            ax.set_xlabel('position error (spot widths)')
-            ax.set_ylabel('cumulative fraction')
-            ## opaque frame: every CDF ends up in the top-left corner, so an unfilled
-            ## legend there is unreadable. This is also the key for panel c above, which
-            ## has room only for the arm names without the 'MultiGATE' prefix.
-            leg = ax.legend(loc='upper left', fontsize=PANEL_FS['annot'], frameon=True,
-                            facecolor='white', edgecolor='0.8', framealpha=1.0)
-            leg.set_zorder(6)
-            leg.get_frame().set_linewidth(0.4)
-            ax.spines[['top', 'right']].set_visible(False)
-
-            ## both readings: typical error (median, where each curve crosses y=0.5) and
-            ## the share confidently localised (where each curve crosses the vertical
-            ## reference). Off by default -- it does not survive the panel's final size,
-            ## and the same numbers are printed below for the caption.
-            if show_summary_table:
-                lines = [f'{"":<18s}{"median":>7s}{f"<={pitch_ref:g}sp":>7s}']
-                for m, r in summary.iterrows():
-                    lines.append(f'{short[m]:<18s}{r["median_err"]:>7.1f}'
-                                 f'{r[f"within_{pitch_ref:g}_pitch"]:>7.0%}')
-                ax.text(0.985, 0.03, '\n'.join(lines), transform=ax.transAxes,
-                        fontsize=PANEL_FS['annot'] - 0.5, ha='right', va='bottom',
-                        color='0.3', linespacing=1.5, family='monospace')
-
-            if panel is not None:
-                save_panel_svg(fig, panel, save_dir=save_dir, dpi=dpi)
-        plt.show()
-        print(summary.round(3))
-        return {'summary': summary, 'curves': curves, 'pitch': pitch, 'fig': fig}
-
-    heldout_reconstruction_results = plot_heldout_spatial_reconstruction(
-        source_rna, mdata.mod['rna']
-    )
-
-    ## source-side agreement with the Inflow-NMF referee.
-    ## The target-side referee is deliberately not scored: target spatial coordinates are
-    ## imputed from the MultiGATE latent space being evaluated (see target_rna.obsm['spatial']
-    ## assignment above), so any target agreement is circular. On the source the referee is
-    ## built from real coordinates and expert RNA_clusters, and is model-independent.
-    from matplotlib import gridspec
-    from scipy.optimize import linear_sum_assignment
-
-    def _comb2(x):
-        return x * (x - 1.0) / 2.0
-
-    def _contingency(x_codes, y_codes, nx, ny):
-        return np.bincount(x_codes * ny + y_codes, minlength=nx * ny).reshape(nx, ny)
-
-    def _ari_nmi_from_tables(C):
-        """C: (B, nA, nB) contingency stack -> (ARI[B], NMI[B]), sklearn conventions."""
-        C = np.asarray(C, dtype=np.float64)
-        n = C.sum(axis=(1, 2))
-        a, b = C.sum(axis=2), C.sum(axis=1)
-        s_ij = _comb2(C).sum(axis=(1, 2))
-        s_a, s_b = _comb2(a).sum(axis=1), _comb2(b).sum(axis=1)
-        exp_ = s_a * s_b / _comb2(n)
-        ari = (s_ij - exp_) / (0.5 * (s_a + s_b) - exp_)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            pij, pa, pb = C / n[:, None, None], a / n[:, None], b / n[:, None]
-            lg = np.where(
-                C > 0,
-                np.log(np.where(C > 0, pij, 1.0))
-                - np.log(np.where(C > 0, pa[:, :, None] * pb[:, None, :], 1.0)),
-                0.0,
-            )
-            mi = (pij * lg).sum(axis=(1, 2))
-            ha = -np.where(a > 0, pa * np.log(np.where(a > 0, pa, 1.0)), 0.0).sum(axis=1)
-            hb = -np.where(b > 0, pb * np.log(np.where(b > 0, pb, 1.0)), 0.0).sum(axis=1)
-            nmi = mi / (0.5 * (ha + hb))
-        return ari, nmi
-
-    def _bootstrap_ari_nmi(x_codes, y_codes, nx, ny, n_boot=2000, seed=0):
-        """Nonparametric cell bootstrap. Resampling cells with replacement is exactly a
-        Multinomial(n, p) draw over the contingency bins, so every replicate comes from a
-        single multinomial call: O(nx*ny) per replicate instead of O(n_cells)."""
-        C = _contingency(x_codes, y_codes, nx, ny).astype(np.float64)
-        n = int(C.sum())
-        boot = np.random.default_rng(seed).multinomial(
-            n, (C / n).ravel(), size=n_boot
-        ).reshape(n_boot, nx, ny)
-        ari_b, nmi_b = _ari_nmi_from_tables(boot)
-        ari_p, nmi_p = _ari_nmi_from_tables(C[None])
-        return float(ari_p[0]), float(nmi_p[0]), ari_b, nmi_b
-
-    def _leiden_at_k(ad, k, lo=0.002, hi=4.0, max_iter=30, seed=0):
-        """Bisect the Leiden resolution until the partition has k clusters, so that every
-        method is compared to the referee at matched cluster count (ARI is k-sensitive)."""
-        best = None
-        for _ in range(max_iter):
-            mid = (lo + hi) / 2
-            sc.tl.leiden(ad, resolution=mid, key_added='_k', random_state=seed)
-            n = ad.obs['_k'].nunique()
-            if best is None or abs(n - k) < abs(best[2] - k):
-                best = (np.asarray(ad.obs['_k']).copy(), mid, n)
-            if n == k:
-                break
-            lo, hi = (mid, hi) if n < k else (lo, mid)
-        return best
-
-    def _merged_ceiling(expert, ref_codes, ok, target_k, nref):
-        """Best agreement any coarsening of the expert labels to target_k groups reaches
-        against the referee, found by greedy pairwise merging. The referee is a heavily
-        transformed derivative of those same expert labels (SVG filter -> LR resource ->
-        spatial lag -> per-cell-type stratification -> NMF -> Leiden), so this is how well
-        the referee can be recovered by the annotation that generated it."""
-        grp = {c: {c} for c in pd.unique(expert[ok])}
-
-        def _score(mapping):
-            codes = pd.factorize(expert[ok].map(mapping))[0]
-            C = _contingency(codes, ref_codes, codes.max() + 1, nref).astype(float)
-            return float(_ari_nmi_from_tables(C[None])[0][0])
-
-        while len(grp) > target_k:
-            keys, best = list(grp), (-np.inf, None)
-            for i in range(len(keys)):
-                for j in range(i + 1, len(keys)):
-                    trial = dict(grp)
-                    trial[keys[i]] = trial[keys[i]] | trial.pop(keys[j])
-                    s = _score({lab: g for g, mem in trial.items() for lab in mem})
-                    if s > best[0]:
-                        best = (s, (keys[i], keys[j]))
-            a, b = best[1]
-            grp[a] = grp[a] | grp.pop(b)
-        m = {lab: g for g, mem in grp.items() for lab in mem}
-        codes = pd.factorize(expert[ok].map(m))[0]
-        C = _contingency(codes, ref_codes, codes.max() + 1, nref).astype(float)
-        a_, n_ = _ari_nmi_from_tables(C[None])
-        return float(a_[0]), float(n_[0])
-
-    def _hungarian_map(lab, ref_lab):
-        """Relabel a partition so its cluster ids match the referee's, for shared colours."""
-        lc, lu = pd.factorize(lab, sort=True)
-        rc, ru = pd.factorize(ref_lab, sort=True)
-        r, c = linear_sum_assignment(-_contingency(lc, rc, len(lu), len(ru)))
-        return {lu[i]: ru[j] for i, j in zip(r, c)}
-
-    def _draw_agreement_bar(ax, res_df, ceil_ari, referee_k, fs, tick_labels=None,
-                            rotation=30, ha='right', capsize=2.5, err_lw=0.9,
-                            legend_loc='upper right'):
-        """ARI/NMI against the Inflow-NMF referee, with bootstrap CIs and the expert
-        ceiling. Shared by the overview figure and the standalone composite panel, which
-        differ only in physical size and hence in type size and error-bar weight."""
-        x, w = np.arange(len(res_df)), 0.38
-        for off, key, color in ((-w / 2, 'ARI', '#66c2a5'), (w / 2, 'NMI', '#bbbbbb')):
-            ax.bar(x + off, res_df[key], w, color=color, label=key,
-                   yerr=[res_df[key] - res_df[f'{key}_lo'],
-                         res_df[f'{key}_hi'] - res_df[key]],
-                   capsize=capsize, error_kw=dict(lw=err_lw, ecolor='0.25'))
-        ax.axhline(ceil_ari, ls='--', lw=err_lw, color='#2a7f62')
-        ax.text(len(res_df) - 0.4, ceil_ari, 'expert ceiling ', fontsize=fs['annot'],
-                va='bottom', ha='right', color='#2a7f62')
-        ## headroom so the legend clears the tallest CI whisker instead of sitting on it
-        ax.set_ylim(0, max(res_df['NMI_hi'].max(), res_df['ARI_hi'].max(), ceil_ari) * 1.32)
-        ax.set_xlim(-0.6, len(res_df) - 0.4)
-        ax.set_xticks(x)
-        ax.set_xticklabels(res_df.index if tick_labels is None else tick_labels,
-                           rotation=rotation, ha=ha, fontsize=fs['tick'])
-        ax.set_ylabel(f'agreement with\nInflow-NMF (k={referee_k})', fontsize=fs['label'])
-        ax.tick_params(axis='y', labelsize=fs['tick'])
-        ax.legend(frameon=False, fontsize=fs['legend'], loc=legend_loc)
-        ax.spines[['top', 'right']].set_visible(False)
-        return ax
-
-    def plot_referee_agreement_panel(
-        res_df,
-        ceil_ari,
-        referee_k,
-        panel='c_referee_agreement',
-        save_dir=CIBB_PLS_FIGURES_DIR,
-        dpi=600,
-    ):
-        """Panel c of the assembled LIANA figure, at the size it is placed."""
-        ## drop the repeated 'MultiGATE ' prefix: the four full names do not fit across a
-        ## 1.6 in axes at any usable type size, upright or rotated, and panel d sits
-        ## directly below with the same four arms spelled out in its legend
-        labels = [m.replace('MultiGATE ', '') for m in res_df.index]
-        with plt.rc_context(PANEL_RC):
-            fig = panel_figure(panel)
-            ax = fig.add_axes([0.21, 0.115, 0.765, 0.855])
-            _draw_agreement_bar(ax, res_df, ceil_ari, referee_k, PANEL_FS,
-                                tick_labels=labels, rotation=0, ha='center',
-                                capsize=1.3, err_lw=0.55, legend_loc='upper left')
-            ax.yaxis.set_major_locator(mpl.ticker.MaxNLocator(nbins=5))
-            if panel is not None:
-                save_panel_svg(fig, panel, save_dir=save_dir, dpi=dpi)
         plt.show()
         return fig
 
-    def plot_source_referee_panels(
-        source_rna,
-        multivi_rna,
-        source_liana_results,
-        model_label='MultiGATE student',
-        expert_col='RNA_clusters',
-        seed=0,
-        n_boot=2000,
-        n_neighbors=10,
-        s_spatial=11.0,
-        s_umap=3.0,
-        s_missing=2.5,
-        save_name='liana_source_referee_panels',
-        save_dir=CIBB_PLS_FIGURES_DIR,
-        dpi=96,
-    ):
-        ## align MultiVI rows onto source_rna barcodes; all methods share the resulting spots
-        overlap = source_rna.obs_names.intersection(multivi_rna.obs_names)
-        if len(overlap) == 0:
-            assert multivi_rna.n_obs == source_rna.n_obs, (
-                f'no shared barcodes and shape mismatch: '
-                f'{multivi_rna.n_obs} vs {source_rna.n_obs}'
-            )
-            print('WARNING: no barcode overlap with MultiVI - falling back to positional alignment')
-            mv_full = np.asarray(multivi_rna.obsm['X_multivi'])
-            mask = np.ones(source_rna.n_obs, dtype=bool)
-        else:
-            pos = pd.Series(np.arange(multivi_rna.n_obs), index=multivi_rna.obs_names)
-            idx = pos.reindex(source_rna.obs_names)
-            mask = idx.notna().to_numpy()
-            mv_full = np.full(
-                (source_rna.n_obs, multivi_rna.obsm['X_multivi'].shape[1]), np.nan
-            )
-            mv_full[mask] = np.asarray(multivi_rna.obsm['X_multivi'])[
-                idx[mask].astype(int).to_numpy()
-            ]
-        print(f'MultiVI covers {mask.sum()} of {source_rna.n_obs} source spots '
-              f'(all methods restricted to these)')
-        obs_names = source_rna.obs_names[mask]
-
-        reps = {
-            'MultiGATE teacher': np.asarray(source_rna.obsm['MultiGATE_full_teacher'])[mask],
-            'MultiGATE student': np.asarray(source_rna.obsm['MultiGATE'])[mask],
-            'MultiGATE no-KD': np.asarray(source_rna.obsm['MultiGATE_nonspatial'])[mask],
-            'MultiVI': mv_full[mask],
-        }
-        for key, val in reps.items():
-            assert np.isfinite(val).all(), f'{key} has non-finite values after alignment'
-
-        xy = np.asarray(source_rna.obsm['spatial'])[mask]
-        expert = pd.Series(
-            np.asarray(source_rna.obs[expert_col])[mask].astype(str), index=obs_names
-        )
-
-        nmf_src = source_liana_results['nmf_spatial']
-        referee = pd.Series(
-            np.asarray(nmf_src.obs['leiden']).astype(object), index=nmf_src.obs_names
-        ).reindex(obs_names)
-        ok = referee.notna().to_numpy()
-        referee_k = referee.dropna().nunique()
-        ref_codes, ref_uniq = pd.factorize(referee[ok].astype(str), sort=True)
-        print(f'Inflow-NMF referee: {ok.sum()}/{len(obs_names)} spots, k={referee_k} '
-              f'(cells dropped by the keep_nmf filter have no referee label)')
-
-        ## referee's own graph UMAP, rebuilt at full referee coverage. nmf_spatial.obs
-        ## carries the NMF_W factor columns for every kept cell (joined before the
-        ## stratified subsample), so this avoids the 5000-cell subsampled UMAP.
-        factors = [str(c) for c in source_liana_results['nmf'].var_names]
-        factors = [c for c in factors if c in nmf_src.obs.columns]
-        if len(factors) >= 2:
-            W = nmf_src.obs.loc[obs_names[ok], factors].to_numpy(dtype=np.float64)
-            ad_ref = sc.AnnData(X=np.zeros((W.shape[0], 1), dtype=np.float32), obsm={'X_nmf': W})
-            ad_ref.obs_names = obs_names[ok]
-            sc.pp.neighbors(ad_ref, use_rep='X_nmf', metric='euclidean',
-                            n_neighbors=30, random_state=seed)
-            sc.tl.umap(ad_ref, min_dist=0.5, random_state=seed)
-            umap_ref = np.asarray(ad_ref.obsm['X_umap'])
-            print(f'Referee UMAP rebuilt from {len(factors)} NMF factors, {W.shape[0]} cells')
-        else:
-            sub = source_liana_results['nmf']
-            umap_ref = pd.DataFrame(
-                np.asarray(sub.obsm['X_umap']), index=sub.obs_names
-            ).reindex(obs_names[ok]).to_numpy()
-            print('WARNING: NMF factor columns absent from nmf_spatial.obs; '
-                  'falling back to the subsampled referee UMAP')
-
-        ## every embedding partitioned at the referee's own k
-        labels, meta, umap_model = {}, [], None
-        for name, Z in reps.items():
-            ad = sc.AnnData(X=np.zeros((len(Z), 1), dtype=np.float32), obsm={'X_emb': Z})
-            ad.obs_names = obs_names
-            sc.pp.neighbors(ad, use_rep='X_emb', n_neighbors=n_neighbors, random_state=seed)
-            lab, res, k_found = _leiden_at_k(ad, referee_k, seed=seed)
-            labels[name] = pd.Series(lab, index=obs_names)
-            meta.append({'method': name, 'resolution': round(res, 4), 'k': k_found})
-            if name == model_label:
-                sc.tl.umap(ad, min_dist=0.3, random_state=seed)
-                umap_model = np.asarray(ad.obsm['X_umap'])
-        meta_df = pd.DataFrame(meta).set_index('method')
-        print(meta_df)
-
-        ceil_ari, ceil_nmi = _merged_ceiling(expert, ref_codes, ok, referee_k, len(ref_uniq))
-        print(f'Expert ceiling ({expert_col} merged {expert.nunique()} -> {referee_k}): '
-              f'ARI={ceil_ari:.3f}, NMI={ceil_nmi:.3f}')
-
-        rows, boots = [], {}
-        for name, lab in labels.items():
-            codes = pd.factorize(lab[ok].astype(str), sort=True)[0]
-            ari, nmi, ari_b, nmi_b = _bootstrap_ari_nmi(
-                codes, ref_codes, codes.max() + 1, len(ref_uniq), n_boot=n_boot, seed=seed
-            )
-            boots[name] = (ari_b, nmi_b)
-            rows.append({
-                'method': name, 'ARI': ari, 'NMI': nmi,
-                'ARI_lo': np.percentile(ari_b, 2.5), 'ARI_hi': np.percentile(ari_b, 97.5),
-                'NMI_lo': np.percentile(nmi_b, 2.5), 'NMI_hi': np.percentile(nmi_b, 97.5),
-            })
-        res_df = pd.DataFrame(rows).set_index('method')
-        print(res_df.round(3))
-
-        ## paired over shared bootstrap replicates, so the referee's own noise cancels
-        delta = boots[model_label][0] - boots['MultiVI'][0]
-        print(f'{model_label} - MultiVI  dARI={delta.mean():.3f}  95% CI '
-              f'[{np.percentile(delta, 2.5):.3f}, {np.percentile(delta, 97.5):.3f}]  '
-              f'P(>0)={(delta > 0).mean():.3f}')
-
-        cmap = _hungarian_map(
-            labels[model_label][ok].astype(str).to_numpy(), referee[ok].astype(str).to_numpy()
-        )
-        model_lab = labels[model_label].astype(str).map(lambda v: cmap.get(v, v))
-
-        palette = {c: plt.get_cmap('tab10')(i) for i, c in enumerate(sorted(ref_uniq))}
-        grey = '#e8e8e8'
-
-        def _scatter(ax, coords, lab, size, size_missing):
-            lab = pd.Series(np.asarray(lab, dtype=object))
-            good = np.isfinite(coords).all(axis=1)
-            missing = pd.isna(lab).to_numpy() | ~good
-            if missing.any():
-                ## keep_nmf drop-outs go underneath, small, so the colours cover them
-                ax.scatter(coords[missing & good, 0], coords[missing & good, 1],
-                           s=size_missing, c=grey, lw=0, rasterized=True, zorder=1)
-            for c in sorted(ref_uniq):
-                m = (lab == c).to_numpy() & good
-                if m.any():
-                    ax.scatter(coords[m, 0], coords[m, 1], s=size, color=palette[c],
-                               lw=0, rasterized=True, zorder=2)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            for spine in ax.spines.values():
-                spine.set_linewidth(0.6)
-
-        fig = plt.figure(figsize=(12.6, 5.2))
-        outer = gridspec.GridSpec(1, 2, width_ratios=[3.0, 1.35], wspace=0.20, figure=fig)
-        inner = gridspec.GridSpecFromSubplotSpec(2, 3, subplot_spec=outer[0, 0],
-                                                 wspace=0.06, hspace=0.08)
-        axes = np.array([[fig.add_subplot(inner[r, c]) for c in range(3)] for r in range(2)])
-        ax_bar = fig.add_subplot(outer[0, 1])
-
-        spaces = [
-            ('spatial', xy, s_spatial, s_missing),
-            ('Inflow-NMF UMAP', umap_ref, s_umap, s_umap),
-            (f'{model_label} UMAP', umap_model, s_umap, s_umap),
-        ]
-        rowsets = [('Inflow-NMF\n(referee)', referee), (f'{model_label}\n(k={referee_k})', model_lab)]
-        for r, (row_name, lab) in enumerate(rowsets):
-            for c, (space_name, coords, size, size_missing) in enumerate(spaces):
-                sub_lab = lab[ok] if coords is umap_ref else lab
-                _scatter(axes[r, c], coords, sub_lab, size, size_missing)
-                if r == 0:
-                    axes[r, c].set_title(space_name, fontsize=8.5, pad=3)
-            axes[r, 0].set_ylabel(row_name, fontsize=8.5, labelpad=3)
-
-        _draw_agreement_bar(
-            ax_bar, res_df, ceil_ari, referee_k,
-            {'tick': 7.5, 'label': 8.0, 'legend': 7.5, 'annot': 6.5},
-        )
-
-        handles = [plt.Line2D([], [], marker='o', ls='', ms=5, color=palette[c])
-                   for c in sorted(ref_uniq)]
-        fig.legend(handles, [str(c) for c in sorted(ref_uniq)], ncol=len(ref_uniq),
-                   frameon=False, fontsize=7.5, loc='lower center',
-                   bbox_to_anchor=(0.38, -0.03), handletextpad=0.2, columnspacing=0.9)
-
-        if save_name is not None:
-            save_figure_svg(fig, os.path.join(save_dir, f'{save_name}.svg'), dpi=dpi)
-        plt.show()
-
-        ## same bars again, standalone and at the size panel c is placed in the assembled
-        ## figure -- the copy inside this overview lives on a 12.6 in canvas and would have
-        ## to be scaled down by ~6x to fit, which is what shrinks its type to nothing
-        fig_panel_c = plot_referee_agreement_panel(
-            res_df, ceil_ari, referee_k, save_dir=save_dir
-        )
-        return {'scores': res_df, 'partitions': meta_df,
-                'ceiling': {'ARI': ceil_ari, 'NMI': ceil_nmi},
-                'delta_vs_multivi': delta, 'referee_k': referee_k, 'fig': fig,
-                'fig_panel_c': fig_panel_c}
-
-    source_referee_results = plot_source_referee_panels(
-        source_rna, mdata.mod['rna'], source_liana_results
+    ## two variants: the MultiGATE-only lineup, and the same plus the MultiVI
+    ## baselines that are actually solving the transfer task
+    plot_scib_barplot(plotted_domains, "scib_metrics_barplot.svg")
+    plot_scib_barplot(
+        [d for d in plotted_domains if d not in multivi_domains],
+        "scib_metrics_barplot_no_multivi.svg",
     )
 
-    ## Align by barcode rather than by position. nmf has already dropped the cells the
-    ## keep_nmf filter removed and may have been stratified-subsampled, so positional
-    ## correspondence with adata is not guaranteed -- and np.corrcoef only rejects a row
-    ## *count* mismatch, never a row *order* one. A silent misalignment therefore does not
-    ## raise: it produces a correlation matrix at the noise floor (SD ~ 1/sqrt(n), so
-    ## ~0.014 at n=5000) that looks like a real, if weak, result.
-    shared = adata.obs_names.intersection(nmf.obs_names)
-    assert len(shared) > 0, 'adata and nmf share no barcodes'
-    assert not shared.has_duplicates, 'duplicate barcodes make the alignment ambiguous'
-    if len(shared) < min(adata.n_obs, nmf.n_obs):
-        print(f'WARNING: adata ({adata.n_obs}) and nmf ({nmf.n_obs}) overlap in only '
-              f'{len(shared)} barcodes; correlating on those')
-    x1 = np.asarray(adata[shared].obsm['MultiGATE_source_aligned'])
-    x2 = np.asarray(nmf[shared].X)
-    print(f'NMF-MultiGATE correlation on {len(shared)} aligned cells, '
-          f'{x1.shape[1]} dimensions x {x2.shape[1]} factors')
-    x1 = rankdata(x1, axis=0)
-    x2 = rankdata(x2, axis=0)
-    #x1 = np.argsort(x1, axis=0)
-    #x2 = np.argsort(x2, axis=0)
-    corrs = np.corrcoef(x1, x2, rowvar=False)
-    corrs = corrs[x1.shape[1]:, :x1.shape[1]]
-    ## guard against the failure above coming back by another route: a real association
-    ## sits far above the null, whose SD is ~1/sqrt(n-1)
-    null_sd = 1.0 / np.sqrt(len(shared) - 1)
-    if np.abs(corrs).max() < 5 * null_sd:
-        print(f'WARNING: max |rho| = {np.abs(corrs).max():.3f} against a null SD of '
-              f'{null_sd:.3f} -- the embedding and the NMF factors are at the noise '
-              f'floor, check that the two are really row-aligned')
-    corrs_df = pd.DataFrame(corrs, index=nmf.var_names.str.replace('Factor', 'NMF'))
-    topk=3
-    ## keep the topk factors most strongly associated with each MultiGATE dimension,
-    ## ranked by |rho| so that an anti-correlated factor counts as much as a correlated one
-    corrs_order = pd.Series(corrs_df.apply(lambda x: corrs_df.index[np.argsort(-np.abs(x))[:topk]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values.tolist()
-    corr_top = corrs_df.loc[corrs_order]
 
-    def plot_nmf_multigate_corr_panel(
-        corr_top,
-        panel='e_nmf_multigate_corr',
-        save_dir=CIBB_PLS_FIGURES_DIR,
-        dpi=600,
+#%% spatial structure metrics
+#
+# Three "absolute score per model" spatial metrics for the RNA-ATAC lineup:
+#   1. Niche recovery             -> predict each spot's neighbours' cluster
+#                                    composition (excluding self) from the
+#                                    joint embedding; report Spearman rho.
+#   2. Within-cluster coherence   -> inside each transcriptomic cluster,
+#                                    correlate embedding distance with physical
+#                                    distance (Spearman rho).
+#   3. Orthogonal-target recovery -> predict the held-out modality's (ATAC)
+#                                    spatial pattern from the RNA-only
+#                                    embedding; report Spearman rho.
+#
+# Scoring is on the SOURCE replicate: the teacher and no-distillation
+# (nonspatial) embeddings only exist there. Spatial-block cross-validation
+# holds out contiguous tissue, providing both the "held-out" signal and the
+# per-fold values used for bootstrap CIs and the paired significance test.
+# Coordinates are used only to build targets / CV blocks, never as model input.
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import KMeans
+from sklearn.linear_model import Ridge
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score
+from scipy.stats import spearmanr, wilcoxon
+
+_spatial_key = "spatial"
+n_spatial_blocks = 10
+niche_k = 15
+ssm_rng = np.random.default_rng(0)
+
+# --- reference geometry: source replicate (RNA coords / clusters) ---
+# RNA and ATAC are paired row-for-row, so the ATAC cluster labels align to
+# the same spots and are used alongside RNA clusters (both modalities define
+# the microenvironment and a "near-flat" partition for the coherence test).
+ref_obs_names = pd.Index(source_rna.obs_names)
+coords = np.asarray(source_rna.obsm[_spatial_key], dtype=float)
+n_ref = ref_obs_names.size
+
+def _codes_and_onehot(labels):
+    cat = pd.Series(np.asarray(labels)).astype("category")
+    return cat.cat.codes.to_numpy(), pd.get_dummies(cat).to_numpy().astype(float)
+
+rna_cluster_codes, rna_cluster_onehot = _codes_and_onehot(source_rna.obs["RNA_clusters"])
+atac_cluster_codes, atac_cluster_onehot = _codes_and_onehot(source_atac.obs["ATAC_clusters"])
+# partitions reused by the within-cluster coherence metric (pooled)
+cluster_partitions = [rna_cluster_codes, atac_cluster_codes]
+
+# contiguous spatial blocks (KMeans on coordinates) shared across all models
+block_labels = KMeans(
+    n_clusters=n_spatial_blocks, random_state=0, n_init=10
+).fit_predict(coords)
+
+def _to_pca(adata, n_comps=30):
+    """Top components of a modality (TruncatedSVD == PCA on centred input)."""
+    X = adata.X
+    if sp.issparse(X):
+        n = min(n_comps, X.shape[1] - 1)
+        return TruncatedSVD(n_components=n, random_state=0).fit_transform(X)
+    X = StandardScaler().fit_transform(np.asarray(X, dtype=float))
+    n = min(n_comps, X.shape[1] - 1)
+    return TruncatedSVD(n_components=n, random_state=0).fit_transform(X)
+
+def _standardize(X):
+    return StandardScaler().fit_transform(X)
+
+def _align_to_ref(rna_adata, atac_adata, key):
+    """Return (rna_emb, atac_emb, valid) aligned to ref_obs_names.
+
+    RNA is matched by obs_name; ATAC is taken at the SAME positional index
+    (RNA/ATAC are paired row-for-row, see FOSCTTM above).
+    """
+    if key not in rna_adata.obsm or key not in atac_adata.obsm:
+        return None
+    rna_e = np.asarray(rna_adata.obsm[key], dtype=float)
+    atac_e = np.asarray(atac_adata.obsm[key], dtype=float)
+    pos = pd.Index(rna_adata.obs_names).get_indexer(ref_obs_names)
+    valid = pos >= 0
+    if valid.mean() < 0.5:
+        warnings.warn(
+            "Embedding '{}' overlaps <50% of reference spots; skipping.".format(key)
+        )
+        return None
+    rna_al = np.full((n_ref, rna_e.shape[1]), np.nan)
+    atac_al = np.full((n_ref, atac_e.shape[1]), np.nan)
+    rna_al[valid] = rna_e[pos[valid]]
+    atac_al[valid] = atac_e[pos[valid]]
+    return rna_al, atac_al, valid
+
+# ── assemble the lineup ──────────────────────────────────────────────
+# each entry -> (rna_emb, atac_emb, valid); joint = concat([rna, atac]),
+# the RNA-only emb (for orthogonal-target) is the rna_emb.
+model_specs = [
+    ("teacher",    source_rna,        source_atac,        "MultiGATE_full_teacher"),
+    ("student",    source_rna,        source_atac,        "MultiGATE"),
+    ("nonspatial", source_rna,        source_atac,        "MultiGATE_nonspatial"),
+    ("multivi",    mdata.mod['rna'],  mdata.mod['atac'],  "X_multivi"),
+]
+
+# confirm that the multivi embeddings are the same as the rna and atac embeddings, not the joint embedding from mdata.obsm['X_multivi']
+assert (mdata.mod['rna'].obsm['X_multivi'] == mdata.mod['rna'].obsm['X_multivi_rna']).all()
+assert (mdata.mod['atac'].obsm['X_multivi'] == mdata.mod['atac'].obsm['X_multivi_atac']).all()
+assert not (mdata.mod['rna'].obsm['X_multivi'] == mdata.mod['atac'].obsm['X_multivi']).any()
+
+lineup = {}
+for name, rna_ad, atac_ad, key in model_specs:
+    aligned = _align_to_ref(rna_ad, atac_ad, key)
+    if aligned is None:
+        warnings.warn("Lineup model '{}' unavailable; skipping.".format(name))
+        continue
+    rna_al, atac_al, valid = aligned
+    lineup[name] = {
+        "rna": rna_al,
+        "joint": np.concatenate([rna_al, atac_al], axis=1),
+        "valid": valid,
+    }
+
+# raw-feature floor: PCA of each modality (RNA-only = RNA PCA, joint = concat)
+rna_pca = _to_pca(source_rna, 30)
+atac_pca = _to_pca(source_atac, 30)
+lineup["pca"] = {
+    "rna": rna_pca,
+    "joint": np.concatenate([rna_pca, atac_pca], axis=1),
+    "valid": np.ones(n_ref, dtype=bool),
+}
+
+# standardize embeddings so distances / ridge are comparable across models
+for name in lineup:
+    v = lineup[name]["valid"]
+    for k in ("rna", "joint"):
+        X = lineup[name][k]
+        Xs = np.full_like(X, np.nan)
+        Xs[v] = _standardize(X[v])
+        lineup[name][k] = Xs
+
+def _sample_pairs(idx, max_pairs, rng):
+    """Random unordered index pairs drawn from `idx`."""
+    m = idx.size
+    n_pairs = min(max_pairs, m * (m - 1) // 2)
+    a = rng.integers(0, m, size=n_pairs)
+    b = rng.integers(0, m, size=n_pairs)
+    keep = a != b
+    return idx[a[keep]], idx[b[keep]]
+
+# ── per-fold metric computations (one scalar per spatial block) ──────
+def _r2_vw(y_true, y_pred):
+    # variance_weighted avoids near-constant output columns (e.g. a cluster
+    # nearly absent from a held-out block) dominating the score.
+    return float(r2_score(y_true, y_pred, multioutput="variance_weighted"))
+
+def _mean_spearman(y_true, y_pred):
+    """Mean over output columns of Spearman(pred, true); robust to the
+    scale/mean shift that drives R^2 negative under spatial-block CV."""
+    rhos = []
+    for j in range(y_true.shape[1]):
+        rho, _ = spearmanr(y_true[:, j], y_pred[:, j])
+        if np.isfinite(rho):
+            rhos.append(rho)
+    return float(np.mean(rhos)) if rhos else np.nan
+
+def _cv_predict_per_block(X, Y, valid, scorer):
+    """Ridge predict Y from X holding out one spatial block at a time;
+    return {block: scorer(y_true, y_pred)}."""
+    out = {}
+    for b in np.unique(block_labels):
+        test = (block_labels == b) & valid
+        train = (block_labels != b) & valid
+        if test.sum() < 5 or train.sum() < 20:
+            continue
+        scaler = StandardScaler().fit(X[train])
+        ridge = Ridge(alpha=1.0).fit(scaler.transform(X[train]), Y[train])
+        pred = ridge.predict(scaler.transform(X[test]))
+        out[b] = scorer(Y[test], pred)
+    return out
+
+def _coherence_per_block(Xjoint, valid, coords_for_dist):
+    """Within-cluster Spearman(embedding dist, physical dist), per block,
+    pooled over both the RNA and ATAC cluster partitions."""
+    out = {}
+    for b in np.unique(block_labels):
+        mask = (block_labels == b) & valid
+        idx = np.where(mask)[0]
+        if idx.size < 30:
+            continue
+        rhos, weights = [], []
+        for codes in cluster_partitions:
+            for c in np.unique(codes[idx]):
+                ci = idx[codes[idx] == c]
+                if ci.size < 8:
+                    continue
+                pa, pb = _sample_pairs(ci, max_pairs=2000, rng=ssm_rng)
+                if pa.size < 10:
+                    continue
+                ed = np.linalg.norm(Xjoint[pa] - Xjoint[pb], axis=1)
+                pdist = np.linalg.norm(coords_for_dist[pa] - coords_for_dist[pb], axis=1)
+                rho, _ = spearmanr(ed, pdist)
+                if np.isfinite(rho):
+                    rhos.append(rho)
+                    weights.append(ci.size)
+        if rhos:
+            out[b] = float(np.average(rhos, weights=weights))
+    return out
+
+def _build_targets(coords_for_targets):
+    """Niche (neighbour cluster composition) and orthogonal (neighbour-
+    averaged ATAC PCA) targets for the given coordinate set."""
+    nn = NearestNeighbors(n_neighbors=niche_k + 1).fit(coords_for_targets)
+    nbr = nn.kneighbors(coords_for_targets, return_distance=False)[:, 1:]
+    # neighbour composition over BOTH modalities' clusters (joint niche)
+    y_niche = np.concatenate(
+        [rna_cluster_onehot[nbr].mean(axis=1), atac_cluster_onehot[nbr].mean(axis=1)],
+        axis=1,
+    )
+    y_orth = _standardize(atac_pca[nbr].mean(axis=1))
+    return y_niche, y_orth
+
+def _score_lineup(coords_for_dist, coords_for_targets, tag):
+    """Compute the three per-fold metrics for every model in the lineup."""
+    y_niche, y_orth = _build_targets(coords_for_targets)
+    rows = []
+    for name, d in lineup.items():
+        valid = d["valid"]
+        niche = _cv_predict_per_block(d["joint"], y_niche, valid, _mean_spearman)
+        orth = _cv_predict_per_block(d["rna"], y_orth, valid, _mean_spearman)
+        coher = _coherence_per_block(d["joint"], valid, coords_for_dist)
+        for metric, per_block in (
+            ("niche_recovery_r2", niche),
+            ("orthogonal_target_spearman", orth),
+            ("within_cluster_coherence", coher),
+        ):
+            for fold, value in per_block.items():
+                rows.append(
+                    {"setting": tag, "model": name, "metric": metric,
+                        "fold": int(fold), "value": value}
+                )
+    return pd.DataFrame(rows)
+
+# real scores + coordinate-permutation control (scoring-side shuffle)
+perm = ssm_rng.permutation(n_ref)
+spatial_metrics_df = pd.concat(
+    [
+        _score_lineup(coords, coords, tag="real"),
+        _score_lineup(coords[perm], coords[perm], tag="coord_permuted"),
+    ],
+    ignore_index=True,
+)
+# NOTE: the teacher-graph-shuffle control requires retraining the student
+# with a permuted teacher graph and is run upstream, not in this scoring cell.
+
+# ── absolute scores (mean over folds) + bootstrap 95% CI ─────────────
+def _bootstrap_ci(values, n_boot=2000, alpha=0.05):
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return (np.nan, np.nan)
+    boot = ssm_rng.choice(values, size=(n_boot, values.size), replace=True).mean(axis=1)
+    return (float(np.quantile(boot, alpha / 2)), float(np.quantile(boot, 1 - alpha / 2)))
+
+summary_rows = []
+for (setting, model, metric), grp in spatial_metrics_df.groupby(["setting", "model", "metric"]):
+    lo, hi = _bootstrap_ci(grp["value"].to_numpy())
+    summary_rows.append(
+        {"setting": setting, "model": model, "metric": metric,
+            "mean": float(grp["value"].mean()), "ci_lo": lo, "ci_hi": hi,
+            "n_folds": int(grp.shape[0])}
+    )
+spatial_metrics_summary_df = pd.DataFrame(summary_rows)
+print("\n[spatial structure metrics] absolute scores (mean over folds):")
+print(
+    spatial_metrics_summary_df[spatial_metrics_summary_df["setting"] == "real"]
+    .pivot(index="model", columns="metric", values="mean")
+    .round(3)
+    .to_string()
+)
+print("\n[spatial structure metrics] coordinate-permutation control (should be ~chance):")
+print(
+    spatial_metrics_summary_df[spatial_metrics_summary_df["setting"] == "coord_permuted"]
+    .pivot(index="model", columns="metric", values="mean")
+    .round(3)
+    .to_string()
+)
+
+# ── paired significance test: student vs nonspatial (across folds) ───
+sig_rows = []
+real_df = spatial_metrics_df[spatial_metrics_df["setting"] == "real"]
+if {"student", "nonspatial"}.issubset(set(real_df["model"])):
+    for metric in real_df["metric"].unique():
+        a = real_df[(real_df["model"] == "student") & (real_df["metric"] == metric)]
+        b = real_df[(real_df["model"] == "nonspatial") & (real_df["metric"] == metric)]
+        merged = a.merge(b, on="fold", suffixes=("_student", "_nonspatial"))
+        if merged.shape[0] >= 3:
+            diff = merged["value_student"] - merged["value_nonspatial"]
+            try:
+                stat, p = wilcoxon(diff)
+            except ValueError:
+                stat, p = np.nan, np.nan
+            sig_rows.append(
+                {"metric": metric, "n_folds": int(merged.shape[0]),
+                    "mean_diff_student_minus_nonspatial": float(diff.mean()),
+                    "wilcoxon_p": float(p)}
+            )
+spatial_metrics_sig_df = pd.DataFrame(sig_rows)
+if not spatial_metrics_sig_df.empty:
+    print("\n[spatial structure metrics] student vs nonspatial (paired over folds):")
+    print(spatial_metrics_sig_df.round(4).to_string(index=False))
+
+# ── figure: absolute scores per model per metric (CI over folds) ─────
+_metric_titles = {
+    "niche_recovery_r2": "Niche recovery",
+    "within_cluster_coherence": "Within-cluster coherence",
+    "orthogonal_target_spearman": "Orthogonal-target recovery",
+}
+_metric_order = ["niche_recovery_r2", "within_cluster_coherence", "orthogonal_target_spearman"]
+_model_order = [m for m in ["teacher", "student", "nonspatial", "multivi", "pca"]
+                if m in set(real_df["model"])]
+g = sns.catplot(
+    data=real_df, x="model", y="value", col="metric",
+    order=_model_order,
+    col_order=_metric_order,
+    kind="bar", palette="Set2", height=4, aspect=0.8,
+    errorbar=("ci", 95), capsize=0.15, sharey=False,
+)
+for ax, metric in zip(g.axes.flat, _metric_order):
+    ax.set_title(_metric_titles.get(metric, metric))
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.axhline(0.0, color="#999999", lw=0.8, ls="--")
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
+    for patch in ax.patches:
+        patch.set_edgecolor("#cccccc")
+        patch.set_linewidth(1)
+g.fig.set_size_inches(10, 4)
+plt.tight_layout()
+save_figure_pdf_vector_raster(
+    plt.gcf(),
+    os.path.join(
+        "/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures",
+        "spatial_structure_metrics_barplot.pdf",
+    ),
+)
+ax = g.axes.flat[0]
+ax.set_ylabel('Correlation coefficient ($\\rho$)')
+plt.show()
+
+#%% LIANA+ inflow analysis
+import plotnine as p9
+import gc
+from sklearn.model_selection import StratifiedShuffleSplit
+
+def make_full_spatial_nmf_plot_adata(nmf, full_adata, spatial_key="spatial", preserve_obs_cols=None):
+    nmf_scores = nmf.X.toarray() if sp.issparse(nmf.X) else np.asarray(nmf.X)
+    nmf_scores_df = pd.DataFrame(
+        nmf_scores,
+        index=nmf.obs_names,
+        columns=nmf.var_names,
+    )
+
+    full_obs = full_adata.obs.copy()
+    overlapping_score_cols = full_obs.columns.intersection(nmf_scores_df.columns)
+    if len(overlapping_score_cols) > 0:
+        full_obs = full_obs.drop(columns=overlapping_score_cols)
+    full_obs = full_obs.join(nmf_scores_df, how='left')
+
+    preserve_obs_cols = set(preserve_obs_cols or [])
+    for col in nmf.obs.columns:
+        if col in preserve_obs_cols and col in full_obs.columns:
+            continue
+        full_obs[col] = nmf.obs[col].reindex(full_obs.index)
+
+    return sc.AnnData(
+        X=np.zeros((full_adata.n_obs, 1)),
+        obs=full_obs,
+        obsm={spatial_key: full_adata.obsm[spatial_key].copy()},
+    )
+
+def liana_spatial_analysis(
+    adata,
+    subsample_n=5000,
+    resource=None,
+    spatial_key="spatial",
+    cell_type_col="RNA_clusters",
+    labels=["R2", "R4", "R7"], interaction=None, ncomps=30, bandwidth=40, s=60
     ):
-        """Panel e of the assembled LIANA figure, at the size it is placed.
+    """
+    Performs LIANA+ inflow and associated spatial ligand-receptor analyses on `source_rna` AnnData object.
 
-        Replaces the seaborn clustermap: the clustermap's dendrograms are dropped at
-        assembly anyway, and its own layout manager fixes the tick/colorbar placement,
-        which is what forced the panel to be rescaled by hand. Here the ordering is
-        computed with the same average-linkage clustering, and the axes rectangles are
-        set explicitly so the panel lands at its declared size.
-        """
+    Parameters:
+        source_rna: AnnData
+            Source RNA AnnData object with spatial information.
+        source_rna_emb: np.ndarray
+            Embedding array for reference for GW distance computation.
+        labels: list
+            Labels for feature_by_group (cell types).
+        interaction: str
+            Ligand-receptor interaction string to visualize, e.g., 'R1^Mdk^Alk'.
+        ncomps: int
+            Number of NMF components for factorization.
+        bandwidth: int
+            Bandwidth for spatial neighbors.
+        s: int
+            Dot size for spatial plots.
+        cell_type_col: str
+            Column in .obs with cell type/cluster labels.
+        spatial_key: str
+            Key in .obsm for spatial coordinates.
+    Returns:
+        dict of intermediate outputs (optional).
+    """
+
+    sc.pl.embedding(adata, basis=spatial_key, color=[cell_type_col], wspace=0.4, s=s)
+
+    plot, df = li.ut.query_bandwidth(
+        coordinates=adata.obsm[spatial_key],
+        start=5,         
+        end=60,           
+        interval_n=40    
+    )
+    plot + p9.scale_y_continuous(breaks=range(int(df.neighbours.min()), int(df.neighbours.max())+1))
+
+    li.ut.spatial_neighbors(adata=adata, bandwidth=bandwidth, spatial_key=spatial_key)
+    li.pl.connectivity(adata, idx=5500, size=1, figure_size=(6, 5), spatial_key=spatial_key)
+
+    sq.gr.spatial_autocorr(adata, mode='moran', use_raw=False, show_progress_bar=True)
+    svgs = adata.uns['moranI'].index[(adata.uns['moranI']['pval_norm_fdr_bh'] < 0.05) & (adata.uns['moranI']['I'] > 0.01)]
+    adata = adata[:, svgs]
+    print(f"Number of spatially variable genes: {len(svgs)}")
+
+    map_df = pd.read_csv(os.path.join(os.environ.get('DATAPATH'), 'gene_annotations', 'human_mouse_gene_orthologs.csv')) 
+    map_df = map_df.rename(columns={"Gene name": "source", "Mouse gene name": "target"})
+    map_df = map_df.drop(columns=["Gene stable ID", "Mouse gene stable ID"])
+
+    if resource is None:
+        resource = li.rs.select_resource('mouseconsensus') # NOTE: mouse_consensus could be used in future
+        '''
+        resource = li.rs.translate_resource(
+            resource,
+            map_df=map_df,
+            columns=['ligand', 'receptor'],
+            replace=True,
+            one_to_many=2,
+        )
+        '''
+
+    lrdata = li.mt.inflow(
+        adata,
+        groupby=cell_type_col,
+        resource=resource,
+        use_raw=False,
+    )
+
+    fused_I = None
+    if interaction is not None:
+
+        sq.gr.spatial_autocorr(lrdata, mode='moran', use_raw=False)
+        svis = lrdata.uns['moranI'].index[(lrdata.uns['moranI']['pval_norm_fdr_bh'] <= 0.05) & (lrdata.uns['moranI']['I'] > 0.01)]
+        print(f"Number of spatially variable ligand-receptor interactions: {len(svis)}")
+        lrdata = lrdata[:, svis]
+        lrdata.uns['moranI'].sort_values("I").tail(30)
+
+        try:
+            ligands = lrdata.var_names.str.split("^").str[1]
+            receptors = lrdata.var_names.str.split("^").str[2]
+            fused_I = adata.uns['moranI'].loc[ligands, 'I'].values * adata.uns['moranI'].loc[receptors, 'I'].values
+            print(lrdata.var_names[np.flip(fused_I.argsort())])
+        except:
+            fused_I = None
+
+        comp = interaction.split("^")
+
+        sc.pl.embedding(
+            lrdata,
+            basis=spatial_key,
+            color=interaction,
+            s=s,
+            ncols=2,
+        )
+
+        sc.pl.embedding(
+            adata,
+            basis=spatial_key,
+            color=[comp[1], comp[2]],
+            s=s,
+            use_raw=False,
+            ncols=2,
+        )
+
+        fig, ax = plt.subplots(figsize=(14, 5)) 
+        sc.pl.violin(lrdata, groupby=cell_type_col, keys=interaction, size=0.5, rotation=90, ax=ax)
+        plt.tight_layout()
+        plt.show()
+
+        li.pl.feature_by_group(
+            adata=lrdata,
+            spatial_key=spatial_key,
+            feature=interaction,
+            groupby=cell_type_col,
+            percentile_scaling=(1,97),
+            labels=labels,
+            show_counts=False,
+            normalize=True,
+            figure_size=(10,8),
+        )
+        ## stopped at "Global Summaries"
+
+    ## NMF
+    li.multi.nmf(lrdata, n_components=ncomps, inplace=True, random_state=0, max_iter=200, verbose=True)
+    lr_loadings = li.ut.get_variable_loadings(lrdata, varm_key='NMF_H').set_index('index')
+    factor_scores = li.ut.get_factor_scores(lrdata, obsm_key='NMF_W')
+
+    X_nmf = lrdata.obsm['NMF_W']
+    keep_nmf = X_nmf.sum(axis=1) > 0
+    lrdata_nmf = lrdata[keep_nmf].copy()
+    nmf = sc.AnnData(X=lrdata_nmf.obsm['NMF_W'],
+                    obs=lrdata_nmf.obs,
+                    var=pd.DataFrame(index=lr_loadings.columns),
+                    uns=lrdata.uns,
+                    obsm=lrdata_nmf.obsm)
+    lr_loadings.head(10)
+
+    sc.pp.neighbors(nmf, use_rep='X', metric='euclidean', n_neighbors=30)
+    sc.tl.leiden(nmf, resolution=0.1)
+    sc.tl.umap(nmf, min_dist=0.5)
+    sc.pl.umap(nmf, color=[cell_type_col, 'leiden'], size=25, ncols=2)
+
+    nmf_spatial = make_full_spatial_nmf_plot_adata(
+        nmf,
+        adata,
+        spatial_key=spatial_key,
+        preserve_obs_cols=[cell_type_col],
+    )
+    sc.pl.embedding(
+        nmf_spatial,
+        basis=spatial_key,
+        color=[cell_type_col, 'leiden'],
+        size=s,
+        ncols=2,
+        na_color='darkgray',
+    )
+
+    stratified_subsample_applied = False
+    if subsample_n is not None and subsample_n < nmf.n_obs:
+        y = nmf.obs[cell_type_col].astype(str).to_numpy()
+        try:
+            sss = StratifiedShuffleSplit(
+                n_splits=1, train_size=subsample_n, random_state=0
+            )
+            train_idx, _ = next(sss.split(np.zeros((nmf.n_obs, 1)), y))
+        except ValueError:
+            # Too few cells per class (or similar) for stratified split.
+            train_idx = np.random.default_rng(0).choice(
+                nmf.n_obs, size=subsample_n, replace=False
+            )
+        chosen = nmf.obs_names[train_idx].tolist()
+        nmf = nmf[chosen].copy()
+        adata = adata[chosen].copy()
+        stratified_subsample_applied = True
+
+    '''
+    ## GW distance
+    X_nmf = nmf.X
+    if stratified_subsample_applied:
+        X_source = np.asarray(adata.obsm["MultiGATE"])
+    else:
+        X_source = adata.obsm["MultiGATE"][keep_nmf]
+    C_nmf = ot.utils.dist(X_nmf, metric='euclidean')
+    C_source = ot.utils.dist(X_source, metric='euclidean')
+    C_nmf = torch.from_numpy(C_nmf / C_nmf.max()).to('cuda:2', dtype=torch.float64)
+    C_source = torch.from_numpy(C_source / C_source.max()).to('cuda:2', dtype=torch.float64)
+    gw_distance = ot.gromov.entropic_gromov_wasserstein2(C_nmf, C_source, eps=1e-2)
+    #gw_distance = ot.gaussian.gaussian_gromov_wasserstein_distance(C_nmf, C_source, log=True)[0]
+    gw_distance = 0.5 * gw_distance.sqrt().item()
+
+    del C_nmf, C_source
+    torch.cuda.empty_cache()
+    gc.collect()
+    '''
+
+    # Return a dictionary of useful results, or could just not return if only for plotting side-effects
+    return {
+        "adata": adata,
+        "lrdata": lrdata,
+        "nmf": nmf,
+        "nmf_spatial": nmf_spatial,
+        "fused_I": fused_I,
+        "svgs": svgs,
+        "lr_loadings": lr_loadings,
+        "factor_scores": factor_scores
+    }
+
+'''
+## map ATAC peaks to genes
+gpnet = source_atac.uns['gene_peak_Net'].copy()
+gpmap = gpnet.groupby("Gene", sort=True)["Peak"].unique()
+missing_genes = set(source_rna.var_names) - set(gpmap.index)
+gene_names = pd.Index(gpmap.index).intersection(source_rna.var_names, sort=False)
+
+gp_distances = pd.pivot(gpnet, index='Gene', columns='Peak', values='Distance').fillna(np.inf)
+for gene in missing_genes:
+    gp_distances.loc[gene] = np.inf
+gp_distances = gp_distances.loc[source_rna.var_names, source_atac.var_names]
+gp_weights = 1 / (gp_distances + 1)
+
+gp_pairs = gpmap.loc[gene_names].explode().reset_index().rename(columns={"index": "Gene"})
+peak_indexer = source_atac.var_names.get_indexer(gp_pairs["Peak"])
+missing_peak_mask = peak_indexer < 0
+if missing_peak_mask.any():
+    missing_peaks = gp_pairs.loc[missing_peak_mask, "Peak"].unique()
+    raise KeyError(
+        "gene_peak_Net contains peaks not present in source_atac.var_names: "
+        f"{missing_peaks[:10].tolist()}"
+    )
+
+gene_indexer = gene_names.get_indexer(gp_pairs["Gene"])
+weight_row_indexer = source_rna.var_names.get_indexer(gp_pairs["Gene"])
+edge_weights = gp_weights.to_numpy()[weight_row_indexer, peak_indexer].astype(
+    np.float32,
+    copy=False,
+)
+
+peak_to_gene = sp.coo_matrix(
+    (edge_weights, (peak_indexer, gene_indexer)),
+    shape=(source_atac.n_vars, gene_names.size),
+).tocsc()
+
+atac_matrix = source_atac.X.tocsr() if sp.issparse(source_atac.X) else np.asarray(source_atac.X)
+n_jobs = min(os.cpu_count() or 1, gene_names.size)
+chunk_size = max(1, (gene_names.size + n_jobs - 1) // n_jobs)
+chunk_bounds = [
+    (start, min(start + chunk_size, gene_names.size))
+    for start in range(0, gene_names.size, chunk_size)
+]
+
+def _score_gene_chunk(start: int, stop: int) -> np.ndarray:
+    peak_to_gene_chunk = peak_to_gene[:, start:stop]
+    if sp.issparse(atac_matrix):
+        chunk_scores = atac_matrix @ peak_to_gene_chunk
+        return chunk_scores.toarray()
+    return np.asarray(atac_matrix @ peak_to_gene_chunk.toarray())
+
+gp_score_chunks = Parallel(n_jobs=n_jobs, prefer="threads")(
+    delayed(_score_gene_chunk)(start, stop) for start, stop in chunk_bounds
+)
+gp_scores = pd.DataFrame(
+    np.concatenate(gp_score_chunks, axis=1),
+    index=source_rna.obs_names,
+    columns=gene_names,
+)
+
+for missing_gene in missing_genes:
+    gp_scores[missing_gene] = np.nan
+
+gp_scores = gp_scores.loc[:, source_rna.var_names]
+
+assert gp_scores.index.equals(source_rna.obs_names)
+assert gp_scores.columns.equals(source_rna.var_names)
+
+from scipy.sparse import csr_matrix
+source_rna.layers['fusion_scores'] = \
+    csr_matrix(gp_scores.values.astype(source_rna.X.dtype)).multiply(
+    source_rna.X
+)
+
+source_fusion = source_rna.copy()
+source_fusion.X = source_fusion.layers['fusion_scores'].copy()
+del source_rna.layers['fusion_scores']
+'''
+
+## format combined_gp_dict to adapt to LIANA+
+resource = li.rs.select_resource('mouseconsensus')
+
+## ingest RNA_cluster assign RNA_clusters to target_rna
+print("Ingesting RNA_clusters to target_rna...")
+sc.tl.ingest(target_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters', inplace=True)
+print("RNA_clusters ingested to target_rna")
+
+ingested_rna_clusters = target_concat_adata.obs.loc[
+    target_concat_adata.obs['modality'].eq('rna'), 'RNA_clusters'
+]
+ingested_rna_clusters.index = ingested_rna_clusters.index.str.replace('_rna', '')
+target_rna.obs['RNA_clusters'] = ingested_rna_clusters
+
+## set SCT_data as default assay
+source_rna_liana = source_rna.copy()
+source_rna_liana.X = source_rna_liana.layers['SCT_data'].copy()
+target_rna_liana = target_rna.copy()
+target_rna_liana.X = target_rna_liana.layers['SCT_data'].copy()
+
+## LIANA+ inflow analysis
+source_liana_results = liana_spatial_analysis(
+    source_rna_liana,
+    subsample_n=5000,
+    resource=resource,
+    labels=None, interaction=None, ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
+    )
+
+'''
+target_liana_results = liana_spatial_analysis(
+    target_rna_liana,
+    subsample_n=5000,
+    resource=resource,
+    labels=None, interaction=None, ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
+    )
+'''
+
+## LIANA-MultiGATE heatmaps
+from scipy.stats import rankdata
+adata = source_liana_results['adata'].copy()
+nmf = source_liana_results['nmf'].copy()
+nmf_spatial = source_liana_results['nmf_spatial'].copy()
+
+## Held-out spatial reconstruction: the primary ground-truth spatial claim.
+## Hide half the source spots, match each hidden spot to its nearest retained spot in
+## embedding space, and inherit that neighbour's real coordinates as the prediction --
+## 1-NN regression on position, with the matching done in a space holding no coordinates.
+## Only source_rna.obsm['spatial'] and the embeddings enter: no imputed target
+## coordinates, no ingested labels, no OT, no Inflow-NMF, so nothing being compared was
+## produced by the models under test.
+## Caveat for the caption: the split is held out at evaluation time, not training time,
+## so this shows position is recoverable from the embedding, not that the model
+## generalises to unseen tissue. The teacher sees the spatial graph and is a scale
+## reference, not a competitor; the no-KD ablation is the control that isolates
+## distillation (same architecture, same data, no teacher).
+def plot_heldout_spatial_reconstruction(
+    source_rna,
+    multivi_rna,
+    n_splits=5,
+    seed=0,
+    pitch_ref=2.0,
+    panel='d_heldout_cdf',
+    save_dir=CIBB_PLS_FIGURES_DIR,
+    show_summary_table=False,
+    dpi=600,
+):
+    from sklearn.neighbors import NearestNeighbors
+
+    rng = np.random.default_rng(seed)
+
+    ## restrict to spots every method covers, so the arms are comparable
+    pos = pd.Series(
+        np.arange(multivi_rna.n_obs), index=multivi_rna.obs_names
+    ).reindex(source_rna.obs_names)
+    mask = pos.notna().to_numpy()
+    xy = np.asarray(source_rna.obsm['spatial'])[mask]
+    ## NearestNeighbors.kneighbors returns (distances, indices) in that order
+    d_nn, _ = NearestNeighbors(n_neighbors=2).fit(xy).kneighbors(xy)
+    pitch = float(np.median(d_nn[:, 1]))
+    print(f'held-out reconstruction: {mask.sum()} spots, pitch {pitch:.1f} units')
+
+    arms = {
+        'MultiGATE teacher (spatial graph)': (
+            np.asarray(source_rna.obsm['MultiGATE_full_teacher'])[mask],
+            '#00441b', 1.4, '--'),
+        'MultiGATE student (identity graph)': (
+            np.asarray(source_rna.obsm['MultiGATE'])[mask], '#1b7837', 2.4, '-'),
+        'MultiGATE no-KD ablation': (
+            np.asarray(source_rna.obsm['MultiGATE_nonspatial'])[mask], '#a6dba0', 1.4, '-'),
+        'MultiVI': (
+            np.asarray(multivi_rna.obsm['X_multivi'])[pos[mask].astype(int).to_numpy()],
+            '#762a83', 2.4, '-'),
+    }
+    for name, (Z, *_rest) in arms.items():
+        assert np.isfinite(Z).all(), f'{name} has non-finite values'
+
+    def _heldout_error(Z):
+        out = []
+        for r in range(n_splits):
+            perm = np.random.default_rng(seed + r).permutation(len(Z))
+            ref, qry = perm[: len(perm) // 2], perm[len(perm) // 2:]
+            _, i = NearestNeighbors(n_neighbors=1).fit(Z[ref]).kneighbors(Z[qry])
+            out.append(np.linalg.norm(xy[ref[i[:, 0]]] - xy[qry], axis=1) / pitch)
+        return np.concatenate(out)
+
+    curves = {name: _heldout_error(Z) for name, (Z, *_rest) in arms.items()}
+    n_q = len(next(iter(curves.values())))
+    ## floor: guess a random spot rather than the embedding's nearest neighbour
+    curves['random floor'] = np.linalg.norm(
+        xy[rng.integers(0, len(xy), n_q)] - xy[rng.integers(0, len(xy), n_q)], axis=1
+    ) / pitch
+    arms['random floor'] = (None, '#999999', 1.4, ':')
+
+    ## legend keys are kept long for the printed summary, short on the panel: at the
+    ## size this panel is placed, the full arm names would take half the axes width.
+    short = {'MultiGATE teacher (spatial graph)': 'MultiGATE teacher',
+                'MultiGATE student (identity graph)': 'MultiGATE student',
+                'MultiGATE no-KD ablation': 'MultiGATE no-KD',
+                'MultiVI': 'MultiVI', 'random floor': 'random floor'}
+
+    with plt.rc_context(PANEL_RC):
+        fig = panel_figure(panel)
+        ## explicit rectangle rather than tight_layout: the panel has to keep the
+        ## figsize it declares, since that is what makes it drop into the assembled
+        ## figure at 100% next to the other panels. The left and right edges match
+        ## panel c's, which stacks directly above it, so the two plot boxes line up.
+        ax = fig.add_axes([0.21, 0.155, 0.765, 0.825])
+
+        rows = []
+        for name, (_Z, color, lw, ls) in arms.items():
+            v = np.sort(curves[name])
+            frac = np.arange(1, len(v) + 1) / len(v)
+            ax.plot(v, frac, lw=lw * 0.62, ls=ls, color=color, label=short[name],
+                    zorder=3)
+            within, med = float((v <= pitch_ref).mean()), float(np.median(v))
+            ## mark where each curve crosses the two reference lines
+            ax.plot([pitch_ref, med], [within, 0.5], ls='none', marker='o', ms=2.4,
+                    color=color, mec='w', mew=0.4, zorder=5)
+            rows.append({'method': name, 'median_err': med,
+                            f'within_{pitch_ref:g}_pitch': within})
+        summary = pd.DataFrame(rows).set_index('method')
+
+        ## log scale and limits first: a text artist anchored at a linear-scale xlim
+        ## would sit at a negative x, which a log axis cannot represent, and autoscale
+        ## then blows the range out to a blank, extremely wide plot
+        ax.set_xscale('log')
+        ## exact hits give an error of 0, which a log axis cannot take as a limit
+        lo = min((v[v > 0].min() for v in curves.values() if (v > 0).any()), default=1.0)
+        ax.set_xlim(lo * 0.9, max(v.max() for v in curves.values()) * 1.1)
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
+
+        ax.axvline(pitch_ref, ls=':', lw=0.6, color='0.35', zorder=1)
+        ## both reference labels go into the bottom-left wedge, the only region of a
+        ## CDF panel this size that no curve and not the legend passes through;
+        ## x in data coords, y in axes fraction
+        ax.text(pitch_ref, 0.015, f' ≤{pitch_ref:g} sp',
+                transform=ax.get_xaxis_transform(),
+                fontsize=PANEL_FS['annot'], color='0.35', va='bottom', ha='left')
+        ax.axhline(0.5, ls=':', lw=0.6, color='0.6', zorder=1)
+        ## x in axes fraction, y in data coords, so this never enters the x data range
+        ax.text(0.985, 0.515, 'median', transform=ax.get_yaxis_transform(),
+                fontsize=PANEL_FS['annot'], color='0.55', va='bottom', ha='right')
+
+        ## short axis labels: the full sentences are caption material, and at 6.5 pt
+        ## they would overrun the 1.4 in axes they have to sit against
+        ax.set_xlabel('position error (spot widths)')
+        ax.set_ylabel('cumulative fraction')
+        ## opaque frame: every CDF ends up in the top-left corner, so an unfilled
+        ## legend there is unreadable. This is also the key for panel c above, which
+        ## has room only for the arm names without the 'MultiGATE' prefix.
+        leg = ax.legend(loc='upper left', fontsize=PANEL_FS['annot'], frameon=True,
+                        facecolor='white', edgecolor='0.8', framealpha=1.0)
+        leg.set_zorder(6)
+        leg.get_frame().set_linewidth(0.4)
+        ax.spines[['top', 'right']].set_visible(False)
+
+        ## both readings: typical error (median, where each curve crosses y=0.5) and
+        ## the share confidently localised (where each curve crosses the vertical
+        ## reference). Off by default -- it does not survive the panel's final size,
+        ## and the same numbers are printed below for the caption.
+        if show_summary_table:
+            lines = [f'{"":<18s}{"median":>7s}{f"<={pitch_ref:g}sp":>7s}']
+            for m, r in summary.iterrows():
+                lines.append(f'{short[m]:<18s}{r["median_err"]:>7.1f}'
+                                f'{r[f"within_{pitch_ref:g}_pitch"]:>7.0%}')
+            ax.text(0.985, 0.03, '\n'.join(lines), transform=ax.transAxes,
+                    fontsize=PANEL_FS['annot'] - 0.5, ha='right', va='bottom',
+                    color='0.3', linespacing=1.5, family='monospace')
+
+        if panel is not None:
+            save_panel_svg(fig, panel, save_dir=save_dir, dpi=dpi)
+    plt.show()
+    print(summary.round(3))
+    return {'summary': summary, 'curves': curves, 'pitch': pitch, 'fig': fig}
+
+heldout_reconstruction_results = plot_heldout_spatial_reconstruction(
+    source_rna, mdata.mod['rna']
+)
+
+## source-side agreement with the Inflow-NMF referee.
+## The target-side referee is deliberately not scored: target spatial coordinates are
+## imputed from the MultiGATE latent space being evaluated (see target_rna.obsm['spatial']
+## assignment above), so any target agreement is circular. On the source the referee is
+## built from real coordinates and expert RNA_clusters, and is model-independent.
+from matplotlib import gridspec
+from scipy.optimize import linear_sum_assignment
+
+def _comb2(x):
+    return x * (x - 1.0) / 2.0
+
+def _contingency(x_codes, y_codes, nx, ny):
+    return np.bincount(x_codes * ny + y_codes, minlength=nx * ny).reshape(nx, ny)
+
+def _ari_nmi_from_tables(C):
+    """C: (B, nA, nB) contingency stack -> (ARI[B], NMI[B]), sklearn conventions."""
+    C = np.asarray(C, dtype=np.float64)
+    n = C.sum(axis=(1, 2))
+    a, b = C.sum(axis=2), C.sum(axis=1)
+    s_ij = _comb2(C).sum(axis=(1, 2))
+    s_a, s_b = _comb2(a).sum(axis=1), _comb2(b).sum(axis=1)
+    exp_ = s_a * s_b / _comb2(n)
+    ari = (s_ij - exp_) / (0.5 * (s_a + s_b) - exp_)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        pij, pa, pb = C / n[:, None, None], a / n[:, None], b / n[:, None]
+        lg = np.where(
+            C > 0,
+            np.log(np.where(C > 0, pij, 1.0))
+            - np.log(np.where(C > 0, pa[:, :, None] * pb[:, None, :], 1.0)),
+            0.0,
+        )
+        mi = (pij * lg).sum(axis=(1, 2))
+        ha = -np.where(a > 0, pa * np.log(np.where(a > 0, pa, 1.0)), 0.0).sum(axis=1)
+        hb = -np.where(b > 0, pb * np.log(np.where(b > 0, pb, 1.0)), 0.0).sum(axis=1)
+        nmi = mi / (0.5 * (ha + hb))
+    return ari, nmi
+
+def _bootstrap_ari_nmi(x_codes, y_codes, nx, ny, n_boot=2000, seed=0):
+    """Nonparametric cell bootstrap. Resampling cells with replacement is exactly a
+    Multinomial(n, p) draw over the contingency bins, so every replicate comes from a
+    single multinomial call: O(nx*ny) per replicate instead of O(n_cells)."""
+    C = _contingency(x_codes, y_codes, nx, ny).astype(np.float64)
+    n = int(C.sum())
+    boot = np.random.default_rng(seed).multinomial(
+        n, (C / n).ravel(), size=n_boot
+    ).reshape(n_boot, nx, ny)
+    ari_b, nmi_b = _ari_nmi_from_tables(boot)
+    ari_p, nmi_p = _ari_nmi_from_tables(C[None])
+    return float(ari_p[0]), float(nmi_p[0]), ari_b, nmi_b
+
+def _leiden_at_k(ad, k, lo=0.002, hi=4.0, max_iter=30, seed=0):
+    """Bisect the Leiden resolution until the partition has k clusters, so that every
+    method is compared to the referee at matched cluster count (ARI is k-sensitive)."""
+    best = None
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2
+        sc.tl.leiden(ad, resolution=mid, key_added='_k', random_state=seed)
+        n = ad.obs['_k'].nunique()
+        if best is None or abs(n - k) < abs(best[2] - k):
+            best = (np.asarray(ad.obs['_k']).copy(), mid, n)
+        if n == k:
+            break
+        lo, hi = (mid, hi) if n < k else (lo, mid)
+    return best
+
+def _merged_ceiling(expert, ref_codes, ok, target_k, nref):
+    """Best agreement any coarsening of the expert labels to target_k groups reaches
+    against the referee, found by greedy pairwise merging. The referee is a heavily
+    transformed derivative of those same expert labels (SVG filter -> LR resource ->
+    spatial lag -> per-cell-type stratification -> NMF -> Leiden), so this is how well
+    the referee can be recovered by the annotation that generated it."""
+    grp = {c: {c} for c in pd.unique(expert[ok])}
+
+    def _score(mapping):
+        codes = pd.factorize(expert[ok].map(mapping))[0]
+        C = _contingency(codes, ref_codes, codes.max() + 1, nref).astype(float)
+        return float(_ari_nmi_from_tables(C[None])[0][0])
+
+    while len(grp) > target_k:
+        keys, best = list(grp), (-np.inf, None)
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                trial = dict(grp)
+                trial[keys[i]] = trial[keys[i]] | trial.pop(keys[j])
+                s = _score({lab: g for g, mem in trial.items() for lab in mem})
+                if s > best[0]:
+                    best = (s, (keys[i], keys[j]))
+        a, b = best[1]
+        grp[a] = grp[a] | grp.pop(b)
+    m = {lab: g for g, mem in grp.items() for lab in mem}
+    codes = pd.factorize(expert[ok].map(m))[0]
+    C = _contingency(codes, ref_codes, codes.max() + 1, nref).astype(float)
+    a_, n_ = _ari_nmi_from_tables(C[None])
+    return float(a_[0]), float(n_[0])
+
+def _hungarian_map(lab, ref_lab):
+    """Relabel a partition so its cluster ids match the referee's, for shared colours."""
+    lc, lu = pd.factorize(lab, sort=True)
+    rc, ru = pd.factorize(ref_lab, sort=True)
+    r, c = linear_sum_assignment(-_contingency(lc, rc, len(lu), len(ru)))
+    return {lu[i]: ru[j] for i, j in zip(r, c)}
+
+def _draw_agreement_bar(ax, res_df, ceil_ari, referee_k, fs, tick_labels=None,
+                        rotation=30, ha='right', capsize=2.5, err_lw=0.9,
+                        legend_loc='upper right'):
+    """ARI/NMI against the Inflow-NMF referee, with bootstrap CIs and the expert
+    ceiling. Shared by the overview figure and the standalone composite panel, which
+    differ only in physical size and hence in type size and error-bar weight."""
+    x, w = np.arange(len(res_df)), 0.38
+    for off, key, color in ((-w / 2, 'ARI', '#66c2a5'), (w / 2, 'NMI', '#bbbbbb')):
+        ax.bar(x + off, res_df[key], w, color=color, label=key,
+                yerr=[res_df[key] - res_df[f'{key}_lo'],
+                        res_df[f'{key}_hi'] - res_df[key]],
+                capsize=capsize, error_kw=dict(lw=err_lw, ecolor='0.25'))
+    ax.axhline(ceil_ari, ls='--', lw=err_lw, color='#2a7f62')
+    ax.text(len(res_df) - 0.4, ceil_ari, 'expert ceiling ', fontsize=fs['annot'],
+            va='bottom', ha='right', color='#2a7f62')
+    ## headroom so the legend clears the tallest CI whisker instead of sitting on it
+    ax.set_ylim(0, max(res_df['NMI_hi'].max(), res_df['ARI_hi'].max(), ceil_ari) * 1.32)
+    ax.set_xlim(-0.6, len(res_df) - 0.4)
+    ax.set_xticks(x)
+    ax.set_xticklabels(res_df.index if tick_labels is None else tick_labels,
+                        rotation=rotation, ha=ha, fontsize=fs['tick'])
+    ax.set_ylabel(f'agreement with\nInflow-NMF (k={referee_k})', fontsize=fs['label'])
+    ax.tick_params(axis='y', labelsize=fs['tick'])
+    ax.legend(frameon=False, fontsize=fs['legend'], loc=legend_loc)
+    ax.spines[['top', 'right']].set_visible(False)
+    return ax
+
+def plot_referee_agreement_panel(
+    res_df,
+    ceil_ari,
+    referee_k,
+    panel='c_referee_agreement',
+    save_dir=CIBB_PLS_FIGURES_DIR,
+    dpi=600,
+):
+    """Panel c of the assembled LIANA figure, at the size it is placed."""
+    ## drop the repeated 'MultiGATE ' prefix: the four full names do not fit across a
+    ## 1.6 in axes at any usable type size, upright or rotated, and panel d sits
+    ## directly below with the same four arms spelled out in its legend
+    labels = [m.replace('MultiGATE ', '') for m in res_df.index]
+    with plt.rc_context(PANEL_RC):
+        fig = panel_figure(panel)
+        ax = fig.add_axes([0.21, 0.115, 0.765, 0.855])
+        _draw_agreement_bar(ax, res_df, ceil_ari, referee_k, PANEL_FS,
+                            tick_labels=labels, rotation=0, ha='center',
+                            capsize=1.3, err_lw=0.55, legend_loc='upper left')
+        ax.yaxis.set_major_locator(mpl.ticker.MaxNLocator(nbins=5))
+        if panel is not None:
+            save_panel_svg(fig, panel, save_dir=save_dir, dpi=dpi)
+    plt.show()
+    return fig
+
+def plot_source_referee_panels(
+    source_rna,
+    multivi_rna,
+    source_liana_results,
+    model_label='MultiGATE student',
+    expert_col='RNA_clusters',
+    seed=0,
+    n_boot=2000,
+    n_neighbors=10,
+    s_spatial=11.0,
+    s_umap=3.0,
+    s_missing=2.5,
+    save_name='liana_source_referee_panels',
+    save_dir=CIBB_PLS_FIGURES_DIR,
+    dpi=96,
+):
+    ## align MultiVI rows onto source_rna barcodes; all methods share the resulting spots
+    overlap = source_rna.obs_names.intersection(multivi_rna.obs_names)
+    if len(overlap) == 0:
+        assert multivi_rna.n_obs == source_rna.n_obs, (
+            f'no shared barcodes and shape mismatch: '
+            f'{multivi_rna.n_obs} vs {source_rna.n_obs}'
+        )
+        print('WARNING: no barcode overlap with MultiVI - falling back to positional alignment')
+        mv_full = np.asarray(multivi_rna.obsm['X_multivi'])
+        mask = np.ones(source_rna.n_obs, dtype=bool)
+    else:
+        pos = pd.Series(np.arange(multivi_rna.n_obs), index=multivi_rna.obs_names)
+        idx = pos.reindex(source_rna.obs_names)
+        mask = idx.notna().to_numpy()
+        mv_full = np.full(
+            (source_rna.n_obs, multivi_rna.obsm['X_multivi'].shape[1]), np.nan
+        )
+        mv_full[mask] = np.asarray(multivi_rna.obsm['X_multivi'])[
+            idx[mask].astype(int).to_numpy()
+        ]
+    print(f'MultiVI covers {mask.sum()} of {source_rna.n_obs} source spots '
+            f'(all methods restricted to these)')
+    obs_names = source_rna.obs_names[mask]
+
+    reps = {
+        'MultiGATE teacher': np.asarray(source_rna.obsm['MultiGATE_full_teacher'])[mask],
+        'MultiGATE student': np.asarray(source_rna.obsm['MultiGATE'])[mask],
+        'MultiGATE no-KD': np.asarray(source_rna.obsm['MultiGATE_nonspatial'])[mask],
+        'MultiVI': mv_full[mask],
+    }
+    for key, val in reps.items():
+        assert np.isfinite(val).all(), f'{key} has non-finite values after alignment'
+
+    xy = np.asarray(source_rna.obsm['spatial'])[mask]
+    expert = pd.Series(
+        np.asarray(source_rna.obs[expert_col])[mask].astype(str), index=obs_names
+    )
+
+    nmf_src = source_liana_results['nmf_spatial']
+    referee = pd.Series(
+        np.asarray(nmf_src.obs['leiden']).astype(object), index=nmf_src.obs_names
+    ).reindex(obs_names)
+    ok = referee.notna().to_numpy()
+    referee_k = referee.dropna().nunique()
+    ref_codes, ref_uniq = pd.factorize(referee[ok].astype(str), sort=True)
+    print(f'Inflow-NMF referee: {ok.sum()}/{len(obs_names)} spots, k={referee_k} '
+            f'(cells dropped by the keep_nmf filter have no referee label)')
+
+    ## referee's own graph UMAP, rebuilt at full referee coverage. nmf_spatial.obs
+    ## carries the NMF_W factor columns for every kept cell (joined before the
+    ## stratified subsample), so this avoids the 5000-cell subsampled UMAP.
+    factors = [str(c) for c in source_liana_results['nmf'].var_names]
+    factors = [c for c in factors if c in nmf_src.obs.columns]
+    if len(factors) >= 2:
+        W = nmf_src.obs.loc[obs_names[ok], factors].to_numpy(dtype=np.float64)
+        ad_ref = sc.AnnData(X=np.zeros((W.shape[0], 1), dtype=np.float32), obsm={'X_nmf': W})
+        ad_ref.obs_names = obs_names[ok]
+        sc.pp.neighbors(ad_ref, use_rep='X_nmf', metric='euclidean',
+                        n_neighbors=30, random_state=seed)
+        sc.tl.umap(ad_ref, min_dist=0.5, random_state=seed)
+        umap_ref = np.asarray(ad_ref.obsm['X_umap'])
+        print(f'Referee UMAP rebuilt from {len(factors)} NMF factors, {W.shape[0]} cells')
+    else:
+        sub = source_liana_results['nmf']
+        umap_ref = pd.DataFrame(
+            np.asarray(sub.obsm['X_umap']), index=sub.obs_names
+        ).reindex(obs_names[ok]).to_numpy()
+        print('WARNING: NMF factor columns absent from nmf_spatial.obs; '
+                'falling back to the subsampled referee UMAP')
+
+    ## every embedding partitioned at the referee's own k
+    labels, meta, umap_model = {}, [], None
+    for name, Z in reps.items():
+        ad = sc.AnnData(X=np.zeros((len(Z), 1), dtype=np.float32), obsm={'X_emb': Z})
+        ad.obs_names = obs_names
+        sc.pp.neighbors(ad, use_rep='X_emb', n_neighbors=n_neighbors, random_state=seed)
+        lab, res, k_found = _leiden_at_k(ad, referee_k, seed=seed)
+        labels[name] = pd.Series(lab, index=obs_names)
+        meta.append({'method': name, 'resolution': round(res, 4), 'k': k_found})
+        if name == model_label:
+            sc.tl.umap(ad, min_dist=0.3, random_state=seed)
+            umap_model = np.asarray(ad.obsm['X_umap'])
+    meta_df = pd.DataFrame(meta).set_index('method')
+    print(meta_df)
+
+    ceil_ari, ceil_nmi = _merged_ceiling(expert, ref_codes, ok, referee_k, len(ref_uniq))
+    print(f'Expert ceiling ({expert_col} merged {expert.nunique()} -> {referee_k}): '
+            f'ARI={ceil_ari:.3f}, NMI={ceil_nmi:.3f}')
+
+    rows, boots = [], {}
+    for name, lab in labels.items():
+        codes = pd.factorize(lab[ok].astype(str), sort=True)[0]
+        ari, nmi, ari_b, nmi_b = _bootstrap_ari_nmi(
+            codes, ref_codes, codes.max() + 1, len(ref_uniq), n_boot=n_boot, seed=seed
+        )
+        boots[name] = (ari_b, nmi_b)
+        rows.append({
+            'method': name, 'ARI': ari, 'NMI': nmi,
+            'ARI_lo': np.percentile(ari_b, 2.5), 'ARI_hi': np.percentile(ari_b, 97.5),
+            'NMI_lo': np.percentile(nmi_b, 2.5), 'NMI_hi': np.percentile(nmi_b, 97.5),
+        })
+    res_df = pd.DataFrame(rows).set_index('method')
+    print(res_df.round(3))
+
+    ## paired over shared bootstrap replicates, so the referee's own noise cancels
+    delta = boots[model_label][0] - boots['MultiVI'][0]
+    print(f'{model_label} - MultiVI  dARI={delta.mean():.3f}  95% CI '
+            f'[{np.percentile(delta, 2.5):.3f}, {np.percentile(delta, 97.5):.3f}]  '
+            f'P(>0)={(delta > 0).mean():.3f}')
+
+    cmap = _hungarian_map(
+        labels[model_label][ok].astype(str).to_numpy(), referee[ok].astype(str).to_numpy()
+    )
+    model_lab = labels[model_label].astype(str).map(lambda v: cmap.get(v, v))
+
+    palette = {c: plt.get_cmap('tab10')(i) for i, c in enumerate(sorted(ref_uniq))}
+    grey = '#e8e8e8'
+
+    def _scatter(ax, coords, lab, size, size_missing):
+        lab = pd.Series(np.asarray(lab, dtype=object))
+        good = np.isfinite(coords).all(axis=1)
+        missing = pd.isna(lab).to_numpy() | ~good
+        if missing.any():
+            ## keep_nmf drop-outs go underneath, small, so the colours cover them
+            ax.scatter(coords[missing & good, 0], coords[missing & good, 1],
+                        s=size_missing, c=grey, lw=0, rasterized=True, zorder=1)
+        for c in sorted(ref_uniq):
+            m = (lab == c).to_numpy() & good
+            if m.any():
+                ax.scatter(coords[m, 0], coords[m, 1], s=size, color=palette[c],
+                            lw=0, rasterized=True, zorder=2)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_linewidth(0.6)
+
+    fig = plt.figure(figsize=(12.6, 5.2))
+    outer = gridspec.GridSpec(1, 2, width_ratios=[3.0, 1.35], wspace=0.20, figure=fig)
+    inner = gridspec.GridSpecFromSubplotSpec(2, 3, subplot_spec=outer[0, 0],
+                                                wspace=0.06, hspace=0.08)
+    axes = np.array([[fig.add_subplot(inner[r, c]) for c in range(3)] for r in range(2)])
+    ax_bar = fig.add_subplot(outer[0, 1])
+
+    spaces = [
+        ('spatial', xy, s_spatial, s_missing),
+        ('Inflow-NMF UMAP', umap_ref, s_umap, s_umap),
+        (f'{model_label} UMAP', umap_model, s_umap, s_umap),
+    ]
+    rowsets = [('Inflow-NMF\n(referee)', referee), (f'{model_label}\n(k={referee_k})', model_lab)]
+    for r, (row_name, lab) in enumerate(rowsets):
+        for c, (space_name, coords, size, size_missing) in enumerate(spaces):
+            sub_lab = lab[ok] if coords is umap_ref else lab
+            _scatter(axes[r, c], coords, sub_lab, size, size_missing)
+            if r == 0:
+                axes[r, c].set_title(space_name, fontsize=8.5, pad=3)
+        axes[r, 0].set_ylabel(row_name, fontsize=8.5, labelpad=3)
+
+    _draw_agreement_bar(
+        ax_bar, res_df, ceil_ari, referee_k,
+        {'tick': 7.5, 'label': 8.0, 'legend': 7.5, 'annot': 6.5},
+    )
+
+    handles = [plt.Line2D([], [], marker='o', ls='', ms=5, color=palette[c])
+                for c in sorted(ref_uniq)]
+    fig.legend(handles, [str(c) for c in sorted(ref_uniq)], ncol=len(ref_uniq),
+                frameon=False, fontsize=7.5, loc='lower center',
+                bbox_to_anchor=(0.38, -0.03), handletextpad=0.2, columnspacing=0.9)
+
+    if save_name is not None:
+        save_figure_svg(fig, os.path.join(save_dir, f'{save_name}.svg'), dpi=dpi)
+    plt.show()
+
+    ## same bars again, standalone and at the size panel c is placed in the assembled
+    ## figure -- the copy inside this overview lives on a 12.6 in canvas and would have
+    ## to be scaled down by ~6x to fit, which is what shrinks its type to nothing
+    fig_panel_c = plot_referee_agreement_panel(
+        res_df, ceil_ari, referee_k, save_dir=save_dir
+    )
+    return {'scores': res_df, 'partitions': meta_df,
+            'ceiling': {'ARI': ceil_ari, 'NMI': ceil_nmi},
+            'delta_vs_multivi': delta, 'referee_k': referee_k, 'fig': fig,
+            'fig_panel_c': fig_panel_c}
+
+source_referee_results = plot_source_referee_panels(
+    source_rna, mdata.mod['rna'], source_liana_results
+)
+
+## Align by barcode rather than by position. nmf has already dropped the cells the
+## keep_nmf filter removed and may have been stratified-subsampled, so positional
+## correspondence with adata is not guaranteed -- and np.corrcoef only rejects a row
+## *count* mismatch, never a row *order* one. A silent misalignment therefore does not
+## raise: it produces a correlation matrix at the noise floor (SD ~ 1/sqrt(n), so
+## ~0.014 at n=5000) that looks like a real, if weak, result.
+shared = adata.obs_names.intersection(nmf.obs_names)
+assert len(shared) > 0, 'adata and nmf share no barcodes'
+assert not shared.has_duplicates, 'duplicate barcodes make the alignment ambiguous'
+if len(shared) < min(adata.n_obs, nmf.n_obs):
+    print(f'WARNING: adata ({adata.n_obs}) and nmf ({nmf.n_obs}) overlap in only '
+            f'{len(shared)} barcodes; correlating on those')
+x1 = np.asarray(adata[shared].obsm['MultiGATE_source_aligned'])
+x2 = np.asarray(nmf[shared].X)
+print(f'NMF-MultiGATE correlation on {len(shared)} aligned cells, '
+        f'{x1.shape[1]} dimensions x {x2.shape[1]} factors')
+x1 = rankdata(x1, axis=0)
+x2 = rankdata(x2, axis=0)
+#x1 = np.argsort(x1, axis=0)
+#x2 = np.argsort(x2, axis=0)
+corrs = np.corrcoef(x1, x2, rowvar=False)
+corrs = corrs[x1.shape[1]:, :x1.shape[1]]
+## guard against the failure above coming back by another route: a real association
+## sits far above the null, whose SD is ~1/sqrt(n-1)
+null_sd = 1.0 / np.sqrt(len(shared) - 1)
+if np.abs(corrs).max() < 5 * null_sd:
+    print(f'WARNING: max |rho| = {np.abs(corrs).max():.3f} against a null SD of '
+            f'{null_sd:.3f} -- the embedding and the NMF factors are at the noise '
+            f'floor, check that the two are really row-aligned')
+corrs_df = pd.DataFrame(corrs, index=nmf.var_names.str.replace('Factor', 'NMF'))
+topk=3
+## keep the topk factors most strongly associated with each MultiGATE dimension,
+## ranked by |rho| so that an anti-correlated factor counts as much as a correlated one
+corrs_order = pd.Series(corrs_df.apply(lambda x: corrs_df.index[np.argsort(-np.abs(x))[:topk]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values.tolist()
+corr_top = corrs_df.loc[corrs_order]
+
+def plot_nmf_multigate_corr_panel(
+    corr_top,
+    panel='e_nmf_multigate_corr',
+    save_dir=CIBB_PLS_FIGURES_DIR,
+    dpi=600,
+):
+    """Panel e of the assembled LIANA figure, at the size it is placed.
+
+    Replaces the seaborn clustermap: the clustermap's dendrograms are dropped at
+    assembly anyway, and its own layout manager fixes the tick/colorbar placement,
+    which is what forced the panel to be rescaled by hand. Here the ordering is
+    computed with the same average-linkage clustering, and the axes rectangles are
+    set explicitly so the panel lands at its declared size.
+    """
+    from scipy.cluster.hierarchy import leaves_list, linkage
+    from scipy.spatial.distance import pdist
+
+    ## rows MultiGATE dimensions, columns NMF factors: the orientation the panel is
+    ## placed in, with the labels on the outer edges of the assembled block
+    M = corr_top.T
+
+    def _order(mat):
+        if mat.shape[0] < 3:
+            return np.arange(mat.shape[0])
+        return leaves_list(linkage(pdist(mat, metric='euclidean'), method='average'))
+
+    M = M.iloc[_order(M.to_numpy()), :]
+    M = M.iloc[:, _order(M.to_numpy().T)]
+
+    ## symmetric limits off a robust quantile, so a single extreme cell cannot wash
+    ## the rest of the map out to white
+    vmax = float(np.nanpercentile(np.abs(M.to_numpy()), 99))
+    ## the colourbar takes the top band, so the factor-axis label moves to the bottom
+    ## and the map keeps the full panel width; the right band holds the dimension-axis
+    ## label. Both axis labels sit on outer edges of the assembled block.
+    ax_rect = [0.025, 0.050, 0.910, 0.840]
+    cbar_rect = [0.270, 0.935, 0.420, 0.018]
+
+    with plt.rc_context(PANEL_RC):
+        fig = panel_figure(panel)
+        cax = fig.add_axes(cbar_rect)
+        ax = fig.add_axes(ax_rect)
+        sns.heatmap(M, ax=ax, cmap='coolwarm', center=0.0, vmin=-vmax, vmax=vmax,
+                    cbar_ax=cax, cbar_kws={'orientation': 'horizontal'},
+                    xticklabels=False, yticklabels=False)
+
+        ## individual dimension identities are not read off this panel, so the ticks
+        ## go entirely; '(unsorted)' warns that position carries no meaning, the rows
+        ## and columns being in hierarchical-clustering order rather than index order
+        ax.yaxis.set_label_position('right')
+        ax.set_xlabel('Inflow-NMF dimensions (unsorted)',
+                        fontsize=PANEL_FS['label'], labelpad=3)
+        ax.set_ylabel('MultiGATE dimensions (unsorted)',
+                        fontsize=PANEL_FS['label'], labelpad=3)
+        ax.tick_params(length=0, width=0)
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_linewidth(0.4)
+
+        ## rank-transformed inputs, so these Pearson correlations are Spearman's rho.
+        ## Title rather than an axis label: it puts the name above a horizontal bar in
+        ## one line, leaving the space under the bar to the tick labels.
+        cbar = ax.collections[0].colorbar
+        cbar.outline.set_linewidth(0.4)
+        cax.xaxis.set_ticks_position('bottom')
+        cax.set_title('Spearman ρ', fontsize=PANEL_FS['label'], pad=2)
+        cbar.locator = mpl.ticker.MaxNLocator(nbins=4, symmetric=True)
+        cbar.update_ticks()
+        cax.tick_params(labelsize=PANEL_FS['tick'], length=1.2, width=0.4, pad=1.2)
+
+        if panel is not None:
+            save_panel_svg(fig, panel, save_dir=save_dir, dpi=dpi)
+    plt.show()
+    return fig
+
+fig_panel_e = plot_nmf_multigate_corr_panel(corr_top)
+save_plot_to_svg(fig_panel_e, "liana_multigate_heatmap")
+
+## The per-arm ARI/NMI barplot that used to live here scored every arm against a
+## Leiden partition whose k was set by the referee's own fixed resolution, and scored
+## the target arms against a referee built on model-imputed coordinates. Both are
+## handled above by plot_source_referee_panels, at matched k and source-only.
+ingested_nonspatial_source_concat_adata = sc.tl.ingest(
+    nonspatial_source_concat_adata, source_concat_adata,
+    embedding_method='umap', obs='leiden', inplace=False
+)
+
+## plot UMAP of source, target, nonspatial-source and ingested nonspatial-source
+fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+sc.pl.umap(source_concat_adata, color='leiden', size=25, ax=axs[0, 0], show=False)
+sc.pl.umap(target_concat_adata, color='leiden', size=25, ax=axs[0, 1], show=False)
+sc.pl.umap(nonspatial_source_concat_adata, color='leiden', size=25, ax=axs[1, 0], show=False)
+sc.pl.umap(ingested_nonspatial_source_concat_adata, color='leiden', size=25, ax=axs[1, 1], show=False)
+plt.tight_layout()
+plt.show()
+
+#%% PLS embedding-to-gene modelling
+from sklearn.cross_decomposition import PLSRegression
+import decoupler as dc
+import decoupler.op
+import liana as li
+
+def _apply_pls_component_signs(pls, signs):
+    ## coef_ is a product of one x-side and one y-side factor, so it is already
+    ## invariant under this flip and must be left alone; flipping it would change
+    ## the model's predictions.
+    n_comp = pls.x_rotations_.shape[1]
+    for attr in ('x_weights_', 'x_loadings_', 'x_rotations_',
+                    'y_weights_', 'y_loadings_', 'y_rotations_',
+                    'x_scores_', 'y_scores_'):
+        mat = getattr(pls, attr, None)
+        if mat is None or np.ndim(mat) != 2 or mat.shape[1] != n_comp:
+            continue
+        try:
+            setattr(pls, attr, mat * signs)
+        except AttributeError:  # read-only in some sklearn versions
+            continue
+
+def orient_pls_components_by_markers(pls, Z, X, var_names, markers,
+                                        components=(0,), label=''):
+    ## Sign alignment makes the four models agree with each other, but the shared
+    ## convention it settles on is still arbitrary. Anchor it to biology: flip a
+    ## component so the marker set it is meant to highlight -- myelin genes over the
+    ## fibre tracts, for PLS_0 -- lands on the positive end of the map. Applied to
+    ## the reference model only; the other three inherit it through the alignment.
+    n_comp = pls.x_rotations_.shape[1]
+    signs = np.ones(n_comp)
+
+    var_index = pd.Index(var_names)
+    present = [g for g in markers if g in var_index]
+    if not present:
+        print('  PLS marker orientation{}: no marker present, skipped'.format(
+            ' [{}]'.format(label) if label else ''))
+        return signs
+
+    ## z-score per gene before averaging, so the signature is not just whichever
+    ## marker happens to be most highly expressed (Mbp/Plp1 dominate otherwise)
+    marker_X = np.asarray(X[:, var_index.get_indexer(present)], dtype=float)
+    marker_sd = marker_X.std(axis=0)
+    marker_sd[marker_sd == 0] = 1.0
+    marker_score = ((marker_X - marker_X.mean(axis=0)) / marker_sd).mean(axis=1)
+
+    T = pls.transform(Z)
+    corrs = {}
+    for i in components:
+        if i >= n_comp:
+            continue
+        corrs[i] = np.corrcoef(T[:, i], marker_score)[0, 1]
+        if np.isfinite(corrs[i]) and corrs[i] < 0:
+            signs[i] = -1.0
+
+    _apply_pls_component_signs(pls, signs)
+    print('  PLS marker orientation{}: {} markers ({}); {}'.format(
+        ' [{}]'.format(label) if label else '', len(present), ', '.join(present),
+        ', '.join('PLS_{} r={:+.2f}{}'.format(i, r, ' -> flipped' if signs[i] < 0 else '')
+                    for i, r in corrs.items())
+    ))
+    return signs
+
+def align_pls_component_signs(pls, reference_pls, reference_Z, label=''):
+    ## A PLS component is defined only up to sign: negating its x- and y-side
+    ## vectors together leaves the fitted model identical, so the independently
+    ## fitted source/target x RNA/ATAC models can paint the same spatial pattern in
+    ## opposite colours. All four regress from the same source-aligned embedding, so
+    ## pushing one common Z through both models puts their scores on the same points
+    ## and the sign of the correlation says whether the two components agree.
+    n_comp = pls.x_rotations_.shape[1]
+    n_shared = min(n_comp, reference_pls.x_rotations_.shape[1])
+    t_ref = reference_pls.transform(reference_Z)
+    t = pls.transform(reference_Z)
+
+    signs = np.ones(n_comp)
+    corrs = np.full(n_comp, np.nan)
+    for i in range(n_shared):
+        corrs[i] = np.corrcoef(t_ref[:, i], t[:, i])[0, 1]
+        if np.isfinite(corrs[i]) and corrs[i] < 0:
+            signs[i] = -1.0
+
+    _apply_pls_component_signs(pls, signs)
+
+    flipped = np.flatnonzero(signs < 0)
+    detail = ', '.join('PLS_{} (r={:+.2f})'.format(i, corrs[i]) for i in flipped)
+    print('  PLS sign alignment{}: flipped {}/{} components{}'.format(
+        ' [{}]'.format(label) if label else '', flipped.size, n_shared,
+        ': {}'.format(detail) if flipped.size else ''
+    ))
+    return signs, corrs
+
+def pls_loadings_df(pls, var_names):
+    """Component x feature gene weights, in the model's current sign convention.
+
+    A snapshot, not a view: anything that re-signs the model afterwards (see
+    ``refine_pls_signs_across_models``) leaves an old frame stale, and a stale frame
+    is what makes the enrichment heatmap disagree with the spatial maps.
+    """
+    return pd.DataFrame(
+        pls.y_weights_.T,
+        index=[f'PLS_{i}' for i in range(pls.y_weights_.shape[1])],
+        columns=var_names,
+    )
+
+def refine_pls_signs_across_models(models, common_Z, n_show=5, reference=0,
+                                    apply=True):
+    """Choose each component's signs jointly across all models, and report agreement.
+
+    ``align_pls_component_signs`` fixes every model against one reference, which is
+    enough while a component is strongly shared. For the weaker later components two
+    non-reference models can each pick the sign that suits the reference and still
+    disagree with each other, so the signs are re-chosen here to maximise total
+    pairwise agreement instead (the reference is held fixed, so PLS_0 keeps its
+    myelin orientation).
+
+    The printout also says when a sign is not the problem: if a model's component
+    correlates more strongly with a *different* reference component, the two fits
+    have ordered or mixed their components differently and no flip can align them.
+    """
+    labels = [label for label, _ in models]
+    scores = [pls.transform(common_Z) for _, pls in models]
+    n_models = len(models)
+    n_comp = min(n_show, min(T.shape[1] for T in scores))
+
+    print('\nPLS component agreement across models '
+            '(score-map correlation on the common embedding):')
+    for k in range(n_comp):
+        stacked = np.column_stack([T[:, k] for T in scores])
+        corr = np.corrcoef(stacked, rowvar=False)
+        corr = np.nan_to_num(corr)
+
+        ## exhaustive over the 2^(n_models-1) sign patterns with the reference
+        ## pinned: n_models is 4 here, and the objective (total pairwise agreement)
+        ## has no structure worth exploiting at that size
+        best_signs, best_score = None, -np.inf
+        for bits in range(2 ** (n_models - 1)):
+            signs = np.ones(n_models)
+            for j, other in enumerate(i for i in range(n_models) if i != reference):
+                signs[other] = -1.0 if (bits >> j) & 1 else 1.0
+            total = float(np.sum(np.outer(signs, signs) * corr) - n_models) / 2
+            if total > best_score:
+                best_signs, best_score = signs, total
+
+        flipped = [labels[i] for i in np.flatnonzero(best_signs < 0)]
+        n_pairs = n_models * (n_models - 1) / 2
+        print('  PLS_{}: mean pairwise r {:+.2f}{}'.format(
+            k, best_score / n_pairs,
+            '   [flip: {}]'.format(', '.join(flipped)) if flipped else '   [no flip]',
+        ))
+
+        ## a flip only helps if component k really is the same direction in both
+        ## fits; check each model against every reference component
+        t_ref = scores[reference][:, k]
+        for i in range(n_models):
+            if i == reference:
+                continue
+            cross = np.array([
+                np.corrcoef(t_ref, scores[i][:, j])[0, 1]
+                for j in range(scores[i].shape[1])
+            ])
+            cross = np.nan_to_num(cross)
+            best_j = int(np.argmax(np.abs(cross)))
+            if best_j != k:
+                print('    {} PLS_{} matches {} PLS_{} better '
+                        '(|r|={:.2f} vs {:.2f} on the diagonal): a permuted or mixed '
+                        'component, which no sign flip can align.'.format(
+                            labels[i], k, labels[reference], best_j,
+                            abs(cross[best_j]), abs(cross[k])))
+
+        if apply:
+            for i in np.flatnonzero(best_signs < 0):
+                signs_full = np.ones(scores[i].shape[1])
+                signs_full[k] = -1.0
+                _apply_pls_component_signs(models[i][1], signs_full)
+                scores[i] = models[i][1].transform(common_Z)
+
+def run_pls_embedding_to_gene_plots(
+    adata, full_adata=None, umap_title=None, save_plots=False, plot_prefix='',
+    umap_plot_prefix=None, spatial_leiden_plot_prefix=None,
+    n_components=9, basis='spatial', weights_plot_type='staircase', top_n_genes=5, heatmap_cmap='YlGn',
+    censor_gene_from_plot=None, weights_dendrogram='rows',
+    sign_reference_pls=None, sign_reference_Z=None,
+    orient_markers=None, orient_components=(0,)
+):
+    ## weights_dendrogram (dotplot only): 'rows' draws a geneset dendrogram, 'both' also
+    ## clusters and draws PLS components, None just orders rows by linkage without
+    ## drawing. 'both' reorders the components, which breaks their natural
+    ## decreasing-covariance order and the correspondence with the PLS_0/1/2 spatial
+    ## panels, so it is opt-in.
+    def join_obs_preserving_n_obs(base_obs, values_df):
+        base_obs = base_obs.copy()
+        values_df = values_df.copy()
+
+        overlapping_cols = base_obs.columns.intersection(values_df.columns)
+        if len(overlapping_cols) > 0:
+            base_obs = base_obs.drop(columns=overlapping_cols)
+
+        if base_obs.index.equals(values_df.index) and len(base_obs) == len(values_df):
+            for col in values_df.columns:
+                base_obs[col] = values_df[col].to_numpy()
+            return base_obs
+
+        if not values_df.index.is_unique:
+            values_df = values_df[~values_df.index.duplicated(keep='first')]
+
+        for col in values_df.columns:
+            base_obs[col] = base_obs.index.map(values_df[col])
+        return base_obs
+
+    def copy_full_obsm(full_adata):
+        return {
+            key: value.copy()
+            for key, value in full_adata.obsm.items()
+            if len(value) == full_adata.n_obs
+        }
+
+    # X = pathway_embedding_results['source_rna'].pathway_scores.to_numpy()
+    X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
+    Z = adata.obsm['MultiGATE_source_aligned'].copy()
+
+    pls = PLSRegression(n_components=n_components)
+    pls.fit(Z, X)
+    ## flip before anything is derived from the fit, so the spatial maps, the
+    ## loadings heatmap/dotplot and the returned coef df all share one convention.
+    ## A reference model already carries the marker orientation, so the two paths
+    ## are exclusive: matching the reference is the stronger constraint.
+    if sign_reference_pls is not None and sign_reference_pls is not pls:
+        align_pls_component_signs(
+            pls, sign_reference_pls,
+            Z if sign_reference_Z is None else sign_reference_Z,
+            label=plot_prefix,
+        )
+    elif orient_markers is not None:
+        orient_pls_components_by_markers(
+            pls, Z, X, adata.var_names, orient_markers,
+            components=orient_components, label=plot_prefix,
+        )
+    T = pls.transform(Z)
+
+    ## plot PLS loadings onto embedding
+    pls_cols = [f'PLS_{i}' for i in range(T.shape[1])]
+    pls_df = pd.DataFrame(T, index=adata.obs_names, columns=pls_cols)
+
+    if full_adata is not None:
+        # Reindex onto the full cell set; cells filtered out get NaN and are
+        # rendered as na_color ('darkgray') to form a spatial background.
+        full_obs = join_obs_preserving_n_obs(full_adata.obs, pls_df)
+        adata_pls = sc.AnnData(
+            X=np.zeros((full_adata.n_obs, 1)),
+            obs=full_obs,
+            obsm=copy_full_obsm(full_adata),
+        )
+    else:
+        adata_pls = adata.copy()
+        adata_pls.obs = join_obs_preserving_n_obs(adata_pls.obs, pls_df)
+
+    if 'X_umap' in adata_pls.obsm and 'leiden' in adata_pls.obs:
+        sc.pl.umap(adata_pls, color='leiden', size=25, show=False)
+        if umap_title is not None:
+            plt.gca().set_title(umap_title)
+        plt.tight_layout()
+        fig = plt.gcf()
+        if save_plots:
+            save_prefix = umap_plot_prefix or plot_prefix
+            save_plot_to_svg(fig, f"{save_prefix}_liana_umap_leiden")
+        plt.show()
+
+    if 'spatial' in adata_pls.obsm and 'leiden' in adata_pls.obs:
+        sc.pl.embedding(
+            adata_pls,
+            basis='spatial',
+            color='leiden',
+            size=60,
+            show=False,
+            na_color='darkgray',
+        )
+        fig = plt.gcf()
+        plt.tight_layout()
+        if save_plots:
+            save_prefix = spatial_leiden_plot_prefix or plot_prefix
+            save_plot_to_svg(fig, f"{save_prefix}_spatial_leiden")
+        plt.show()
+
+    sc.pl.embedding(
+        adata_pls,
+        basis=basis,  # 'spatial' or 'X_seurat_umap' or 'X_umap
+        color=adata_pls.obs.columns[adata_pls.obs.columns.str.startswith('PLS_')],
+        ncols=3, wspace=0.2, size=25, show=False, na_color='darkgray'
+    )
+    fig = plt.gcf()
+    fig.set_size_inches(12, 10)  # or any desired figsize (width, height)
+    for ax in fig.get_axes():
+        ax.set_xlabel('')
+        ax.set_ylabel('')
+    plt.tight_layout()
+    if save_plots:
+        save_plot_to_svg(fig, f"{plot_prefix}_pls_embedding_spatial")
+    plt.show()
+
+    ## plot heatmap of PLS coef
+    pls_coef_df = pls_loadings_df(pls, adata.var_names)
+    if weights_plot_type == 'staircase':
+        top_genes_sort = pls_coef_df.abs().apply(
+            lambda x: x.nlargest(top_n_genes).index, axis=1, result_type='reduce'
+        ).explode().unique()
+        pls_coef_df_sorted = pls_coef_df.loc[:, top_genes_sort]
+        pls_coef_df_sorted_plot = pls_coef_df_sorted.copy()
+        if censor_gene_from_plot is not None:
+            pls_coef_df_sorted_plot = pls_coef_df_sorted_plot.loc[:, ~pls_coef_df_sorted_plot.columns.isin(censor_gene_from_plot)]
+
+        fig = plt.figure(figsize=(4.25, 9))
+        sns.heatmap(pls_coef_df_sorted_plot.T.abs(), cmap=heatmap_cmap, cbar=True)
+        plt.tight_layout()
+        if save_plots:
+            save_plot_to_svg(fig, f"{plot_prefix}_pls_weights_heatmap_staircase")
+        plt.show()
+
+    elif weights_plot_type == 'barplot':
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        n_components = len(pls_coef_df)
+        n_genesets = len(pls_coef_df.columns)
+        bar_width = 0.8 / n_genesets
+        
+        colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+        geneset_colors = {col: colors[i % len(colors)] for i, col in enumerate(pls_coef_df.columns)}
+        
+        for i, (idx, row) in enumerate(pls_coef_df.iterrows()):
+            sorted_row = row.sort_values(ascending=False)
+            for j, (geneset, val) in enumerate(sorted_row.items()):
+                pos = i - 0.4 + (j + 0.5) * bar_width
+                ax.bar(pos, val, width=bar_width, color=geneset_colors[geneset])
+        
+        ax.set_xticks(range(n_components))
+        ax.set_xticklabels(pls_coef_df.index, rotation=30)
+        ax.set_ylabel('PLS weight')
+        
+        from matplotlib.patches import Patch
+        legend_elements = [Patch(facecolor=geneset_colors[col], label=col) for col in pls_coef_df.columns]
+        ax.legend(handles=legend_elements, bbox_to_anchor=(0.5, -0.2), loc='upper center', ncol=2)
+        plt.tight_layout()
+        if save_plots:
+            save_plot_to_svg(fig, f"{plot_prefix}_pls_weights_barplot")
+        plt.show()
+
+        pls_coef_df_sorted = None
+
+    elif weights_plot_type == 'dotplot':
+        ## geneset x PLS component. scanpy's dotplot normally encodes (fraction of cells
+        ## expressing, mean expression); both channels are overridden here with
+        ## |weight| and signed weight, so the size legend has to be relabelled.
         from scipy.cluster.hierarchy import leaves_list, linkage
         from scipy.spatial.distance import pdist
 
-        ## rows MultiGATE dimensions, columns NMF factors: the orientation the panel is
-        ## placed in, with the labels on the outer edges of the assembled block
-        M = corr_top.T
+        abbrev = {
+            'EPITHELIAL_MESENCHYMAL_TRANSITION': 'EMT',
+            'TNFA_SIGNALING_VIA_NFKB': 'TNFa / NF-kB',
+            'INTERFERON_GAMMA_RESPONSE': 'IFN-g response',
+            'INTERFERON_ALPHA_RESPONSE': 'IFN-a response',
+            'REACTIVE_OXYGEN_SPECIES_PATHWAY': 'ROS pathway',
+            'OXIDATIVE_PHOSPHORYLATION': 'OxPhos',
+            'UNFOLDED_PROTEIN_RESPONSE': 'Unfolded protein resp.',
+        }
 
-        def _order(mat):
-            if mat.shape[0] < 3:
-                return np.arange(mat.shape[0])
-            return leaves_list(linkage(pdist(mat, metric='euclidean'), method='average'))
+        def _pretty(name):
+            return abbrev.get(name, name.replace('_', ' ').capitalize())
 
-        M = M.iloc[_order(M.to_numpy()), :]
-        M = M.iloc[:, _order(M.to_numpy().T)]
+        weights = pls_coef_df.T.copy()          # rows = genesets, cols = PLS components
 
-        ## symmetric limits off a robust quantile, so a single extreme cell cannot wash
-        ## the rest of the map out to white
-        vmax = float(np.nanpercentile(np.abs(M.to_numpy()), 99))
-        ## the colourbar takes the top band, so the factor-axis label moves to the bottom
-        ## and the map keeps the full panel width; the right band holds the dimension-axis
-        ## label. Both axis labels sit on outer edges of the assembled block.
-        ax_rect = [0.025, 0.050, 0.910, 0.840]
-        cbar_rect = [0.270, 0.935, 0.420, 0.018]
+        ## column clustering is opt-in: it reorders the PLS components, breaking their
+        ## decreasing-covariance order and the link to the PLS_0/1/2 spatial panels
+        col_link = None
+        if weights_dendrogram == 'both' and weights.shape[1] > 2:
+            col_link = linkage(pdist(weights.T.to_numpy()), method='average')
+            weights = weights.iloc[:, leaves_list(col_link)]
+        ## with a row dendrogram scanpy sets the row order itself; otherwise pre-sort
+        if weights_dendrogram not in ('rows', 'both') and len(weights) > 2:
+            weights = weights.iloc[
+                leaves_list(linkage(pdist(weights.to_numpy()), method='average'))
+            ]
+        weights.index = [_pretty(i) for i in weights.index]
+        weights.columns = [str(c).replace('PLS_', '') for c in weights.columns]
 
-        with plt.rc_context(PANEL_RC):
-            fig = panel_figure(panel)
-            cax = fig.add_axes(cbar_rect)
-            ax = fig.add_axes(ax_rect)
-            sns.heatmap(M, ax=ax, cmap='coolwarm', center=0.0, vmin=-vmax, vmax=vmax,
-                        cbar_ax=cax, cbar_kws={'orientation': 'horizontal'},
-                        xticklabels=False, yticklabels=False)
+        lim = float(np.abs(weights.to_numpy()).max())
+        size_df = weights.abs() / lim           # dot size must be a fraction in [0, 1]
 
-            ## individual dimension identities are not read off this panel, so the ticks
-            ## go entirely; '(unsorted)' warns that position carries no meaning, the rows
-            ## and columns being in hierarchical-clustering order rather than index order
-            ax.yaxis.set_label_position('right')
-            ax.set_xlabel('Inflow-NMF dimensions (unsorted)',
-                          fontsize=PANEL_FS['label'], labelpad=3)
-            ax.set_ylabel('MultiGATE dimensions (unsorted)',
-                          fontsize=PANEL_FS['label'], labelpad=3)
-            ax.tick_params(length=0, width=0)
-            for spine in ax.spines.values():
-                spine.set_visible(True)
-                spine.set_linewidth(0.4)
+        weights_adata = sc.AnnData(
+            X=weights.to_numpy().astype(np.float32),
+            obs=pd.DataFrame(index=pd.Index(weights.index, name=None)),
+            var=pd.DataFrame(index=pd.Index(weights.columns, name=None)),
+        )
+        weights_adata.obs['geneset'] = pd.Categorical(
+            weights.index, categories=list(weights.index)
+        )
 
-            ## rank-transformed inputs, so these Pearson correlations are Spearman's rho.
-            ## Title rather than an axis label: it puts the name above a horizontal bar in
-            ## one line, leaving the space under the bar to the tick labels.
-            cbar = ax.collections[0].colorbar
-            cbar.outline.set_linewidth(0.4)
-            cax.xaxis.set_ticks_position('bottom')
-            cax.set_title('Spearman ρ', fontsize=PANEL_FS['label'], pad=2)
-            cbar.locator = mpl.ticker.MaxNLocator(nbins=4, symmetric=True)
-            cbar.update_ticks()
-            cax.tick_params(labelsize=PANEL_FS['tick'], length=1.2, width=0.4, pad=1.2)
+        draw_row_dendrogram = weights_dendrogram in ('rows', 'both') and len(weights) > 2
+        if draw_row_dendrogram:
+            ## one observation per category, so the category means scanpy clusters on
+            ## are the weight rows themselves
+            sc.tl.dendrogram(
+                weights_adata, groupby='geneset', use_rep='X', n_pcs=None,
+                cor_method='pearson', linkage_method='average', optimal_ordering=True,
+            )
 
-            if panel is not None:
-                save_panel_svg(fig, panel, save_dir=save_dir, dpi=dpi)
+        dp = sc.pl.DotPlot(
+            weights_adata,
+            var_names=list(weights.columns),
+            groupby='geneset',
+            categories_order=None if draw_row_dendrogram else list(weights.index),
+            dot_color_df=weights,
+            dot_size_df=size_df,
+            vmin=-lim, vmax=lim, vcenter=0,
+            ## ~1.7:1, matching the panel h slot to the right of the schematic and the
+            ## PLS spatial maps: wide enough to fill it, short enough that the geneset
+            ## rows do not stretch apart
+            figsize=(0.52 * weights.shape[1] + 3.2, 0.36 * weights.shape[0] + 2.1),
+        )
+        dp.style(cmap='RdBu_r', dot_edge_color='0.25', dot_edge_lw=0.4,
+                    largest_dot=210, smallest_dot=2, grid=True)
+        dp.legend(size_title='|PLS weight|\n(rel. to max)', colorbar_title='PLS weight',
+                    width=1.3)
+        if draw_row_dendrogram:
+            dp.add_dendrogram(size=0.9)
+        dp.make_figure()
+
+        main_ax = dp.get_axes().get('mainplot_ax')
+        if main_ax is not None:
+            main_ax.set_xlabel('PLS component', fontsize=13)
+            ## geneset names carry the meaning, so give them the larger size
+            main_ax.tick_params(axis='y', labelsize=12)
+            main_ax.tick_params(axis='x', labelsize=10)
+            ## component numbers are short; scanpy rotates them 90 degrees by default
+            plt.setp(main_ax.get_xticklabels(), rotation=0, ha='center')
+        fig = getattr(dp, 'fig', None) or plt.gcf()
+
+        ## scanpy has no var-axis dendrogram, so draw the column one onto its own axes
+        ## above the main plot. scipy places leaves at 10*i + 5, so an x range of
+        ## [0, 10*n_cols] lines the leaves up with the dot columns.
+        if col_link is not None and main_ax is not None:
+            from scipy.cluster.hierarchy import dendrogram as _scipy_dendrogram
+
+            box = main_ax.get_position()
+            dax = fig.add_axes([box.x0, box.y1 + 0.012, box.width, 0.085])
+            _scipy_dendrogram(col_link, ax=dax, no_labels=True, color_threshold=0,
+                                above_threshold_color='0.4', orientation='top')
+            dax.set_xlim(0, 10 * weights.shape[1])
+            dax.axis('off')
+
         plt.show()
-        return fig
+        if save_plots:
+            save_plot_to_svg(fig, f"{plot_prefix}_pls_weights_dotplot")
 
-    fig_panel_e = plot_nmf_multigate_corr_panel(corr_top)
-    save_plot_to_svg(fig_panel_e, "liana_multigate_heatmap")
+        pls_coef_df_sorted = None
 
-    ## The per-arm ARI/NMI barplot that used to live here scored every arm against a
-    ## Leiden partition whose k was set by the referee's own fixed resolution, and scored
-    ## the target arms against a referee built on model-imputed coordinates. Both are
-    ## handled above by plot_source_referee_panels, at matched k and source-only.
-    ingested_nonspatial_source_concat_adata = sc.tl.ingest(
-        nonspatial_source_concat_adata, source_concat_adata,
-        embedding_method='umap', obs='leiden', inplace=False
+    return pls, pls_coef_df, pls_coef_df_sorted
+
+def plot_pls_spatial_panel(
+    rows, n_show=3, basis='spatial', size=25, panel_in=2.0,
+    col_gap_in=0.30, row_gap_in=0.06, cbar_loc='right',
+    cmap='viridis', clip_percentile=99, frame_color='0.85', frame_lw=0.4,
+    cbar_label='PLS score', save_plots=False, plot_prefix='12_pls_spatial_panel'
+):
+    """Grid of the leading PLS score maps: one row per model, one column per component.
+
+    ``rows`` is a list of ``(row_label, adata, pls)``. The models are sign-aligned
+    upstream, so a column is directly comparable down the rows; the grid therefore
+    shares one colour scale and one colorbar rather than one per subpanel.
+
+    ``cbar_loc`` puts the shared colorbar in the right margin ('right') or under the
+    grid ('bottom'). Which one wins is a question of the shape of the slot the panel
+    has to fill in the assembled figure: 'right' plus wide ``col_gap_in`` squares up
+    a few-column grid, 'bottom' plus tight gaps keeps a many-column grid compact.
+    """
+    if cbar_loc not in ('right', 'bottom'):
+        raise ValueError("cbar_loc must be 'right' or 'bottom', got {!r}".format(cbar_loc))
+    pls_cols = [f'PLS_{i}' for i in range(n_show)]
+
+    ## score every model up front: a shared colour scale has to see all of them
+    ## before the first subpanel is drawn. Re-projecting here rather than writing
+    ## PLS_* into the source adatas keeps stale columns out of them.
+    scored = [
+        (row_label, adata,
+            pls.transform(adata.obsm['MultiGATE_source_aligned'])[:, :n_show])
+        for row_label, adata, pls in rows
+    ]
+    ## symmetric about zero and percentile-clipped, so the handful of extreme spots
+    ## visible in the target rows cannot wash out the pattern everywhere else
+    lim = float(np.percentile(
+        np.abs(np.concatenate([T.ravel() for _, _, T in scored])), clip_percentile
+    ))
+
+    ## lay the grid out in inches so each slot is exactly square. With box_aspect(1)
+    ## any slot/axes aspect mismatch comes back as whitespace inside the slot, which
+    ## is the one thing tight_layout cannot take out.
+    n_grid_rows, n_grid_cols = len(scored), n_show
+    ## whichever margin carries the colorbar gets the room for bar, tick labels and
+    ## axis label; the opposite margin closes up to nothing.
+    cbar_pad_in, cbar_thick_in = 0.16, 0.13
+    left_in, top_in = 0.62, 0.30
+    if cbar_loc == 'right':
+        right_in = cbar_pad_in + cbar_thick_in + 0.72  # ticks + rotated label
+        bottom_in = 0.10
+    else:
+        right_in = 0.08
+        bottom_in = cbar_pad_in + cbar_thick_in + 0.56  # ticks + label
+    grid_w_in = n_grid_cols * panel_in + (n_grid_cols - 1) * col_gap_in
+    grid_h_in = n_grid_rows * panel_in + (n_grid_rows - 1) * row_gap_in
+    fig_w = left_in + grid_w_in + right_in
+    fig_h = top_in + grid_h_in + bottom_in
+
+    fig, axs = plt.subplots(
+        n_grid_rows, n_grid_cols, figsize=(fig_w, fig_h), squeeze=False
+    )
+    fig.subplots_adjust(
+        left=left_in / fig_w, right=1 - right_in / fig_w,
+        top=1 - top_in / fig_h, bottom=bottom_in / fig_h,
+        ## matplotlib takes these as fractions of the mean axes size
+        wspace=col_gap_in / panel_in, hspace=row_gap_in / panel_in,
     )
 
-    ## plot UMAP of source, target, nonspatial-source and ingested nonspatial-source
-    fig, axs = plt.subplots(2, 2, figsize=(10, 10))
-    sc.pl.umap(source_concat_adata, color='leiden', size=25, ax=axs[0, 0], show=False)
-    sc.pl.umap(target_concat_adata, color='leiden', size=25, ax=axs[0, 1], show=False)
-    sc.pl.umap(nonspatial_source_concat_adata, color='leiden', size=25, ax=axs[1, 0], show=False)
-    sc.pl.umap(ingested_nonspatial_source_concat_adata, color='leiden', size=25, ax=axs[1, 1], show=False)
-    plt.tight_layout()
-    plt.show()
-
-    #%% PLS embedding-to-gene modelling
-    from sklearn.cross_decomposition import PLSRegression
-    import decoupler as dc
-    import decoupler.op
-    import liana as li
-
-    def _apply_pls_component_signs(pls, signs):
-        ## coef_ is a product of one x-side and one y-side factor, so it is already
-        ## invariant under this flip and must be left alone; flipping it would change
-        ## the model's predictions.
-        n_comp = pls.x_rotations_.shape[1]
-        for attr in ('x_weights_', 'x_loadings_', 'x_rotations_',
-                     'y_weights_', 'y_loadings_', 'y_rotations_',
-                     'x_scores_', 'y_scores_'):
-            mat = getattr(pls, attr, None)
-            if mat is None or np.ndim(mat) != 2 or mat.shape[1] != n_comp:
-                continue
-            try:
-                setattr(pls, attr, mat * signs)
-            except AttributeError:  # read-only in some sklearn versions
-                continue
-
-    def orient_pls_components_by_markers(pls, Z, X, var_names, markers,
-                                         components=(0,), label=''):
-        ## Sign alignment makes the four models agree with each other, but the shared
-        ## convention it settles on is still arbitrary. Anchor it to biology: flip a
-        ## component so the marker set it is meant to highlight -- myelin genes over the
-        ## fibre tracts, for PLS_0 -- lands on the positive end of the map. Applied to
-        ## the reference model only; the other three inherit it through the alignment.
-        n_comp = pls.x_rotations_.shape[1]
-        signs = np.ones(n_comp)
-
-        var_index = pd.Index(var_names)
-        present = [g for g in markers if g in var_index]
-        if not present:
-            print('  PLS marker orientation{}: no marker present, skipped'.format(
-                ' [{}]'.format(label) if label else ''))
-            return signs
-
-        ## z-score per gene before averaging, so the signature is not just whichever
-        ## marker happens to be most highly expressed (Mbp/Plp1 dominate otherwise)
-        marker_X = np.asarray(X[:, var_index.get_indexer(present)], dtype=float)
-        marker_sd = marker_X.std(axis=0)
-        marker_sd[marker_sd == 0] = 1.0
-        marker_score = ((marker_X - marker_X.mean(axis=0)) / marker_sd).mean(axis=1)
-
-        T = pls.transform(Z)
-        corrs = {}
-        for i in components:
-            if i >= n_comp:
-                continue
-            corrs[i] = np.corrcoef(T[:, i], marker_score)[0, 1]
-            if np.isfinite(corrs[i]) and corrs[i] < 0:
-                signs[i] = -1.0
-
-        _apply_pls_component_signs(pls, signs)
-        print('  PLS marker orientation{}: {} markers ({}); {}'.format(
-            ' [{}]'.format(label) if label else '', len(present), ', '.join(present),
-            ', '.join('PLS_{} r={:+.2f}{}'.format(i, r, ' -> flipped' if signs[i] < 0 else '')
-                      for i, r in corrs.items())
-        ))
-        return signs
-
-    def align_pls_component_signs(pls, reference_pls, reference_Z, label=''):
-        ## A PLS component is defined only up to sign: negating its x- and y-side
-        ## vectors together leaves the fitted model identical, so the independently
-        ## fitted source/target x RNA/ATAC models can paint the same spatial pattern in
-        ## opposite colours. All four regress from the same source-aligned embedding, so
-        ## pushing one common Z through both models puts their scores on the same points
-        ## and the sign of the correlation says whether the two components agree.
-        n_comp = pls.x_rotations_.shape[1]
-        n_shared = min(n_comp, reference_pls.x_rotations_.shape[1])
-        t_ref = reference_pls.transform(reference_Z)
-        t = pls.transform(reference_Z)
-
-        signs = np.ones(n_comp)
-        corrs = np.full(n_comp, np.nan)
-        for i in range(n_shared):
-            corrs[i] = np.corrcoef(t_ref[:, i], t[:, i])[0, 1]
-            if np.isfinite(corrs[i]) and corrs[i] < 0:
-                signs[i] = -1.0
-
-        _apply_pls_component_signs(pls, signs)
-
-        flipped = np.flatnonzero(signs < 0)
-        detail = ', '.join('PLS_{} (r={:+.2f})'.format(i, corrs[i]) for i in flipped)
-        print('  PLS sign alignment{}: flipped {}/{} components{}'.format(
-            ' [{}]'.format(label) if label else '', flipped.size, n_shared,
-            ': {}'.format(detail) if flipped.size else ''
-        ))
-        return signs, corrs
-
-    def pls_loadings_df(pls, var_names):
-        """Component x feature gene weights, in the model's current sign convention.
-
-        A snapshot, not a view: anything that re-signs the model afterwards (see
-        ``refine_pls_signs_across_models``) leaves an old frame stale, and a stale frame
-        is what makes the enrichment heatmap disagree with the spatial maps.
-        """
-        return pd.DataFrame(
-            pls.y_weights_.T,
-            index=[f'PLS_{i}' for i in range(pls.y_weights_.shape[1])],
-            columns=var_names,
+    for r, (row_label, adata, T) in enumerate(scored):
+        adata_scores = sc.AnnData(
+            X=np.zeros((adata.n_obs, 1)),
+            obs=pd.DataFrame(T, index=adata.obs_names, columns=pls_cols),
+            obsm={basis: adata.obsm[basis].copy()},
         )
-
-    def refine_pls_signs_across_models(models, common_Z, n_show=5, reference=0,
-                                       apply=True):
-        """Choose each component's signs jointly across all models, and report agreement.
-
-        ``align_pls_component_signs`` fixes every model against one reference, which is
-        enough while a component is strongly shared. For the weaker later components two
-        non-reference models can each pick the sign that suits the reference and still
-        disagree with each other, so the signs are re-chosen here to maximise total
-        pairwise agreement instead (the reference is held fixed, so PLS_0 keeps its
-        myelin orientation).
-
-        The printout also says when a sign is not the problem: if a model's component
-        correlates more strongly with a *different* reference component, the two fits
-        have ordered or mixed their components differently and no flip can align them.
-        """
-        labels = [label for label, _ in models]
-        scores = [pls.transform(common_Z) for _, pls in models]
-        n_models = len(models)
-        n_comp = min(n_show, min(T.shape[1] for T in scores))
-
-        print('\nPLS component agreement across models '
-              '(score-map correlation on the common embedding):')
-        for k in range(n_comp):
-            stacked = np.column_stack([T[:, k] for T in scores])
-            corr = np.corrcoef(stacked, rowvar=False)
-            corr = np.nan_to_num(corr)
-
-            ## exhaustive over the 2^(n_models-1) sign patterns with the reference
-            ## pinned: n_models is 4 here, and the objective (total pairwise agreement)
-            ## has no structure worth exploiting at that size
-            best_signs, best_score = None, -np.inf
-            for bits in range(2 ** (n_models - 1)):
-                signs = np.ones(n_models)
-                for j, other in enumerate(i for i in range(n_models) if i != reference):
-                    signs[other] = -1.0 if (bits >> j) & 1 else 1.0
-                total = float(np.sum(np.outer(signs, signs) * corr) - n_models) / 2
-                if total > best_score:
-                    best_signs, best_score = signs, total
-
-            flipped = [labels[i] for i in np.flatnonzero(best_signs < 0)]
-            n_pairs = n_models * (n_models - 1) / 2
-            print('  PLS_{}: mean pairwise r {:+.2f}{}'.format(
-                k, best_score / n_pairs,
-                '   [flip: {}]'.format(', '.join(flipped)) if flipped else '   [no flip]',
-            ))
-
-            ## a flip only helps if component k really is the same direction in both
-            ## fits; check each model against every reference component
-            t_ref = scores[reference][:, k]
-            for i in range(n_models):
-                if i == reference:
-                    continue
-                cross = np.array([
-                    np.corrcoef(t_ref, scores[i][:, j])[0, 1]
-                    for j in range(scores[i].shape[1])
-                ])
-                cross = np.nan_to_num(cross)
-                best_j = int(np.argmax(np.abs(cross)))
-                if best_j != k:
-                    print('    {} PLS_{} matches {} PLS_{} better '
-                          '(|r|={:.2f} vs {:.2f} on the diagonal): a permuted or mixed '
-                          'component, which no sign flip can align.'.format(
-                              labels[i], k, labels[reference], best_j,
-                              abs(cross[best_j]), abs(cross[k])))
-
-            if apply:
-                for i in np.flatnonzero(best_signs < 0):
-                    signs_full = np.ones(scores[i].shape[1])
-                    signs_full[k] = -1.0
-                    _apply_pls_component_signs(models[i][1], signs_full)
-                    scores[i] = models[i][1].transform(common_Z)
-
-    def run_pls_embedding_to_gene_plots(
-        adata, full_adata=None, umap_title=None, save_plots=False, plot_prefix='',
-        umap_plot_prefix=None, spatial_leiden_plot_prefix=None,
-        n_components=9, basis='spatial', weights_plot_type='staircase', top_n_genes=5, heatmap_cmap='YlGn',
-        censor_gene_from_plot=None, weights_dendrogram='rows',
-        sign_reference_pls=None, sign_reference_Z=None,
-        orient_markers=None, orient_components=(0,)
-    ):
-        ## weights_dendrogram (dotplot only): 'rows' draws a geneset dendrogram, 'both' also
-        ## clusters and draws PLS components, None just orders rows by linkage without
-        ## drawing. 'both' reorders the components, which breaks their natural
-        ## decreasing-covariance order and the correspondence with the PLS_0/1/2 spatial
-        ## panels, so it is opt-in.
-        def join_obs_preserving_n_obs(base_obs, values_df):
-            base_obs = base_obs.copy()
-            values_df = values_df.copy()
-
-            overlapping_cols = base_obs.columns.intersection(values_df.columns)
-            if len(overlapping_cols) > 0:
-                base_obs = base_obs.drop(columns=overlapping_cols)
-
-            if base_obs.index.equals(values_df.index) and len(base_obs) == len(values_df):
-                for col in values_df.columns:
-                    base_obs[col] = values_df[col].to_numpy()
-                return base_obs
-
-            if not values_df.index.is_unique:
-                values_df = values_df[~values_df.index.duplicated(keep='first')]
-
-            for col in values_df.columns:
-                base_obs[col] = base_obs.index.map(values_df[col])
-            return base_obs
-
-        def copy_full_obsm(full_adata):
-            return {
-                key: value.copy()
-                for key, value in full_adata.obsm.items()
-                if len(value) == full_adata.n_obs
-            }
-
-        # X = pathway_embedding_results['source_rna'].pathway_scores.to_numpy()
-        X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
-        Z = adata.obsm['MultiGATE_source_aligned'].copy()
-
-        pls = PLSRegression(n_components=n_components)
-        pls.fit(Z, X)
-        ## flip before anything is derived from the fit, so the spatial maps, the
-        ## loadings heatmap/dotplot and the returned coef df all share one convention.
-        ## A reference model already carries the marker orientation, so the two paths
-        ## are exclusive: matching the reference is the stronger constraint.
-        if sign_reference_pls is not None and sign_reference_pls is not pls:
-            align_pls_component_signs(
-                pls, sign_reference_pls,
-                Z if sign_reference_Z is None else sign_reference_Z,
-                label=plot_prefix,
-            )
-        elif orient_markers is not None:
-            orient_pls_components_by_markers(
-                pls, Z, X, adata.var_names, orient_markers,
-                components=orient_components, label=plot_prefix,
-            )
-        T = pls.transform(Z)
-
-        ## plot PLS loadings onto embedding
-        pls_cols = [f'PLS_{i}' for i in range(T.shape[1])]
-        pls_df = pd.DataFrame(T, index=adata.obs_names, columns=pls_cols)
-
-        if full_adata is not None:
-            # Reindex onto the full cell set; cells filtered out get NaN and are
-            # rendered as na_color ('darkgray') to form a spatial background.
-            full_obs = join_obs_preserving_n_obs(full_adata.obs, pls_df)
-            adata_pls = sc.AnnData(
-                X=np.zeros((full_adata.n_obs, 1)),
-                obs=full_obs,
-                obsm=copy_full_obsm(full_adata),
-            )
-        else:
-            adata_pls = adata.copy()
-            adata_pls.obs = join_obs_preserving_n_obs(adata_pls.obs, pls_df)
-
-        if 'X_umap' in adata_pls.obsm and 'leiden' in adata_pls.obs:
-            sc.pl.umap(adata_pls, color='leiden', size=25, show=False)
-            if umap_title is not None:
-                plt.gca().set_title(umap_title)
-            plt.tight_layout()
-            fig = plt.gcf()
-            if save_plots:
-                save_prefix = umap_plot_prefix or plot_prefix
-                save_plot_to_svg(fig, f"{save_prefix}_liana_umap_leiden")
-            plt.show()
-
-        if 'spatial' in adata_pls.obsm and 'leiden' in adata_pls.obs:
+        for c, col in enumerate(pls_cols):
+            ax = axs[r, c]
             sc.pl.embedding(
-                adata_pls,
-                basis='spatial',
-                color='leiden',
-                size=60,
-                show=False,
-                na_color='darkgray',
+                adata_scores, basis=basis, color=col, ax=ax, show=False,
+                size=size, frameon=True, title=col if r == 0 else '',
+                cmap=cmap, vmin=-lim, vmax=lim, colorbar_loc=None,
             )
-            fig = plt.gcf()
-            plt.tight_layout()
-            if save_plots:
-                save_prefix = spatial_leiden_plot_prefix or plot_prefix
-                save_plot_to_svg(fig, f"{save_prefix}_spatial_leiden")
-            plt.show()
-
-        sc.pl.embedding(
-            adata_pls,
-            basis=basis,  # 'spatial' or 'X_seurat_umap' or 'X_umap
-            color=adata_pls.obs.columns[adata_pls.obs.columns.str.startswith('PLS_')],
-            ncols=3, wspace=0.2, size=25, show=False, na_color='darkgray'
-        )
-        fig = plt.gcf()
-        fig.set_size_inches(12, 10)  # or any desired figsize (width, height)
-        for ax in fig.get_axes():
+            ## square subpanels, as in the assembled CIBB figure. box_aspect fixes
+            ## the axes box itself; 'equal' with adjustable='datalim' then pads the
+            ## shorter data axis to fill it, so the tissue keeps its true geometry
+            ## instead of being stretched into the square.
+            ax.set_box_aspect(1)
+            ax.set_aspect('equal', adjustable='datalim')
+            ax.set_xticks([])
+            ax.set_yticks([])
             ax.set_xlabel('')
-            ax.set_ylabel('')
-        plt.tight_layout()
-        if save_plots:
-            save_plot_to_svg(fig, f"{plot_prefix}_pls_embedding_spatial")
-        plt.show()
+            ax.set_ylabel(row_label if c == 0 else '')
+            for spine in ax.spines.values():
+                spine.set_color(frame_color)
+                spine.set_linewidth(frame_lw)
 
-        ## plot heatmap of PLS coef
-        pls_coef_df = pls_loadings_df(pls, adata.var_names)
-        if weights_plot_type == 'staircase':
-            top_genes_sort = pls_coef_df.abs().apply(
-                lambda x: x.nlargest(top_n_genes).index, axis=1, result_type='reduce'
-            ).explode().unique()
-            pls_coef_df_sorted = pls_coef_df.loc[:, top_genes_sort]
-            pls_coef_df_sorted_plot = pls_coef_df_sorted.copy()
-            if censor_gene_from_plot is not None:
-                pls_coef_df_sorted_plot = pls_coef_df_sorted_plot.loc[:, ~pls_coef_df_sorted_plot.columns.isin(censor_gene_from_plot)]
+    ## one shared colorbar, half the length of the side it sits on and centred on it
+    if cbar_loc == 'right':
+        cbar_len_in = 0.5 * grid_h_in
+        cbar_rect = [
+            (left_in + grid_w_in + cbar_pad_in) / fig_w,
+            (bottom_in + 0.5 * (grid_h_in - cbar_len_in)) / fig_h,
+            cbar_thick_in / fig_w,
+            cbar_len_in / fig_h,
+        ]
+    else:
+        cbar_len_in = 0.5 * grid_w_in
+        cbar_rect = [
+            (left_in + 0.5 * (grid_w_in - cbar_len_in)) / fig_w,
+            (bottom_in - cbar_pad_in - cbar_thick_in) / fig_h,
+            cbar_len_in / fig_w,
+            cbar_thick_in / fig_h,
+        ]
+    cbar = fig.colorbar(
+        mpl.cm.ScalarMappable(
+            norm=mpl.colors.Normalize(vmin=-lim, vmax=lim), cmap=cmap
+        ),
+        cax=fig.add_axes(cbar_rect),
+        orientation='vertical' if cbar_loc == 'right' else 'horizontal',
+    )
+    cbar.set_label(cbar_label, labelpad=2)
+    cbar.outline.set_linewidth(frame_lw)
+    cbar.outline.set_edgecolor(frame_color)
 
-            fig = plt.figure(figsize=(4.25, 9))
-            sns.heatmap(pls_coef_df_sorted_plot.T.abs(), cmap=heatmap_cmap, cbar=True)
-            plt.tight_layout()
-            if save_plots:
-                save_plot_to_svg(fig, f"{plot_prefix}_pls_weights_heatmap_staircase")
-            plt.show()
+    if save_plots:
+        save_plot_to_svg(fig, plot_prefix)
+    plt.show()
+    return fig
 
-        elif weights_plot_type == 'barplot':
+def plot_pls_biological_annotation(
+    source_adata,
+    target_adata,
+    source_pls,
+    target_pls,
+    source_loadings,
+    target_loadings,
+    n_pairs=5,
+    n_permutations=2000,
+    random_seed=42,
+    fdr_threshold=0.05,
+    assume_aligned=True,
+    save_path="/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis/12_pls_biological_annotation.svg",
+):
+    """Plot matched RNA PLS module enrichments.
 
-            fig, ax = plt.subplots(figsize=(6, 4))
-            n_components = len(pls_coef_df)
-            n_genesets = len(pls_coef_df.columns)
-            bar_width = 0.8 / n_genesets
-            
-            colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-            geneset_colors = {col: colors[i % len(colors)] for i, col in enumerate(pls_coef_df.columns)}
-            
-            for i, (idx, row) in enumerate(pls_coef_df.iterrows()):
-                sorted_row = row.sort_values(ascending=False)
-                for j, (geneset, val) in enumerate(sorted_row.items()):
-                    pos = i - 0.4 + (j + 0.5) * bar_width
-                    ax.bar(pos, val, width=bar_width, color=geneset_colors[geneset])
-            
-            ax.set_xticks(range(n_components))
-            ax.set_xticklabels(pls_coef_df.index, rotation=30)
-            ax.set_ylabel('PLS weight')
-            
-            from matplotlib.patches import Patch
-            legend_elements = [Patch(facecolor=geneset_colors[col], label=col) for col in pls_coef_df.columns]
-            ax.legend(handles=legend_elements, bbox_to_anchor=(0.5, -0.2), loc='upper center', ncol=2)
-            plt.tight_layout()
-            if save_plots:
-                save_plot_to_svg(fig, f"{plot_prefix}_pls_weights_barplot")
-            plt.show()
+    With ``assume_aligned`` (the default) the models are taken as already
+    sign- and index-matched by ``align_pls_component_signs``: component i is
+    paired with component i and neither side is re-signed, so a heatmap cell has
+    the sign of the spatial map above it. Disagreements with the gene-loading
+    correlation are reported rather than silently corrected.
 
-            pls_coef_df_sorted = None
+    With ``assume_aligned=False`` the original behaviour applies: source signs
+    are kept, targets are matched by absolute gene-loading correlation and
+    flipped where the signed correlation is negative.
 
-        elif weights_plot_type == 'dotplot':
-            ## geneset x PLS component. scanpy's dotplot normally encodes (fraction of cells
-            ## expressing, mean expression); both channels are overridden here with
-            ## |weight| and signed weight, so the size legend has to be relabelled.
-            from scipy.cluster.hierarchy import leaves_list, linkage
-            from scipy.spatial.distance import pdist
+    The target sign is also applied to new ``*_plot`` spatial-score columns in
+    ``target_adata.obs``.
+    """
+    from scipy.optimize import linear_sum_assignment
 
-            abbrev = {
-                'EPITHELIAL_MESENCHYMAL_TRANSITION': 'EMT',
-                'TNFA_SIGNALING_VIA_NFKB': 'TNFa / NF-kB',
-                'INTERFERON_GAMMA_RESPONSE': 'IFN-g response',
-                'INTERFERON_ALPHA_RESPONSE': 'IFN-a response',
-                'REACTIVE_OXYGEN_SPECIES_PATHWAY': 'ROS pathway',
-                'OXIDATIVE_PHOSPHORYLATION': 'OxPhos',
-                'UNFOLDED_PROTEIN_RESPONSE': 'Unfolded protein resp.',
+    modules = {
+        "Oligodendrocyte / myelin": [
+            "Mobp", "Mal", "Mag", "Mbp", "Plp1", "Cnp",
+        ],
+        "Striatal / MSN signaling": [
+            "Pde10a", "Rgs9", "Gng7", "Ppp1r1b", "Drd1", "Adora2a",
+        ],
+        "Mural / smooth muscle": [
+            "Cald1", "Myh11", "Mylk", "Acta2", "Tagln", "Rgs5", "Pdgfrb",
+        ],
+        "Endothelial / BBB": [
+            "Flt1", "Abcb1a", "Slco1c1", "Kdr", "Cldn5", "Pecam1",
+        ],
+        "Astrocyte": [
+            "Aqp4", "Slc1a3", "Aldoc", "Gfap", "S100b", "Glul",
+        ],
+        "ECM / adhesion": [
+            "Col1a1", "Col1a2", "Col3a1", "Col5a1", "Dcn", "Fn1",
+        ],
+    }
+    module_display = {
+        "Oligodendrocyte / myelin": "Oligodendrocyte\nmyelin",
+        "Striatal / MSN signaling": "Striatal\nMSN",
+        "Mural / smooth muscle": "Mural\nsmooth muscle",
+        "Endothelial / BBB": "Endothelial\nBBB",
+        "Astrocyte": "Astrocyte",
+        "ECM / adhesion": "ECM\nadhesion",
+    }
+
+    source_loadings = source_loadings.copy()
+    target_loadings = target_loadings.copy()
+    source_loadings.columns = source_loadings.columns.astype(str)
+    target_loadings.columns = target_loadings.columns.astype(str)
+    source_loadings = source_loadings.T.groupby(level=0, sort=False).mean().T
+    target_loadings = target_loadings.T.groupby(level=0, sort=False).mean().T
+
+    shared_genes = source_loadings.columns.intersection(target_loadings.columns)
+    if len(shared_genes) < 10:
+        raise ValueError(
+            "PLS biological annotation requires at least 10 shared genes; "
+            f"found {len(shared_genes)}."
+        )
+
+    source_shared = source_loadings.loc[:, shared_genes].to_numpy(dtype=float)
+    target_shared = target_loadings.loc[:, shared_genes].to_numpy(dtype=float)
+    loading_corr = np.corrcoef(source_shared, target_shared)
+    loading_corr = loading_corr[
+        : len(source_loadings),
+        len(source_loadings) :,
+    ]
+    loading_corr = np.nan_to_num(loading_corr)
+
+    if assume_aligned:
+        ## the spatial panel puts component i of every model in one column, so the
+        ## heatmap has to read the same way: pair i with i and keep the upstream
+        ## signs. Re-matching or re-flipping here would contradict the maps rather
+        ## than describe them, so a disagreement is reported instead.
+        n_matched = min(len(source_loadings), len(target_loadings))
+        matched_indices = [(i, i) for i in range(n_matched)][:n_pairs]
+        for source_i, _ in matched_indices:
+            best_i = int(np.argmax(np.abs(loading_corr[source_i])))
+            if loading_corr[source_i, source_i] < 0 or best_i != source_i:
+                print(
+                    "[WARN] PLS_{}: signed loading correlation with target PLS_{} "
+                    "is {:+.2f}; strongest target match is PLS_{} ({:+.2f}). "
+                    "Keeping the upstream alignment.".format(
+                        source_i, source_i, loading_corr[source_i, source_i],
+                        best_i, loading_corr[source_i, best_i],
+                    )
+                )
+    else:
+        source_indices, target_indices = linear_sum_assignment(
+            -np.abs(loading_corr)
+        )
+        matched_indices = sorted(
+            zip(source_indices, target_indices),
+            key=lambda pair: pair[0],
+        )[:n_pairs]
+    if not matched_indices:
+        raise ValueError("No source-target PLS component matches were found.")
+
+    pair_ids = [f"pair_{i}" for i in range(len(matched_indices))]
+    source_matched = []
+    target_matched = []
+    match_records = []
+
+    for pair_id, (source_i, target_i) in zip(pair_ids, matched_indices):
+        source_name = str(source_loadings.index[source_i])
+        target_name = str(target_loadings.index[target_i])
+        corr_value = float(loading_corr[source_i, target_i])
+        target_sign = 1.0 if assume_aligned else (-1.0 if corr_value < 0 else 1.0)
+
+        source_matched.append(
+            source_loadings.iloc[source_i].to_numpy(dtype=float)
+        )
+        target_matched.append(
+            target_sign
+            * target_loadings.iloc[target_i].to_numpy(dtype=float)
+        )
+        match_records.append(
+            {
+                "pair_id": pair_id,
+                "source_component": source_name,
+                "target_component": target_name,
+                "source_index": int(source_i),
+                "target_index": int(target_i),
+                "loading_correlation": corr_value,
+                "target_sign": target_sign,
             }
-
-            def _pretty(name):
-                return abbrev.get(name, name.replace('_', ' ').capitalize())
-
-            weights = pls_coef_df.T.copy()          # rows = genesets, cols = PLS components
-
-            ## column clustering is opt-in: it reorders the PLS components, breaking their
-            ## decreasing-covariance order and the link to the PLS_0/1/2 spatial panels
-            col_link = None
-            if weights_dendrogram == 'both' and weights.shape[1] > 2:
-                col_link = linkage(pdist(weights.T.to_numpy()), method='average')
-                weights = weights.iloc[:, leaves_list(col_link)]
-            ## with a row dendrogram scanpy sets the row order itself; otherwise pre-sort
-            if weights_dendrogram not in ('rows', 'both') and len(weights) > 2:
-                weights = weights.iloc[
-                    leaves_list(linkage(pdist(weights.to_numpy()), method='average'))
-                ]
-            weights.index = [_pretty(i) for i in weights.index]
-            weights.columns = [str(c).replace('PLS_', '') for c in weights.columns]
-
-            lim = float(np.abs(weights.to_numpy()).max())
-            size_df = weights.abs() / lim           # dot size must be a fraction in [0, 1]
-
-            weights_adata = sc.AnnData(
-                X=weights.to_numpy().astype(np.float32),
-                obs=pd.DataFrame(index=pd.Index(weights.index, name=None)),
-                var=pd.DataFrame(index=pd.Index(weights.columns, name=None)),
-            )
-            weights_adata.obs['geneset'] = pd.Categorical(
-                weights.index, categories=list(weights.index)
-            )
-
-            draw_row_dendrogram = weights_dendrogram in ('rows', 'both') and len(weights) > 2
-            if draw_row_dendrogram:
-                ## one observation per category, so the category means scanpy clusters on
-                ## are the weight rows themselves
-                sc.tl.dendrogram(
-                    weights_adata, groupby='geneset', use_rep='X', n_pcs=None,
-                    cor_method='pearson', linkage_method='average', optimal_ordering=True,
-                )
-
-            dp = sc.pl.DotPlot(
-                weights_adata,
-                var_names=list(weights.columns),
-                groupby='geneset',
-                categories_order=None if draw_row_dendrogram else list(weights.index),
-                dot_color_df=weights,
-                dot_size_df=size_df,
-                vmin=-lim, vmax=lim, vcenter=0,
-                ## ~1.7:1, matching the panel h slot to the right of the schematic and the
-                ## PLS spatial maps: wide enough to fill it, short enough that the geneset
-                ## rows do not stretch apart
-                figsize=(0.52 * weights.shape[1] + 3.2, 0.36 * weights.shape[0] + 2.1),
-            )
-            dp.style(cmap='RdBu_r', dot_edge_color='0.25', dot_edge_lw=0.4,
-                     largest_dot=210, smallest_dot=2, grid=True)
-            dp.legend(size_title='|PLS weight|\n(rel. to max)', colorbar_title='PLS weight',
-                      width=1.3)
-            if draw_row_dendrogram:
-                dp.add_dendrogram(size=0.9)
-            dp.make_figure()
-
-            main_ax = dp.get_axes().get('mainplot_ax')
-            if main_ax is not None:
-                main_ax.set_xlabel('PLS component', fontsize=13)
-                ## geneset names carry the meaning, so give them the larger size
-                main_ax.tick_params(axis='y', labelsize=12)
-                main_ax.tick_params(axis='x', labelsize=10)
-                ## component numbers are short; scanpy rotates them 90 degrees by default
-                plt.setp(main_ax.get_xticklabels(), rotation=0, ha='center')
-            fig = getattr(dp, 'fig', None) or plt.gcf()
-
-            ## scanpy has no var-axis dendrogram, so draw the column one onto its own axes
-            ## above the main plot. scipy places leaves at 10*i + 5, so an x range of
-            ## [0, 10*n_cols] lines the leaves up with the dot columns.
-            if col_link is not None and main_ax is not None:
-                from scipy.cluster.hierarchy import dendrogram as _scipy_dendrogram
-
-                box = main_ax.get_position()
-                dax = fig.add_axes([box.x0, box.y1 + 0.012, box.width, 0.085])
-                _scipy_dendrogram(col_link, ax=dax, no_labels=True, color_threshold=0,
-                                  above_threshold_color='0.4', orientation='top')
-                dax.set_xlim(0, 10 * weights.shape[1])
-                dax.axis('off')
-
-            plt.show()
-            if save_plots:
-                save_plot_to_svg(fig, f"{plot_prefix}_pls_weights_dotplot")
-
-            pls_coef_df_sorted = None
-
-        return pls, pls_coef_df, pls_coef_df_sorted
-
-    def plot_pls_spatial_panel(
-        rows, n_show=3, basis='spatial', size=25, panel_in=2.0,
-        col_gap_in=0.30, row_gap_in=0.06, cbar_loc='right',
-        cmap='viridis', clip_percentile=99, frame_color='0.85', frame_lw=0.4,
-        cbar_label='PLS score', save_plots=False, plot_prefix='12_pls_spatial_panel'
-    ):
-        """Grid of the leading PLS score maps: one row per model, one column per component.
-
-        ``rows`` is a list of ``(row_label, adata, pls)``. The models are sign-aligned
-        upstream, so a column is directly comparable down the rows; the grid therefore
-        shares one colour scale and one colorbar rather than one per subpanel.
-
-        ``cbar_loc`` puts the shared colorbar in the right margin ('right') or under the
-        grid ('bottom'). Which one wins is a question of the shape of the slot the panel
-        has to fill in the assembled figure: 'right' plus wide ``col_gap_in`` squares up
-        a few-column grid, 'bottom' plus tight gaps keeps a many-column grid compact.
-        """
-        if cbar_loc not in ('right', 'bottom'):
-            raise ValueError("cbar_loc must be 'right' or 'bottom', got {!r}".format(cbar_loc))
-        pls_cols = [f'PLS_{i}' for i in range(n_show)]
-
-        ## score every model up front: a shared colour scale has to see all of them
-        ## before the first subpanel is drawn. Re-projecting here rather than writing
-        ## PLS_* into the source adatas keeps stale columns out of them.
-        scored = [
-            (row_label, adata,
-             pls.transform(adata.obsm['MultiGATE_source_aligned'])[:, :n_show])
-            for row_label, adata, pls in rows
-        ]
-        ## symmetric about zero and percentile-clipped, so the handful of extreme spots
-        ## visible in the target rows cannot wash out the pattern everywhere else
-        lim = float(np.percentile(
-            np.abs(np.concatenate([T.ravel() for _, _, T in scored])), clip_percentile
-        ))
-
-        ## lay the grid out in inches so each slot is exactly square. With box_aspect(1)
-        ## any slot/axes aspect mismatch comes back as whitespace inside the slot, which
-        ## is the one thing tight_layout cannot take out.
-        n_grid_rows, n_grid_cols = len(scored), n_show
-        ## whichever margin carries the colorbar gets the room for bar, tick labels and
-        ## axis label; the opposite margin closes up to nothing.
-        cbar_pad_in, cbar_thick_in = 0.16, 0.13
-        left_in, top_in = 0.62, 0.30
-        if cbar_loc == 'right':
-            right_in = cbar_pad_in + cbar_thick_in + 0.72  # ticks + rotated label
-            bottom_in = 0.10
-        else:
-            right_in = 0.08
-            bottom_in = cbar_pad_in + cbar_thick_in + 0.56  # ticks + label
-        grid_w_in = n_grid_cols * panel_in + (n_grid_cols - 1) * col_gap_in
-        grid_h_in = n_grid_rows * panel_in + (n_grid_rows - 1) * row_gap_in
-        fig_w = left_in + grid_w_in + right_in
-        fig_h = top_in + grid_h_in + bottom_in
-
-        fig, axs = plt.subplots(
-            n_grid_rows, n_grid_cols, figsize=(fig_w, fig_h), squeeze=False
-        )
-        fig.subplots_adjust(
-            left=left_in / fig_w, right=1 - right_in / fig_w,
-            top=1 - top_in / fig_h, bottom=bottom_in / fig_h,
-            ## matplotlib takes these as fractions of the mean axes size
-            wspace=col_gap_in / panel_in, hspace=row_gap_in / panel_in,
         )
 
-        for r, (row_label, adata, T) in enumerate(scored):
-            adata_scores = sc.AnnData(
-                X=np.zeros((adata.n_obs, 1)),
-                obs=pd.DataFrame(T, index=adata.obs_names, columns=pls_cols),
-                obsm={basis: adata.obsm[basis].copy()},
-            )
-            for c, col in enumerate(pls_cols):
-                ax = axs[r, c]
-                sc.pl.embedding(
-                    adata_scores, basis=basis, color=col, ax=ax, show=False,
-                    size=size, frameon=True, title=col if r == 0 else '',
-                    cmap=cmap, vmin=-lim, vmax=lim, colorbar_loc=None,
-                )
-                ## square subpanels, as in the assembled CIBB figure. box_aspect fixes
-                ## the axes box itself; 'equal' with adjustable='datalim' then pads the
-                ## shorter data axis to fill it, so the tissue keeps its true geometry
-                ## instead of being stretched into the square.
-                ax.set_box_aspect(1)
-                ax.set_aspect('equal', adjustable='datalim')
-                ax.set_xticks([])
-                ax.set_yticks([])
-                ax.set_xlabel('')
-                ax.set_ylabel(row_label if c == 0 else '')
-                for spine in ax.spines.values():
-                    spine.set_color(frame_color)
-                    spine.set_linewidth(frame_lw)
+    source_matched = pd.DataFrame(
+        source_matched,
+        index=pair_ids,
+        columns=source_loadings.columns,
+    )
+    target_matched = pd.DataFrame(
+        target_matched,
+        index=pair_ids,
+        columns=target_loadings.columns,
+    )
 
-        ## one shared colorbar, half the length of the side it sits on and centred on it
-        if cbar_loc == 'right':
-            cbar_len_in = 0.5 * grid_h_in
-            cbar_rect = [
-                (left_in + grid_w_in + cbar_pad_in) / fig_w,
-                (bottom_in + 0.5 * (grid_h_in - cbar_len_in)) / fig_h,
-                cbar_thick_in / fig_w,
-                cbar_len_in / fig_h,
-            ]
-        else:
-            cbar_len_in = 0.5 * grid_w_in
-            cbar_rect = [
-                (left_in + 0.5 * (grid_w_in - cbar_len_in)) / fig_w,
-                (bottom_in - cbar_pad_in - cbar_thick_in) / fig_h,
-                cbar_len_in / fig_w,
-                cbar_thick_in / fig_h,
-            ]
-        cbar = fig.colorbar(
-            mpl.cm.ScalarMappable(
-                norm=mpl.colors.Normalize(vmin=-lim, vmax=lim), cmap=cmap
-            ),
-            cax=fig.add_axes(cbar_rect),
-            orientation='vertical' if cbar_loc == 'right' else 'horizontal',
-        )
-        cbar.set_label(cbar_label, labelpad=2)
-        cbar.outline.set_linewidth(frame_lw)
-        cbar.outline.set_edgecolor(frame_color)
-
-        if save_plots:
-            save_plot_to_svg(fig, plot_prefix)
-        plt.show()
-        return fig
-
-    def plot_pls_biological_annotation(
-        source_adata,
-        target_adata,
-        source_pls,
-        target_pls,
-        source_loadings,
-        target_loadings,
-        n_pairs=5,
-        n_permutations=2000,
-        random_seed=42,
-        fdr_threshold=0.05,
-        assume_aligned=True,
-        save_path="/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures/pls_analysis/12_pls_biological_annotation.svg",
-    ):
-        """Plot matched RNA PLS module enrichments.
-
-        With ``assume_aligned`` (the default) the models are taken as already
-        sign- and index-matched by ``align_pls_component_signs``: component i is
-        paired with component i and neither side is re-signed, so a heatmap cell has
-        the sign of the spatial map above it. Disagreements with the gene-loading
-        correlation are reported rather than silently corrected.
-
-        With ``assume_aligned=False`` the original behaviour applies: source signs
-        are kept, targets are matched by absolute gene-loading correlation and
-        flipped where the signed correlation is negative.
-
-        The target sign is also applied to new ``*_plot`` spatial-score columns in
-        ``target_adata.obs``.
-        """
-        from scipy.optimize import linear_sum_assignment
-
-        modules = {
-            "Oligodendrocyte / myelin": [
-                "Mobp", "Mal", "Mag", "Mbp", "Plp1", "Cnp",
-            ],
-            "Striatal / MSN signaling": [
-                "Pde10a", "Rgs9", "Gng7", "Ppp1r1b", "Drd1", "Adora2a",
-            ],
-            "Mural / smooth muscle": [
-                "Cald1", "Myh11", "Mylk", "Acta2", "Tagln", "Rgs5", "Pdgfrb",
-            ],
-            "Endothelial / BBB": [
-                "Flt1", "Abcb1a", "Slco1c1", "Kdr", "Cldn5", "Pecam1",
-            ],
-            "Astrocyte": [
-                "Aqp4", "Slc1a3", "Aldoc", "Gfap", "S100b", "Glul",
-            ],
-            "ECM / adhesion": [
-                "Col1a1", "Col1a2", "Col3a1", "Col5a1", "Dcn", "Fn1",
-            ],
+    def module_loading_enrichment(loadings, seed):
+        rng = np.random.default_rng(seed)
+        genes = loadings.columns.astype(str)
+        gene_to_position = {
+            gene: position for position, gene in enumerate(genes)
         }
-        module_display = {
-            "Oligodendrocyte / myelin": "Oligodendrocyte\nmyelin",
-            "Striatal / MSN signaling": "Striatal\nMSN",
-            "Mural / smooth muscle": "Mural\nsmooth muscle",
-            "Endothelial / BBB": "Endothelial\nBBB",
-            "Astrocyte": "Astrocyte",
-            "ECM / adhesion": "ECM\nadhesion",
-        }
+        scores = pd.DataFrame(
+            np.nan,
+            index=list(modules),
+            columns=loadings.index,
+            dtype=float,
+        )
+        pvalues = scores.copy()
+        random_indices = {}
 
-        source_loadings = source_loadings.copy()
-        target_loadings = target_loadings.copy()
-        source_loadings.columns = source_loadings.columns.astype(str)
-        target_loadings.columns = target_loadings.columns.astype(str)
-        source_loadings = source_loadings.T.groupby(level=0, sort=False).mean().T
-        target_loadings = target_loadings.T.groupby(level=0, sort=False).mean().T
+        for module_name, module_genes in modules.items():
+            positions = [
+                gene_to_position[gene]
+                for gene in module_genes
+                if gene in gene_to_position
+            ]
+            module_size = len(positions)
+            if module_size < 2:
+                print(
+                    f"[WARN] Skipping {module_name!r}: only "
+                    f"{module_size} module genes were found."
+                )
+                continue
 
-        shared_genes = source_loadings.columns.intersection(target_loadings.columns)
-        if len(shared_genes) < 10:
-            raise ValueError(
-                "PLS biological annotation requires at least 10 shared genes; "
-                f"found {len(shared_genes)}."
-            )
-
-        source_shared = source_loadings.loc[:, shared_genes].to_numpy(dtype=float)
-        target_shared = target_loadings.loc[:, shared_genes].to_numpy(dtype=float)
-        loading_corr = np.corrcoef(source_shared, target_shared)
-        loading_corr = loading_corr[
-            : len(source_loadings),
-            len(source_loadings) :,
-        ]
-        loading_corr = np.nan_to_num(loading_corr)
-
-        if assume_aligned:
-            ## the spatial panel puts component i of every model in one column, so the
-            ## heatmap has to read the same way: pair i with i and keep the upstream
-            ## signs. Re-matching or re-flipping here would contradict the maps rather
-            ## than describe them, so a disagreement is reported instead.
-            n_matched = min(len(source_loadings), len(target_loadings))
-            matched_indices = [(i, i) for i in range(n_matched)][:n_pairs]
-            for source_i, _ in matched_indices:
-                best_i = int(np.argmax(np.abs(loading_corr[source_i])))
-                if loading_corr[source_i, source_i] < 0 or best_i != source_i:
-                    print(
-                        "[WARN] PLS_{}: signed loading correlation with target PLS_{} "
-                        "is {:+.2f}; strongest target match is PLS_{} ({:+.2f}). "
-                        "Keeping the upstream alignment.".format(
-                            source_i, source_i, loading_corr[source_i, source_i],
-                            best_i, loading_corr[source_i, best_i],
+            if module_size not in random_indices:
+                random_indices[module_size] = np.vstack(
+                    [
+                        rng.choice(
+                            len(genes),
+                            size=module_size,
+                            replace=False,
                         )
-                    )
-        else:
-            source_indices, target_indices = linear_sum_assignment(
-                -np.abs(loading_corr)
-            )
-            matched_indices = sorted(
-                zip(source_indices, target_indices),
-                key=lambda pair: pair[0],
-            )[:n_pairs]
-        if not matched_indices:
-            raise ValueError("No source-target PLS component matches were found.")
+                        for _ in range(n_permutations)
+                    ]
+                )
+            null_indices = random_indices[module_size]
 
-        pair_ids = [f"pair_{i}" for i in range(len(matched_indices))]
-        source_matched = []
-        target_matched = []
-        match_records = []
-
-        for pair_id, (source_i, target_i) in zip(pair_ids, matched_indices):
-            source_name = str(source_loadings.index[source_i])
-            target_name = str(target_loadings.index[target_i])
-            corr_value = float(loading_corr[source_i, target_i])
-            target_sign = 1.0 if assume_aligned else (-1.0 if corr_value < 0 else 1.0)
-
-            source_matched.append(
-                source_loadings.iloc[source_i].to_numpy(dtype=float)
-            )
-            target_matched.append(
-                target_sign
-                * target_loadings.iloc[target_i].to_numpy(dtype=float)
-            )
-            match_records.append(
-                {
-                    "pair_id": pair_id,
-                    "source_component": source_name,
-                    "target_component": target_name,
-                    "source_index": int(source_i),
-                    "target_index": int(target_i),
-                    "loading_correlation": corr_value,
-                    "target_sign": target_sign,
-                }
-            )
-
-        source_matched = pd.DataFrame(
-            source_matched,
-            index=pair_ids,
-            columns=source_loadings.columns,
-        )
-        target_matched = pd.DataFrame(
-            target_matched,
-            index=pair_ids,
-            columns=target_loadings.columns,
-        )
-
-        def module_loading_enrichment(loadings, seed):
-            rng = np.random.default_rng(seed)
-            genes = loadings.columns.astype(str)
-            gene_to_position = {
-                gene: position for position, gene in enumerate(genes)
-            }
-            scores = pd.DataFrame(
-                np.nan,
-                index=list(modules),
-                columns=loadings.index,
-                dtype=float,
-            )
-            pvalues = scores.copy()
-            random_indices = {}
-
-            for module_name, module_genes in modules.items():
-                positions = [
-                    gene_to_position[gene]
-                    for gene in module_genes
-                    if gene in gene_to_position
-                ]
-                module_size = len(positions)
-                if module_size < 2:
-                    print(
-                        f"[WARN] Skipping {module_name!r}: only "
-                        f"{module_size} module genes were found."
-                    )
+            for component in loadings.index:
+                weights = loadings.loc[component].to_numpy(dtype=float)
+                weights = np.nan_to_num(
+                    weights,
+                    nan=float(np.nanmedian(weights)),
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                weight_sd = weights.std(ddof=1)
+                if weight_sd == 0:
                     continue
 
-                if module_size not in random_indices:
-                    random_indices[module_size] = np.vstack(
-                        [
-                            rng.choice(
-                                len(genes),
-                                size=module_size,
-                                replace=False,
-                            )
-                            for _ in range(n_permutations)
-                        ]
+                weights = (weights - weights.mean()) / weight_sd
+                observed = weights[positions].mean()
+                null = weights[null_indices].mean(axis=1)
+                null_mean = null.mean()
+                null_sd = null.std(ddof=1)
+
+                scores.loc[module_name, component] = (
+                    observed - null_mean
+                ) / max(null_sd, 1e-12)
+                pvalues.loc[module_name, component] = (
+                    1
+                    + np.sum(
+                        np.abs(null - null_mean)
+                        >= abs(observed - null_mean)
                     )
-                null_indices = random_indices[module_size]
+                ) / (n_permutations + 1)
 
-                for component in loadings.index:
-                    weights = loadings.loc[component].to_numpy(dtype=float)
-                    weights = np.nan_to_num(
-                        weights,
-                        nan=float(np.nanmedian(weights)),
-                        posinf=0.0,
-                        neginf=0.0,
-                    )
-                    weight_sd = weights.std(ddof=1)
-                    if weight_sd == 0:
-                        continue
+        return scores, pvalues
 
-                    weights = (weights - weights.mean()) / weight_sd
-                    observed = weights[positions].mean()
-                    null = weights[null_indices].mean(axis=1)
-                    null_mean = null.mean()
-                    null_sd = null.std(ddof=1)
+    source_scores, source_pvalues = module_loading_enrichment(
+        source_matched,
+        seed=random_seed,
+    )
+    target_scores, target_pvalues = module_loading_enrichment(
+        target_matched,
+        seed=random_seed + 1,
+    )
 
-                    scores.loc[module_name, component] = (
-                        observed - null_mean
-                    ) / max(null_sd, 1e-12)
-                    pvalues.loc[module_name, component] = (
-                        1
-                        + np.sum(
-                            np.abs(null - null_mean)
-                            >= abs(observed - null_mean)
-                        )
-                    ) / (n_permutations + 1)
+    heat_scores = pd.DataFrame(index=list(modules))
+    heat_pvalues = pd.DataFrame(index=list(modules))
+    column_ids = []
+    column_domains = []
+    pair_labels = []
 
-            return scores, pvalues
+    def component_number(component_name):
+        return str(component_name).replace("PLS_", "")
 
-        source_scores, source_pvalues = module_loading_enrichment(
-            source_matched,
-            seed=random_seed,
-        )
-        target_scores, target_pvalues = module_loading_enrichment(
-            target_matched,
-            seed=random_seed + 1,
+    for pair_id, match in zip(pair_ids, match_records):
+        source_column = f"{pair_id}_source"
+        target_column = f"{pair_id}_target"
+        column_ids.extend([source_column, target_column])
+        column_domains.extend(["Source", "Target"])
+        heat_scores[source_column] = source_scores[pair_id]
+        heat_scores[target_column] = target_scores[pair_id]
+        heat_pvalues[source_column] = source_pvalues[pair_id]
+        heat_pvalues[target_column] = target_pvalues[pair_id]
+
+        source_number = component_number(match["source_component"])
+        target_number = component_number(match["target_component"])
+        pair_labels.append(
+            f"PLS {source_number}"
+            if source_number == target_number
+            else f"PLS {source_number}\N{LEFT RIGHT ARROW}{target_number}"
         )
 
-        heat_scores = pd.DataFrame(index=list(modules))
-        heat_pvalues = pd.DataFrame(index=list(modules))
-        column_ids = []
-        column_domains = []
-        pair_labels = []
-
-        def component_number(component_name):
-            return str(component_name).replace("PLS_", "")
-
-        for pair_id, match in zip(pair_ids, match_records):
-            source_column = f"{pair_id}_source"
-            target_column = f"{pair_id}_target"
-            column_ids.extend([source_column, target_column])
-            column_domains.extend(["Source", "Target"])
-            heat_scores[source_column] = source_scores[pair_id]
-            heat_scores[target_column] = target_scores[pair_id]
-            heat_pvalues[source_column] = source_pvalues[pair_id]
-            heat_pvalues[target_column] = target_pvalues[pair_id]
-
-            source_number = component_number(match["source_component"])
-            target_number = component_number(match["target_component"])
-            pair_labels.append(
-                f"PLS {source_number}"
-                if source_number == target_number
-                else f"PLS {source_number}\N{LEFT RIGHT ARROW}{target_number}"
-            )
-
-        def bh_adjust(values):
-            values = np.asarray(values, dtype=float)
-            adjusted = np.full(values.shape, np.nan)
-            valid = np.isfinite(values)
-            pvalues = values[valid]
-            if len(pvalues) == 0:
-                return adjusted
-
-            order = np.argsort(pvalues)
-            ranked = pvalues[order]
-            qvalues = ranked * len(ranked) / np.arange(
-                1,
-                len(ranked) + 1,
-            )
-            qvalues = np.minimum.accumulate(qvalues[::-1])[::-1]
-            qvalues = np.clip(qvalues, 0, 1)
-            restored = np.empty_like(qvalues)
-            restored[order] = qvalues
-            adjusted[valid] = restored
+    def bh_adjust(values):
+        values = np.asarray(values, dtype=float)
+        adjusted = np.full(values.shape, np.nan)
+        valid = np.isfinite(values)
+        pvalues = values[valid]
+        if len(pvalues) == 0:
             return adjusted
 
-        heat_qvalues = pd.DataFrame(
-            bh_adjust(heat_pvalues.to_numpy().ravel()).reshape(
-                heat_pvalues.shape
-            ),
-            index=heat_pvalues.index,
-            columns=heat_pvalues.columns,
+        order = np.argsort(pvalues)
+        ranked = pvalues[order]
+        qvalues = ranked * len(ranked) / np.arange(
+            1,
+            len(ranked) + 1,
         )
+        qvalues = np.minimum.accumulate(qvalues[::-1])[::-1]
+        qvalues = np.clip(qvalues, 0, 1)
+        restored = np.empty_like(qvalues)
+        restored[order] = qvalues
+        adjusted[valid] = restored
+        return adjusted
 
-        module_ids = [f"module_{i}" for i in range(len(heat_scores))]
-        module_labels = [
-            module_display.get(module_name, module_name)
-            for module_name in heat_scores.index
-        ]
-        plot_obs = pd.DataFrame(
-            {
-                "module_id": pd.Categorical(
-                    module_ids,
-                    categories=module_ids,
-                    ordered=True,
-                ),
-                "module_label": module_labels,
-            },
-            index=module_ids,
-        )
-        plot_var = pd.DataFrame(
-            {"domain": column_domains},
-            index=column_ids,
-        )
-        plot_adata = sc.AnnData(
-            X=heat_scores.to_numpy(dtype=np.float32),
-            obs=plot_obs,
-            var=plot_var,
-        )
+    heat_qvalues = pd.DataFrame(
+        bh_adjust(heat_pvalues.to_numpy().ravel()).reshape(
+            heat_pvalues.shape
+        ),
+        index=heat_pvalues.index,
+        columns=heat_pvalues.columns,
+    )
 
-        finite_values = np.abs(heat_scores.to_numpy())
-        finite_values = finite_values[np.isfinite(finite_values)]
-        vmax = (
-            np.percentile(finite_values, 95)
-            if finite_values.size
-            else 1
-        )
-        vmax = max(vmax, 1)
-
-        mp = sc.pl.matrixplot(
-            plot_adata,
-            var_names=column_ids,
-            groupby="module_id",
-            cmap="RdBu_r",
-            vmin=-vmax,
-            vmax=vmax,
-            colorbar_title="",
-            figsize=(11, 12.0),
-            return_fig=True,
-        )
-        mp.make_figure()
-        axes = mp.get_axes()
-        ax = axes["mainplot_ax"]
-        fig = ax.figure
-
-        ax.set_xticklabels(column_domains, rotation=90, ha="center", fontsize=16)
-        ax.set_yticklabels(module_labels, rotation=0, fontsize=16)
-        ax.set_xlabel("")
-        ax.set_ylabel("")
-
-        for pair_i, pair_label in enumerate(pair_labels):
-            ax.text(
-                2 * pair_i + 1,
-                1.035,
-                pair_label,
-                transform=ax.get_xaxis_transform(),
-                ha="center",
-                va="bottom",
-                fontsize=16,
-                fontweight="bold",
-                clip_on=False,
-            )
-
-        for boundary in range(2, 2 * len(pair_ids), 2):
-            ax.axvline(
-                boundary,
-                color="black",
-                linewidth=1.1,
-                clip_on=False,
-            )
-
-        for row in range(heat_qvalues.shape[0]):
-            for column in range(heat_qvalues.shape[1]):
-                qvalue = heat_qvalues.iat[row, column]
-                if np.isfinite(qvalue) and qvalue < fdr_threshold:
-                    score = heat_scores.iat[row, column]
-                    star_color = (
-                        "white" if abs(score) > 0.65 * vmax else "black"
-                    )
-                    ax.text(
-                        column + 0.5,
-                        row + 0.5,
-                        "*",
-                        ha="center",
-                        va="center",
-                        color=star_color,
-                        fontsize=22,
-                        fontweight="bold",
-                    )
-
-        fig.subplots_adjust(
-            left=0.30,
-            right=0.95,
-            bottom=0.15,
-            top=0.90,
-        )
-
-        # Scanpy creates a horizontal colorbar in a dedicated axes. Move that
-        # axes beneath the main plot and anchor it to the bottom-left.
-        colorbar_ax = axes.get("color_legend_ax")
-        if colorbar_ax is not None:
-            main_position = ax.get_position()
-            colorbar_ax.set_position(
-                [
-                    main_position.x0,
-                    0.03,
-                    main_position.width * 0.15,
-                    0.025,
-                ]
-            )
-            colorbar_ax.set_title(
-                "Signed loading\nenrichment",
-                loc="left",
-                fontsize=16,
-                pad=4,
-            )
-            colorbar_ax.tick_params(labelsize=14)
-
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with plt.rc_context({"svg.fonttype": "none"}):
-            fig.savefig(
-                save_path,
-                format="svg",
-                bbox_inches="tight",
-                dpi=300,
-            )
-        print(f"Saved: {save_path}")
-        plt.show()
-
-        source_scores_spatial = source_pls.transform(
-            source_adata.obsm["MultiGATE_source_aligned"]
-        )
-        target_scores_spatial = target_pls.transform(
-            target_adata.obsm["MultiGATE_source_aligned"]
-        )
-        source_spatial_columns = []
-        target_spatial_columns = []
-
-        for match in match_records:
-            source_column = f"{match['source_component']}_plot"
-            target_column = f"{match['target_component']}_plot"
-            source_adata.obs[source_column] = source_scores_spatial[
-                :,
-                match["source_index"],
-            ]
-            target_adata.obs[target_column] = (
-                match["target_sign"]
-                * target_scores_spatial[:, match["target_index"]]
-            )
-            source_spatial_columns.append(source_column)
-            target_spatial_columns.append(target_column)
-
-        match_table = pd.DataFrame(match_records)
-        print("\nPLS component matching and target sign alignment:")
-        print(match_table.to_string(index=False))
-        print("Source spatial columns:", source_spatial_columns)
-        print("Target spatial columns:", target_spatial_columns)
-
-        return {
-            "figure": fig,
-            "matrixplot": mp,
-            "match_table": match_table,
-            "scores": heat_scores,
-            "qvalues": heat_qvalues,
-            "source_spatial_columns": source_spatial_columns,
-            "target_spatial_columns": target_spatial_columns,
-            "save_path": save_path,
-        }
-
-    def get_liana_lrdata(adata, cell_type_col, lr_pairs):
-
-        adata.X = adata.layers["SCT_data"].copy()
-        sc.pp.normalize_total(adata, target_sum=1e4)
-        sc.pp.log1p(adata)
-
-        li.ut.spatial_neighbors(adata=adata, bandwidth=40, spatial_key='spatial')
-        sq.gr.spatial_autocorr(adata, mode='moran', use_raw=False, show_progress_bar=True)
-        svgs = adata.uns['moranI'].index[(adata.uns['moranI']['pval_norm_fdr_bh'] < 0.05) & (adata.uns['moranI']['I'] > 0.01)]
-        adata = adata[:, svgs]
-
-        lrdata = li.mt.inflow(
-            adata,
-            groupby=cell_type_col,
-            resource = lr_pairs,
-            use_raw=False,
-        )
-        lrdata.var['interaction'] = lrdata.var_names.str.split('^').to_series().apply(lambda x: f'{x[1]}^{x[2]}').values
-        return lrdata
-
-    def build_lrdata_aggregated_by_genesets(lrdata, unique_geneset_per_lr, umap_title=None, save_plots=False, plot_prefix=''):
-        """Aggregate LIANA inflow by hallmark geneset; mutates lrdata.var with geneset columns."""
-        lrdata.var = lrdata.var.merge(
-            unique_geneset_per_lr, left_on='interaction', right_index=True, how='left'
-        )
-        geneset_cols = unique_geneset_per_lr.columns
-        geneset_cols = list(geneset_cols[geneset_cols.isin(lrdata.var.columns)])
-        liana_by_geneset = lrdata.var[geneset_cols].fillna(0)
-        if not liana_by_geneset.values.any():
-            print('No expression in LIANA genesets, returning None')
-            return None
-
-        X_genesets = lrdata.X @ sp.csr_matrix(liana_by_geneset.values)
-        lrdata_genesets = sc.AnnData(
-            X=X_genesets,
-            obs=lrdata.obs,
-            var=pd.DataFrame(index=liana_by_geneset.columns),
-            obsm={'spatial': lrdata.obsm['spatial'].copy()},
-        )
-        sc.pp.filter_cells(lrdata_genesets, min_genes=3)
-        sc.pp.filter_genes(lrdata_genesets, min_cells=2)
-
-        sc.pp.neighbors(lrdata_genesets, use_rep='X', metric='cosine')
-        sc.tl.umap(lrdata_genesets)
-        sc.tl.leiden(lrdata_genesets, resolution=0.03)
-
-        lrdata_genesets.obsm['MultiGATE_source_aligned'] = lrdata[
-            lrdata_genesets.obs_names
-        ].obsm['MultiGATE_source_aligned'].copy()
-        lrdata_genesets.obsm['spatial'] = lrdata[lrdata_genesets.obs_names].obsm['spatial'].copy()
-        return lrdata_genesets
-
-    ## train PLS models on source and target data. The four fits are independent, so
-    ## their component signs are arbitrary relative to each other; the source RNA model
-    ## is the reference and the other three are sign-matched to it over the union of all
-    ## four embeddings, so that a column of the spatial-map panel is one pattern rather
-    ## than a pattern and its negative. The reference itself is oriented on myelin, so
-    ## PLS_0 reads positive over the fibre tracts in every row.
-    MYELIN_MARKER_GENES = [
-        'Mbp', 'Plp1', 'Mobp', 'Mal', 'Cnp', 'Mog', 'Mag', 'Cldn11', 'Ermn', 'Sox10',
+    module_ids = [f"module_{i}" for i in range(len(heat_scores))]
+    module_labels = [
+        module_display.get(module_name, module_name)
+        for module_name in heat_scores.index
     ]
-
-    pls_sign_reference_Z = np.concatenate([
-        source_rna.obsm['MultiGATE_source_aligned'],
-        target_rna.obsm['MultiGATE_source_aligned'],
-        source_atac.obsm['MultiGATE_source_aligned'],
-        target_atac.obsm['MultiGATE_source_aligned'],
-    ], axis=0)
-
-    pls_source_rna, pls_source_rna_coef_df, _ = run_pls_embedding_to_gene_plots(source_rna, save_plots=False, plot_prefix='01_source_rna_pls', orient_markers=MYELIN_MARKER_GENES, orient_components=(0,))
-    pls_target_rna, pls_target_rna_coef_df, _ = run_pls_embedding_to_gene_plots(target_rna, save_plots=False, plot_prefix='02_target_rna_pls', censor_gene_from_plot=['C530008M17Rik'], sign_reference_pls=pls_source_rna, sign_reference_Z=pls_sign_reference_Z)
-    pls_source_atac, pls_source_atac_coef_df, _ = run_pls_embedding_to_gene_plots(source_atac, save_plots=False, plot_prefix='03_source_atac_pls', sign_reference_pls=pls_source_rna, sign_reference_Z=pls_sign_reference_Z)
-    pls_target_atac, pls_target_atac_coef_df, _ = run_pls_embedding_to_gene_plots(target_atac, save_plots=False, plot_prefix='04_target_atac_pls', sign_reference_pls=pls_source_rna, sign_reference_Z=pls_sign_reference_Z)
-
-    ## the pairwise refinement matters for the later components: aligning each model to
-    ## the reference alone can leave two non-reference models disagreeing with each
-    ## other once a component is only weakly shared
-    refine_pls_signs_across_models(
-        [
-            ('source RNA', pls_source_rna),
-            ('source ATAC', pls_source_atac),
-            ('target RNA', pls_target_rna),
-            ('target ATAC', pls_target_atac),
-        ],
-        pls_sign_reference_Z,
-        n_show=5,
+    plot_obs = pd.DataFrame(
+        {
+            "module_id": pd.Categorical(
+                module_ids,
+                categories=module_ids,
+                ordered=True,
+            ),
+            "module_label": module_labels,
+        },
+        index=module_ids,
+    )
+    plot_var = pd.DataFrame(
+        {"domain": column_domains},
+        index=column_ids,
+    )
+    plot_adata = sc.AnnData(
+        X=heat_scores.to_numpy(dtype=np.float32),
+        obs=plot_obs,
+        var=plot_var,
     )
 
-    ## the refinement re-signs the models in place, so the loading frames captured at
-    ## fit time are stale: rebuild them before anything downstream (the enrichment
-    ## heatmap, the gene-peak link scoring) reads a sign the spatial maps no longer show
-    pls_source_rna_coef_df = pls_loadings_df(pls_source_rna, source_rna.var_names)
-    pls_target_rna_coef_df = pls_loadings_df(pls_target_rna, target_rna.var_names)
-    pls_source_atac_coef_df = pls_loadings_df(pls_source_atac, source_atac.var_names)
-    pls_target_atac_coef_df = pls_loadings_df(pls_target_atac, target_atac.var_names)
-
-    fig_pls_spatial_panel = plot_pls_spatial_panel(
-        [
-            ('source RNA', source_rna, pls_source_rna),
-            ('source ATAC', source_atac, pls_source_atac),
-            ('target RNA', target_rna, pls_target_rna),
-            ('target ATAC', target_atac, pls_target_atac),
-        ],
-        ## five components make the grid wide enough on its own, so the columns close
-        ## up and the colorbar goes underneath rather than into the right margin
-        n_show=5,
-        col_gap_in=0.06,
-        cbar_loc='bottom',
-        save_plots=True,
+    finite_values = np.abs(heat_scores.to_numpy())
+    finite_values = finite_values[np.isfinite(finite_values)]
+    vmax = (
+        np.percentile(finite_values, 95)
+        if finite_values.size
+        else 1
     )
+    vmax = max(vmax, 1)
 
-    pls_biological_annotation_results = plot_pls_biological_annotation(
-        source_adata=source_rna,
-        target_adata=target_rna,
-        source_pls=pls_source_rna,
-        target_pls=pls_target_rna,
-        source_loadings=pls_source_rna_coef_df,
-        target_loadings=pls_target_rna_coef_df,
-        n_pairs=5,
+    mp = sc.pl.matrixplot(
+        plot_adata,
+        var_names=column_ids,
+        groupby="module_id",
+        cmap="RdBu_r",
+        vmin=-vmax,
+        vmax=vmax,
+        colorbar_title="",
+        figsize=(11, 12.0),
+        return_fig=True,
     )
+    mp.make_figure()
+    axes = mp.get_axes()
+    ax = axes["mainplot_ax"]
+    fig = ax.figure
 
-    ## plot correlation between source and target PLS dimensions
-    fig, ax = plt.subplots(2, 1, figsize=(4, 8))
-    pls_rna_corr = np.corrcoef(pls_source_rna.y_weights_, pls_target_rna.y_weights_, rowvar=False)
-    pls_rna_corr = pls_rna_corr[:pls_source_rna.y_weights_.shape[1], pls_target_rna.y_weights_.shape[1]:]
-    sns.heatmap(np.abs(pls_rna_corr), cmap='YlGn', cbar=True, ax=ax[0])
-    ax[0].set_xlabel('Target PLS dimensions')
-    ax[0].set_ylabel('Source PLS dimensions')
-    ax[0].set_title('RNA')
+    ax.set_xticklabels(column_domains, rotation=90, ha="center", fontsize=16)
+    ax.set_yticklabels(module_labels, rotation=0, fontsize=16)
+    ax.set_xlabel("")
+    ax.set_ylabel("")
 
-    pls_atac_corr = np.corrcoef(pls_source_atac.y_weights_, pls_target_atac.y_weights_, rowvar=False)
-    pls_atac_corr = pls_atac_corr[:pls_source_atac.y_weights_.shape[1], pls_target_atac.y_weights_.shape[1]:]
-    sns.heatmap(np.abs(pls_atac_corr), cmap='YlGn', cbar=True, ax=ax[1])
-    ax[1].set_xlabel('Target PLS dimensions')
-    ax[1].set_ylabel('Source PLS dimensions')
-    ax[1].set_title('ATAC')
-    fig.tight_layout()
-    plt.show()
-    save_plot_to_svg(fig, '11_pls_source_target_correlation_heatmaps')
-
-    #%% build shared Hallmark mouse net once
-    hallmark_human = dc.op.hallmark(organism="human")
-    map_path = os.path.join(os.environ["DATAPATH"], "gene_annotations", "human_mouse_gene_orthologs.csv")
-    map_df = (
-        pd.read_csv(map_path)
-        .rename(columns={"Gene name": "target_human", "Mouse gene name": "target"})[
-            ["target_human", "target"]
-        ]
-        .dropna()
-        .drop_duplicates()
-    )
-    hallmark_mouse_net = (
-        hallmark_human.rename(columns={"target": "target_human"})
-        .merge(map_df, on="target_human", how="inner")[["source", "target"]]
-        .drop_duplicates()
-    )
-
-    lr_pairs = li.rs.select_resource('mouseconsensus')
-    
-    lr_geneset = li.rs.generate_lr_geneset(
-        lr_pairs,
-        hallmark_mouse_net,
-        lr_sep="^",
-        weight=None,
-    )
-
-    ## build LR data and train PLS models on LR data
-    lrdata_source_rna = get_liana_lrdata(source_rna, 'leiden', lr_pairs)
-    lrdata_target_rna = get_liana_lrdata(target_rna, 'leiden', lr_pairs)
-    pls_source_rna_liana, pls_source_rna_liana_coef_df, _ = run_pls_embedding_to_gene_plots(lrdata_source_rna, save_plots=True, plot_prefix='05_source_rna_liana_pls')
-    pls_target_rna_liana, pls_target_rna_liana_coef_df, _ = run_pls_embedding_to_gene_plots(lrdata_target_rna, save_plots=True, plot_prefix='06_target_rna_liana_pls')
-
-    unique_geneset_per_lr = lr_geneset.groupby('interaction')['source'].unique().map(list).rename('genesets')
-    unique_geneset_per_lr = unique_geneset_per_lr.explode().str.get_dummies().groupby(level=0).max()
-
-    # Capture full spatial layout before filter_cells removes any cells, so
-    # filtered-out cells can be rendered as a gray background in spatial plots.
-    def make_full_pls_plot_reference(adata):
-        return sc.AnnData(
-            X=np.zeros((adata.n_obs, 1)),
-            obs=adata.obs.copy(),
-            obsm={
-                key: adata.obsm[key].copy()
-                for key in ['spatial', 'X_umap']
-                if key in adata.obsm
-            },
+    for pair_i, pair_label in enumerate(pair_labels):
+        ax.text(
+            2 * pair_i + 1,
+            1.035,
+            pair_label,
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="bottom",
+            fontsize=16,
+            fontweight="bold",
+            clip_on=False,
         )
 
-    full_spatial_obsm_df_source = make_full_pls_plot_reference(lrdata_source_rna)
-    full_spatial_obsm_df_target = make_full_pls_plot_reference(lrdata_target_rna)
-
-    lrdata_source_rna_genesets = build_lrdata_aggregated_by_genesets(
-        lrdata_source_rna, unique_geneset_per_lr
-    )
-    lrdata_target_rna_genesets = build_lrdata_aggregated_by_genesets(
-        lrdata_target_rna, unique_geneset_per_lr
-    )
-
-    if lrdata_source_rna_genesets is not None:
-        pls_lrdata_source_rna_genesets, _, _ = run_pls_embedding_to_gene_plots(
-            lrdata_source_rna_genesets,
-            full_spatial_obsm_df_source,
-            umap_title='source RNA LIANA (geneset aggregate)',
-            umap_plot_prefix='07_source_rna_liana_geneset',
-            weights_plot_type='barplot',
-            save_plots=True,
-            plot_prefix='09_source_rna_liana_geneset_pls',
+    for boundary in range(2, 2 * len(pair_ids), 2):
+        ax.axvline(
+            boundary,
+            color="black",
+            linewidth=1.1,
+            clip_on=False,
         )
-    if lrdata_target_rna_genesets is not None:
-        pls_lrdata_target_rna_genesets, _, _ = run_pls_embedding_to_gene_plots(
-            lrdata_target_rna_genesets,
-            full_spatial_obsm_df_target,
-            umap_title='target RNA LIANA (geneset aggregate)',
-            umap_plot_prefix='08_target_rna_liana_geneset',
-            weights_plot_type='barplot',
-            save_plots=True,
-            plot_prefix='10_target_rna_liana_geneset_pls',
-        )
-    
-    #%% attention matrix analysis
-    from gene_peak_attention_utils import (
-        plot_signed_arcs_stacked,
-        save_gene_peak_links_bedpe,
-    )
-    from post_hoc_utils import gene_peak_attention_links_from_att_lgp
 
-    '''
-    # Find the artifact path for the attention matrix
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        attention_artifact_path = "matrices/source_peak_gene_attention.npz"
-        if not artifact_exists(client, run_id, attention_artifact_path):
-            raise FileNotFoundError(
-                "Artifact '{}' not found for run {}.".format(
-                    attention_artifact_path, run_id
+    for row in range(heat_qvalues.shape[0]):
+        for column in range(heat_qvalues.shape[1]):
+            qvalue = heat_qvalues.iat[row, column]
+            if np.isfinite(qvalue) and qvalue < fdr_threshold:
+                score = heat_scores.iat[row, column]
+                star_color = (
+                    "white" if abs(score) > 0.65 * vmax else "black"
                 )
-            )
-        local_path = client.download_artifacts(
-            run_id,
-            attention_artifact_path,
-            tmp_dir,
+                ax.text(
+                    column + 0.5,
+                    row + 0.5,
+                    "*",
+                    ha="center",
+                    va="center",
+                    color=star_color,
+                    fontsize=22,
+                    fontweight="bold",
+                )
+
+    fig.subplots_adjust(
+        left=0.30,
+        right=0.95,
+        bottom=0.15,
+        top=0.90,
+    )
+
+    # Scanpy creates a horizontal colorbar in a dedicated axes. Move that
+    # axes beneath the main plot and anchor it to the bottom-left.
+    colorbar_ax = axes.get("color_legend_ax")
+    if colorbar_ax is not None:
+        main_position = ax.get_position()
+        colorbar_ax.set_position(
+            [
+                main_position.x0,
+                0.03,
+                main_position.width * 0.15,
+                0.025,
+            ]
         )
-        source_peak_gene_attention = sp.load_npz(local_path)
+        colorbar_ax.set_title(
+            "Signed loading\nenrichment",
+            loc="left",
+            fontsize=16,
+            pad=4,
+        )
+        colorbar_ax.tick_params(labelsize=14)
 
-    attention_analysis_summary = run_gene_peak_attention_tutorial(
-        peak_gene_attention=source_peak_gene_attention,
-        adata_rna=source_rna,
-        adata_atac=source_atac,
-    )
-
-    ## load gene-peak attention links
-    gene_peak_attention_links = pd.read_csv(os.path.join(attention_analysis_summary['output_dir'], 'merged_df_threshold.csv'))
-    duplicate_rows = gene_peak_attention_links[gene_peak_attention_links.duplicated(subset=['Gene', 'Peak'], keep=False)]
-    gene_peak_attention_links = gene_peak_attention_links.loc[gene_peak_attention_links['chr'].str.startswith('chr')]
-    gene_peak_attention_links = gene_peak_attention_links.drop_duplicates(subset=['Gene', 'Peak', 'Attention', 'gene_idx', 'peak_idx'])
-    assert gene_peak_attention_links[['Gene', 'Peak']].value_counts().le(1).all()
-    '''
-
-    source_gene_peak_attention_links, source_attention_analysis_summary = gene_peak_attention_links_from_att_lgp(
-        source_att_lgp, source_rna, source_atac
-    )
-    target_gene_peak_attention_links, target_attention_analysis_summary = gene_peak_attention_links_from_att_lgp(
-        target_att_lgp, target_rna, target_atac
-    )
-
-    ## find high PLS-weighted gene-peak attention links
-    source_all_pls_scores_df, source_all_pls_scores_grouped_df = score_gene_peak_attention_links_by_pls(
-        source_gene_peak_attention_links,
-        pls_source_rna_coef_df,
-        pls_source_atac_coef_df,
-    )
-    target_all_pls_scores_df, target_all_pls_scores_grouped_df = score_gene_peak_attention_links_by_pls(
-        target_gene_peak_attention_links,
-        pls_target_rna_coef_df,
-        pls_target_atac_coef_df,
-    )
-    merged_pls_scores_grouped_df = pd.merge(
-        source_all_pls_scores_grouped_df.head(20),
-        target_all_pls_scores_grouped_df.head(20),
-        on=['index','gene'], suffixes=('source','target')
-    )
-
-    print("Source PLS-weighted gene-peak attention links:")
-    print(source_all_pls_scores_df.head(5))
-    print(source_all_pls_scores_grouped_df.head(10))
-    print("Target PLS-weighted gene-peak attention links:")
-    print(target_all_pls_scores_df.head(5))
-    print(target_all_pls_scores_grouped_df.head(10))
-
-    ## select PLS-gene combinations
-    pls_cmp = 'PLS_1'
-    gene = 'Pde10a'
-
-    # DORC plot and annotate the marker corresponding to 'gene'
-    plt.figure(figsize=(2.5, 3))
-    value_counts = source_gene_peak_attention_links['Gene'].value_counts(ascending=True)
-    ax = value_counts.plot(marker='.', color='black')
-    plt.xlabel('Genes')
-    plt.ylabel('Number of peaks')
-    if gene in value_counts.index:
-        y = value_counts[gene]
-        x = list(value_counts.index).index(gene)
-        ax.plot(x, y, 'ro', markersize=8, label=gene)
-        ax.annotate(gene, (x, y), xytext=(-25, 8), textcoords='offset points', ha='center', va='bottom', fontsize=9, color='red', fontweight='bold')
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with plt.rc_context({"svg.fonttype": "none"}):
+        fig.savefig(
+            save_path,
+            format="svg",
+            bbox_inches="tight",
+            dpi=300,
+        )
+    print(f"Saved: {save_path}")
     plt.show()
-    assert source_gene_peak_attention_links['Gene'].value_counts(ascending=True).equals(target_gene_peak_attention_links['Gene'].value_counts(ascending=True))
 
-    ## isolate gene-peak link df
-    source_gp_link_df, source_peaks = select_gene_peak_link_df(
-        source_gene_peak_attention_links,
-        pls_source_rna_coef_df,
-        pls_source_atac_coef_df,
-        pls_cmp,
-        gene,
+    source_scores_spatial = source_pls.transform(
+        source_adata.obsm["MultiGATE_source_aligned"]
     )
-    target_gp_link_df, target_peaks = select_gene_peak_link_df(
-        target_gene_peak_attention_links,
-        pls_target_rna_coef_df,
-        pls_target_atac_coef_df,
-        pls_cmp,
-        gene,
+    target_scores_spatial = target_pls.transform(
+        target_adata.obsm["MultiGATE_source_aligned"]
     )
-    ## create 'peak' scores out of peak set
-    source_peak_scores = source_atac[:, source_gp_link_df['Peak']].X.multiply(source_gp_link_df[f'{pls_cmp}_peak_weight']).sum(axis=1)
-    target_peak_scores = target_atac[:, target_gp_link_df['Peak']].X.multiply(target_gp_link_df[f'{pls_cmp}_peak_weight']).sum(axis=1)
-    source_atac.obs[f'{gene}-linked peaks'] = source_peak_scores
-    target_atac.obs[f'{gene}-linked peaks'] = target_peak_scores
+    source_spatial_columns = []
+    target_spatial_columns = []
 
-    ## spatial plots of selected gene-peak links
-    fig, ax = plt.subplots(2, 2, figsize=(6, 6))
-    sc.pl.embedding(source_rna, basis='spatial', color=gene, size=60, ax=ax[0, 0], show=False)
-    sc.pl.embedding(target_rna, basis='spatial', color=gene, size=60, ax=ax[0, 1], show=False)
-    sc.pl.embedding(source_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, vmax=0.08, ax=ax[1, 0], show=False)
-    sc.pl.embedding(target_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, vmax=0.10, ax=ax[1, 1], show=False)
-    fig.suptitle(f'{gene} - {pls_cmp}')
-    ax[0, 0].set_title('Source gene'); ax[0, 0].set_xlabel(''); ax[0, 0].set_ylabel('')
-    ax[0, 1].set_title('Target gene'); ax[0, 1].set_xlabel(''); ax[0, 1].set_ylabel('')
-    ax[1, 0].set_title('Source peaks'); ax[1, 0].set_xlabel(''); ax[1, 0].set_ylabel('')
-    ax[1, 1].set_title('Target peaks'); ax[1, 1].set_xlabel(''); ax[1, 1].set_ylabel('')
-    plt.tight_layout(); plt.show()
+    for match in match_records:
+        source_column = f"{match['source_component']}_plot"
+        target_column = f"{match['target_component']}_plot"
+        source_adata.obs[source_column] = source_scores_spatial[
+            :,
+            match["source_index"],
+        ]
+        target_adata.obs[target_column] = (
+            match["target_sign"]
+            * target_scores_spatial[:, match["target_index"]]
+        )
+        source_spatial_columns.append(source_column)
+        target_spatial_columns.append(target_column)
 
-    ## save gene-peak links
-    safe_pls_cmp = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in str(pls_cmp))
-    safe_gene = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in str(gene))
+    match_table = pd.DataFrame(match_records)
+    print("\nPLS component matching and target sign alignment:")
+    print(match_table.to_string(index=False))
+    print("Source spatial columns:", source_spatial_columns)
+    print("Target spatial columns:", target_spatial_columns)
 
-    gp_link_prefix = f"source_gene_peak_links_{safe_pls_cmp}_{safe_gene}"
-    gp_link_csv_path = os.path.join(source_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.csv")
-    source_bedpe = os.path.join(source_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.bedpe")
-    source_gp_link_df.to_csv(gp_link_csv_path, index=False)
-    save_gene_peak_links_bedpe(source_gp_link_df, source_bedpe, score_col="Attention")
+    return {
+        "figure": fig,
+        "matrixplot": mp,
+        "match_table": match_table,
+        "scores": heat_scores,
+        "qvalues": heat_qvalues,
+        "source_spatial_columns": source_spatial_columns,
+        "target_spatial_columns": target_spatial_columns,
+        "save_path": save_path,
+    }
 
-    gp_link_prefix = f"target_gene_peak_links_{safe_pls_cmp}_{safe_gene}"
-    gp_link_csv_path = os.path.join(target_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.csv")
-    target_bedpe = os.path.join(target_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.bedpe")
-    target_gp_link_df.to_csv(gp_link_csv_path, index=False)
-    save_gene_peak_links_bedpe(target_gp_link_df, target_bedpe, score_col="Attention")
+def get_liana_lrdata(adata, cell_type_col, lr_pairs):
 
-    ## Plot signed-weight arcs (blue = positive {pls_cmp}_peak_weight, orange = negative;
-    ## transparency scales with |peak_weight|). Produces per-domain figures plus a
-    ## single stacked figure with source on top and target below, sharing genomic coordinates.
-    signed_arcs_out_dir = f"{os.getenv('OUTPATH')}/MultiGATE/attention_analysis"
-    source_signed_arcs_pdf = os.path.join(
-        signed_arcs_out_dir, f"source_gene_peak_links_signed_{safe_pls_cmp}_{safe_gene}.pdf"
+    adata.X = adata.layers["SCT_data"].copy()
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+
+    li.ut.spatial_neighbors(adata=adata, bandwidth=40, spatial_key='spatial')
+    sq.gr.spatial_autocorr(adata, mode='moran', use_raw=False, show_progress_bar=True)
+    svgs = adata.uns['moranI'].index[(adata.uns['moranI']['pval_norm_fdr_bh'] < 0.05) & (adata.uns['moranI']['I'] > 0.01)]
+    adata = adata[:, svgs]
+
+    lrdata = li.mt.inflow(
+        adata,
+        groupby=cell_type_col,
+        resource = lr_pairs,
+        use_raw=False,
     )
-    target_signed_arcs_pdf = os.path.join(
-        signed_arcs_out_dir, f"target_gene_peak_links_signed_{safe_pls_cmp}_{safe_gene}.pdf"
+    lrdata.var['interaction'] = lrdata.var_names.str.split('^').to_series().apply(lambda x: f'{x[1]}^{x[2]}').values
+    return lrdata
+
+def build_lrdata_aggregated_by_genesets(lrdata, unique_geneset_per_lr, umap_title=None, save_plots=False, plot_prefix=''):
+    """Aggregate LIANA inflow by hallmark geneset; mutates lrdata.var with geneset columns."""
+    lrdata.var = lrdata.var.merge(
+        unique_geneset_per_lr, left_on='interaction', right_index=True, how='left'
     )
-    stacked_signed_arcs_pdf = os.path.join(
-        signed_arcs_out_dir, f"stacked_gene_peak_links_signed_{safe_pls_cmp}_{safe_gene}.pdf"
+    geneset_cols = unique_geneset_per_lr.columns
+    geneset_cols = list(geneset_cols[geneset_cols.isin(lrdata.var.columns)])
+    liana_by_geneset = lrdata.var[geneset_cols].fillna(0)
+    if not liana_by_geneset.values.any():
+        print('No expression in LIANA genesets, returning None')
+        return None
+
+    X_genesets = lrdata.X @ sp.csr_matrix(liana_by_geneset.values)
+    lrdata_genesets = sc.AnnData(
+        X=X_genesets,
+        obs=lrdata.obs,
+        var=pd.DataFrame(index=liana_by_geneset.columns),
+        obsm={'spatial': lrdata.obsm['spatial'].copy()},
+    )
+    sc.pp.filter_cells(lrdata_genesets, min_genes=3)
+    sc.pp.filter_genes(lrdata_genesets, min_cells=2)
+
+    sc.pp.neighbors(lrdata_genesets, use_rep='X', metric='cosine')
+    sc.tl.umap(lrdata_genesets)
+    sc.tl.leiden(lrdata_genesets, resolution=0.03)
+
+    lrdata_genesets.obsm['MultiGATE_source_aligned'] = lrdata[
+        lrdata_genesets.obs_names
+    ].obsm['MultiGATE_source_aligned'].copy()
+    lrdata_genesets.obsm['spatial'] = lrdata[lrdata_genesets.obs_names].obsm['spatial'].copy()
+    return lrdata_genesets
+
+## train PLS models on source and target data. The four fits are independent, so
+## their component signs are arbitrary relative to each other; the source RNA model
+## is the reference and the other three are sign-matched to it over the union of all
+## four embeddings, so that a column of the spatial-map panel is one pattern rather
+## than a pattern and its negative. The reference itself is oriented on myelin, so
+## PLS_0 reads positive over the fibre tracts in every row.
+MYELIN_MARKER_GENES = [
+    'Mbp', 'Plp1', 'Mobp', 'Mal', 'Cnp', 'Mog', 'Mag', 'Cldn11', 'Ermn', 'Sox10',
+]
+
+pls_sign_reference_Z = np.concatenate([
+    source_rna.obsm['MultiGATE_source_aligned'],
+    target_rna.obsm['MultiGATE_source_aligned'],
+    source_atac.obsm['MultiGATE_source_aligned'],
+    target_atac.obsm['MultiGATE_source_aligned'],
+], axis=0)
+
+pls_source_rna, pls_source_rna_coef_df, _ = run_pls_embedding_to_gene_plots(source_rna, save_plots=False, plot_prefix='01_source_rna_pls', orient_markers=MYELIN_MARKER_GENES, orient_components=(0,))
+pls_target_rna, pls_target_rna_coef_df, _ = run_pls_embedding_to_gene_plots(target_rna, save_plots=False, plot_prefix='02_target_rna_pls', censor_gene_from_plot=['C530008M17Rik'], sign_reference_pls=pls_source_rna, sign_reference_Z=pls_sign_reference_Z)
+pls_source_atac, pls_source_atac_coef_df, _ = run_pls_embedding_to_gene_plots(source_atac, save_plots=False, plot_prefix='03_source_atac_pls', sign_reference_pls=pls_source_rna, sign_reference_Z=pls_sign_reference_Z)
+pls_target_atac, pls_target_atac_coef_df, _ = run_pls_embedding_to_gene_plots(target_atac, save_plots=False, plot_prefix='04_target_atac_pls', sign_reference_pls=pls_source_rna, sign_reference_Z=pls_sign_reference_Z)
+
+## the pairwise refinement matters for the later components: aligning each model to
+## the reference alone can leave two non-reference models disagreeing with each
+## other once a component is only weakly shared
+refine_pls_signs_across_models(
+    [
+        ('source RNA', pls_source_rna),
+        ('source ATAC', pls_source_atac),
+        ('target RNA', pls_target_rna),
+        ('target ATAC', pls_target_atac),
+    ],
+    pls_sign_reference_Z,
+    n_show=5,
+)
+
+## the refinement re-signs the models in place, so the loading frames captured at
+## fit time are stale: rebuild them before anything downstream (the enrichment
+## heatmap, the gene-peak link scoring) reads a sign the spatial maps no longer show
+pls_source_rna_coef_df = pls_loadings_df(pls_source_rna, source_rna.var_names)
+pls_target_rna_coef_df = pls_loadings_df(pls_target_rna, target_rna.var_names)
+pls_source_atac_coef_df = pls_loadings_df(pls_source_atac, source_atac.var_names)
+pls_target_atac_coef_df = pls_loadings_df(pls_target_atac, target_atac.var_names)
+
+fig_pls_spatial_panel = plot_pls_spatial_panel(
+    [
+        ('source RNA', source_rna, pls_source_rna),
+        ('source ATAC', source_atac, pls_source_atac),
+        ('target RNA', target_rna, pls_target_rna),
+        ('target ATAC', target_atac, pls_target_atac),
+    ],
+    ## five components make the grid wide enough on its own, so the columns close
+    ## up and the colorbar goes underneath rather than into the right margin
+    n_show=5,
+    col_gap_in=0.06,
+    cbar_loc='bottom',
+    save_plots=True,
+)
+
+pls_biological_annotation_results = plot_pls_biological_annotation(
+    source_adata=source_rna,
+    target_adata=target_rna,
+    source_pls=pls_source_rna,
+    target_pls=pls_target_rna,
+    source_loadings=pls_source_rna_coef_df,
+    target_loadings=pls_target_rna_coef_df,
+    n_pairs=5,
+)
+
+## plot correlation between source and target PLS dimensions
+fig, ax = plt.subplots(2, 1, figsize=(4, 8))
+pls_rna_corr = np.corrcoef(pls_source_rna.y_weights_, pls_target_rna.y_weights_, rowvar=False)
+pls_rna_corr = pls_rna_corr[:pls_source_rna.y_weights_.shape[1], pls_target_rna.y_weights_.shape[1]:]
+sns.heatmap(np.abs(pls_rna_corr), cmap='YlGn', cbar=True, ax=ax[0])
+ax[0].set_xlabel('Target PLS dimensions')
+ax[0].set_ylabel('Source PLS dimensions')
+ax[0].set_title('RNA')
+
+pls_atac_corr = np.corrcoef(pls_source_atac.y_weights_, pls_target_atac.y_weights_, rowvar=False)
+pls_atac_corr = pls_atac_corr[:pls_source_atac.y_weights_.shape[1], pls_target_atac.y_weights_.shape[1]:]
+sns.heatmap(np.abs(pls_atac_corr), cmap='YlGn', cbar=True, ax=ax[1])
+ax[1].set_xlabel('Target PLS dimensions')
+ax[1].set_ylabel('Source PLS dimensions')
+ax[1].set_title('ATAC')
+fig.tight_layout()
+plt.show()
+save_plot_to_svg(fig, '11_pls_source_target_correlation_heatmaps')
+
+#%% build shared Hallmark mouse net once
+hallmark_human = dc.op.hallmark(organism="human")
+map_path = os.path.join(os.environ["DATAPATH"], "gene_annotations", "human_mouse_gene_orthologs.csv")
+map_df = (
+    pd.read_csv(map_path)
+    .rename(columns={"Gene name": "target_human", "Mouse gene name": "target"})[
+        ["target_human", "target"]
+    ]
+    .dropna()
+    .drop_duplicates()
+)
+hallmark_mouse_net = (
+    hallmark_human.rename(columns={"target": "target_human"})
+    .merge(map_df, on="target_human", how="inner")[["source", "target"]]
+    .drop_duplicates()
+)
+
+lr_pairs = li.rs.select_resource('mouseconsensus')
+
+lr_geneset = li.rs.generate_lr_geneset(
+    lr_pairs,
+    hallmark_mouse_net,
+    lr_sep="^",
+    weight=None,
+)
+
+## build LR data and train PLS models on LR data
+lrdata_source_rna = get_liana_lrdata(source_rna, 'leiden', lr_pairs)
+lrdata_target_rna = get_liana_lrdata(target_rna, 'leiden', lr_pairs)
+pls_source_rna_liana, pls_source_rna_liana_coef_df, _ = run_pls_embedding_to_gene_plots(lrdata_source_rna, save_plots=True, plot_prefix='05_source_rna_liana_pls')
+pls_target_rna_liana, pls_target_rna_liana_coef_df, _ = run_pls_embedding_to_gene_plots(lrdata_target_rna, save_plots=True, plot_prefix='06_target_rna_liana_pls')
+
+unique_geneset_per_lr = lr_geneset.groupby('interaction')['source'].unique().map(list).rename('genesets')
+unique_geneset_per_lr = unique_geneset_per_lr.explode().str.get_dummies().groupby(level=0).max()
+
+# Capture full spatial layout before filter_cells removes any cells, so
+# filtered-out cells can be rendered as a gray background in spatial plots.
+def make_full_pls_plot_reference(adata):
+    return sc.AnnData(
+        X=np.zeros((adata.n_obs, 1)),
+        obs=adata.obs.copy(),
+        obsm={
+            key: adata.obsm[key].copy()
+            for key in ['spatial', 'X_umap']
+            if key in adata.obsm
+        },
     )
 
-    plot_signed_arcs_stacked(
-        {"Source": source_gp_link_df},
-        pls_cmp=pls_cmp,
-        gene=gene,
-        out_path=source_signed_arcs_pdf,
-        title=f"{gene} — {pls_cmp} (source)",
+full_spatial_obsm_df_source = make_full_pls_plot_reference(lrdata_source_rna)
+full_spatial_obsm_df_target = make_full_pls_plot_reference(lrdata_target_rna)
+
+lrdata_source_rna_genesets = build_lrdata_aggregated_by_genesets(
+    lrdata_source_rna, unique_geneset_per_lr
+)
+lrdata_target_rna_genesets = build_lrdata_aggregated_by_genesets(
+    lrdata_target_rna, unique_geneset_per_lr
+)
+
+if lrdata_source_rna_genesets is not None:
+    pls_lrdata_source_rna_genesets, _, _ = run_pls_embedding_to_gene_plots(
+        lrdata_source_rna_genesets,
+        full_spatial_obsm_df_source,
+        umap_title='source RNA LIANA (geneset aggregate)',
+        umap_plot_prefix='07_source_rna_liana_geneset',
+        weights_plot_type='barplot',
+        save_plots=True,
+        plot_prefix='09_source_rna_liana_geneset_pls',
     )
-    plt.show()
-    plot_signed_arcs_stacked(
-        {"Target": target_gp_link_df},
-        pls_cmp=pls_cmp,
-        gene=gene,
-        out_path=target_signed_arcs_pdf,
-        title=f"{gene} — {pls_cmp} (target)",
+if lrdata_target_rna_genesets is not None:
+    pls_lrdata_target_rna_genesets, _, _ = run_pls_embedding_to_gene_plots(
+        lrdata_target_rna_genesets,
+        full_spatial_obsm_df_target,
+        umap_title='target RNA LIANA (geneset aggregate)',
+        umap_plot_prefix='08_target_rna_liana_geneset',
+        weights_plot_type='barplot',
+        save_plots=True,
+        plot_prefix='10_target_rna_liana_geneset_pls',
     )
-    plt.show()
-    plot_signed_arcs_stacked(
-        {"Source": source_gp_link_df, "Target": target_gp_link_df},
-        pls_cmp=pls_cmp,
-        gene=gene,
-        out_path=stacked_signed_arcs_pdf,
-        title=f"{gene} — {pls_cmp}",
+
+#%% attention matrix analysis
+from gene_peak_attention_utils import (
+    plot_signed_arcs_stacked,
+    save_gene_peak_links_bedpe,
+)
+from post_hoc_utils import gene_peak_attention_links_from_att_lgp
+
+'''
+# Find the artifact path for the attention matrix
+with tempfile.TemporaryDirectory() as tmp_dir:
+    attention_artifact_path = "matrices/source_peak_gene_attention.npz"
+    if not artifact_exists(client, run_id, attention_artifact_path):
+        raise FileNotFoundError(
+            "Artifact '{}' not found for run {}.".format(
+                attention_artifact_path, run_id
+            )
+        )
+    local_path = client.download_artifacts(
+        run_id,
+        attention_artifact_path,
+        tmp_dir,
     )
-    plt.show()
-    print(f"Saved signed-arc plots:\n {source_signed_arcs_pdf}\n {target_signed_arcs_pdf}\n {stacked_signed_arcs_pdf}")
+    source_peak_gene_attention = sp.load_npz(local_path)
 
-    # Plot the saved BEDPE with CoolBox (run from MultiGATE/; env needs bgzip, tabix, pairix).
-    # Need environment with CoolBox installed. (e.g. torch_env_py39)
-    # Use the BEDPE path printed above as --links; pass a sorted, tabix-indexed .gtf.bgz as --gtf (or set $DATAPATH).
-    # python scripts/plot_gene_peak_attention_links_track.py --links gp_link_bedpe_path --gtf "$DATAPATH/gene_annotations/gencode.vM25.chr_patch_hapl_scaff.annotation.sorted.gtf.bgz" --out "$OUTPATH/MultiGATE/attention_analysis/source_gene_peak_links.pdf"
-    # Write a bash script to file, with commands for both source and target plotting
+attention_analysis_summary = run_gene_peak_attention_tutorial(
+    peak_gene_attention=source_peak_gene_attention,
+    adata_rna=source_rna,
+    adata_atac=source_atac,
+)
 
-    plot_script_path = os.path.join(os.path.dirname(__file__), "plot_gene_peak_attention_links_track.py")
-    bash_script_path = os.path.join(f"{os.getenv('OUTPATH')}/MultiGATE/attention_analysis", "run_plot_gene_peak_attention_links.sh")
+## load gene-peak attention links
+gene_peak_attention_links = pd.read_csv(os.path.join(attention_analysis_summary['output_dir'], 'merged_df_threshold.csv'))
+duplicate_rows = gene_peak_attention_links[gene_peak_attention_links.duplicated(subset=['Gene', 'Peak'], keep=False)]
+gene_peak_attention_links = gene_peak_attention_links.loc[gene_peak_attention_links['chr'].str.startswith('chr')]
+gene_peak_attention_links = gene_peak_attention_links.drop_duplicates(subset=['Gene', 'Peak', 'Attention', 'gene_idx', 'peak_idx'])
+assert gene_peak_attention_links[['Gene', 'Peak']].value_counts().le(1).all()
+'''
 
-    # Fill in these file paths with your actual .bedpe, .gtf.bgz (tabix-indexed), and output paths
-    gtf_bgz = f"{os.getenv('DATAPATH')}/gene_annotations/gencode.vM25.chr_patch_hapl_scaff.annotation.sorted.gtf.bgz"
-    out_dir = f"{os.getenv('OUTPATH')}/MultiGATE/attention_analysis"
-    multigate_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-    source_signed_csv = os.path.splitext(source_bedpe)[0] + ".csv"
-    target_signed_csv = os.path.splitext(target_bedpe)[0] + ".csv"
+source_gene_peak_attention_links, source_attention_analysis_summary = gene_peak_attention_links_from_att_lgp(
+    source_att_lgp, source_rna, source_atac
+)
+target_gene_peak_attention_links, target_attention_analysis_summary = gene_peak_attention_links_from_att_lgp(
+    target_att_lgp, target_rna, target_atac
+)
 
-    bash_script_contents = f"""#!/bin/bash
+## find high PLS-weighted gene-peak attention links
+source_all_pls_scores_df, source_all_pls_scores_grouped_df = score_gene_peak_attention_links_by_pls(
+    source_gene_peak_attention_links,
+    pls_source_rna_coef_df,
+    pls_source_atac_coef_df,
+)
+target_all_pls_scores_df, target_all_pls_scores_grouped_df = score_gene_peak_attention_links_by_pls(
+    target_gene_peak_attention_links,
+    pls_target_rna_coef_df,
+    pls_target_atac_coef_df,
+)
+merged_pls_scores_grouped_df = pd.merge(
+    source_all_pls_scores_grouped_df.head(20),
+    target_all_pls_scores_grouped_df.head(20),
+    on=['index','gene'], suffixes=('source','target')
+)
+
+print("Source PLS-weighted gene-peak attention links:")
+print(source_all_pls_scores_df.head(5))
+print(source_all_pls_scores_grouped_df.head(10))
+print("Target PLS-weighted gene-peak attention links:")
+print(target_all_pls_scores_df.head(5))
+print(target_all_pls_scores_grouped_df.head(10))
+
+## select PLS-gene combinations
+pls_cmp = 'PLS_1'
+gene = 'Pde10a'
+
+# DORC plot and annotate the marker corresponding to 'gene'
+plt.figure(figsize=(2.5, 3))
+value_counts = source_gene_peak_attention_links['Gene'].value_counts(ascending=True)
+ax = value_counts.plot(marker='.', color='black')
+plt.xlabel('Genes')
+plt.ylabel('Number of peaks')
+if gene in value_counts.index:
+    y = value_counts[gene]
+    x = list(value_counts.index).index(gene)
+    ax.plot(x, y, 'ro', markersize=8, label=gene)
+    ax.annotate(gene, (x, y), xytext=(-25, 8), textcoords='offset points', ha='center', va='bottom', fontsize=9, color='red', fontweight='bold')
+plt.show()
+assert source_gene_peak_attention_links['Gene'].value_counts(ascending=True).equals(target_gene_peak_attention_links['Gene'].value_counts(ascending=True))
+
+## isolate gene-peak link df
+source_gp_link_df, source_peaks = select_gene_peak_link_df(
+    source_gene_peak_attention_links,
+    pls_source_rna_coef_df,
+    pls_source_atac_coef_df,
+    pls_cmp,
+    gene,
+)
+target_gp_link_df, target_peaks = select_gene_peak_link_df(
+    target_gene_peak_attention_links,
+    pls_target_rna_coef_df,
+    pls_target_atac_coef_df,
+    pls_cmp,
+    gene,
+)
+## create 'peak' scores out of peak set
+source_peak_scores = source_atac[:, source_gp_link_df['Peak']].X.multiply(source_gp_link_df[f'{pls_cmp}_peak_weight']).sum(axis=1)
+target_peak_scores = target_atac[:, target_gp_link_df['Peak']].X.multiply(target_gp_link_df[f'{pls_cmp}_peak_weight']).sum(axis=1)
+source_atac.obs[f'{gene}-linked peaks'] = source_peak_scores
+target_atac.obs[f'{gene}-linked peaks'] = target_peak_scores
+
+## spatial plots of selected gene-peak links
+fig, ax = plt.subplots(2, 2, figsize=(6, 6))
+sc.pl.embedding(source_rna, basis='spatial', color=gene, size=60, ax=ax[0, 0], show=False)
+sc.pl.embedding(target_rna, basis='spatial', color=gene, size=60, ax=ax[0, 1], show=False)
+sc.pl.embedding(source_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, vmax=0.08, ax=ax[1, 0], show=False)
+sc.pl.embedding(target_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, vmax=0.10, ax=ax[1, 1], show=False)
+fig.suptitle(f'{gene} - {pls_cmp}')
+ax[0, 0].set_title('Source gene'); ax[0, 0].set_xlabel(''); ax[0, 0].set_ylabel('')
+ax[0, 1].set_title('Target gene'); ax[0, 1].set_xlabel(''); ax[0, 1].set_ylabel('')
+ax[1, 0].set_title('Source peaks'); ax[1, 0].set_xlabel(''); ax[1, 0].set_ylabel('')
+ax[1, 1].set_title('Target peaks'); ax[1, 1].set_xlabel(''); ax[1, 1].set_ylabel('')
+plt.tight_layout(); plt.show()
+
+## save gene-peak links
+safe_pls_cmp = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in str(pls_cmp))
+safe_gene = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in str(gene))
+
+gp_link_prefix = f"source_gene_peak_links_{safe_pls_cmp}_{safe_gene}"
+gp_link_csv_path = os.path.join(source_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.csv")
+source_bedpe = os.path.join(source_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.bedpe")
+source_gp_link_df.to_csv(gp_link_csv_path, index=False)
+save_gene_peak_links_bedpe(source_gp_link_df, source_bedpe, score_col="Attention")
+
+gp_link_prefix = f"target_gene_peak_links_{safe_pls_cmp}_{safe_gene}"
+gp_link_csv_path = os.path.join(target_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.csv")
+target_bedpe = os.path.join(target_attention_analysis_summary["output_dir"], f"{gp_link_prefix}.bedpe")
+target_gp_link_df.to_csv(gp_link_csv_path, index=False)
+save_gene_peak_links_bedpe(target_gp_link_df, target_bedpe, score_col="Attention")
+
+## Plot signed-weight arcs (blue = positive {pls_cmp}_peak_weight, orange = negative;
+## transparency scales with |peak_weight|). Produces per-domain figures plus a
+## single stacked figure with source on top and target below, sharing genomic coordinates.
+signed_arcs_out_dir = f"{os.getenv('OUTPATH')}/MultiGATE/attention_analysis"
+source_signed_arcs_pdf = os.path.join(
+    signed_arcs_out_dir, f"source_gene_peak_links_signed_{safe_pls_cmp}_{safe_gene}.pdf"
+)
+target_signed_arcs_pdf = os.path.join(
+    signed_arcs_out_dir, f"target_gene_peak_links_signed_{safe_pls_cmp}_{safe_gene}.pdf"
+)
+stacked_signed_arcs_pdf = os.path.join(
+    signed_arcs_out_dir, f"stacked_gene_peak_links_signed_{safe_pls_cmp}_{safe_gene}.pdf"
+)
+
+plot_signed_arcs_stacked(
+    {"Source": source_gp_link_df},
+    pls_cmp=pls_cmp,
+    gene=gene,
+    out_path=source_signed_arcs_pdf,
+    title=f"{gene} — {pls_cmp} (source)",
+)
+plt.show()
+plot_signed_arcs_stacked(
+    {"Target": target_gp_link_df},
+    pls_cmp=pls_cmp,
+    gene=gene,
+    out_path=target_signed_arcs_pdf,
+    title=f"{gene} — {pls_cmp} (target)",
+)
+plt.show()
+plot_signed_arcs_stacked(
+    {"Source": source_gp_link_df, "Target": target_gp_link_df},
+    pls_cmp=pls_cmp,
+    gene=gene,
+    out_path=stacked_signed_arcs_pdf,
+    title=f"{gene} — {pls_cmp}",
+)
+plt.show()
+print(f"Saved signed-arc plots:\n {source_signed_arcs_pdf}\n {target_signed_arcs_pdf}\n {stacked_signed_arcs_pdf}")
+
+# Plot the saved BEDPE with CoolBox (run from MultiGATE/; env needs bgzip, tabix, pairix).
+# Need environment with CoolBox installed. (e.g. torch_env_py39)
+# Use the BEDPE path printed above as --links; pass a sorted, tabix-indexed .gtf.bgz as --gtf (or set $DATAPATH).
+# python scripts/plot_gene_peak_attention_links_track.py --links gp_link_bedpe_path --gtf "$DATAPATH/gene_annotations/gencode.vM25.chr_patch_hapl_scaff.annotation.sorted.gtf.bgz" --out "$OUTPATH/MultiGATE/attention_analysis/source_gene_peak_links.pdf"
+# Write a bash script to file, with commands for both source and target plotting
+
+plot_script_path = os.path.join(os.path.dirname(__file__), "plot_gene_peak_attention_links_track.py")
+bash_script_path = os.path.join(f"{os.getenv('OUTPATH')}/MultiGATE/attention_analysis", "run_plot_gene_peak_attention_links.sh")
+
+# Fill in these file paths with your actual .bedpe, .gtf.bgz (tabix-indexed), and output paths
+gtf_bgz = f"{os.getenv('DATAPATH')}/gene_annotations/gencode.vM25.chr_patch_hapl_scaff.annotation.sorted.gtf.bgz"
+out_dir = f"{os.getenv('OUTPATH')}/MultiGATE/attention_analysis"
+multigate_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+source_signed_csv = os.path.splitext(source_bedpe)[0] + ".csv"
+target_signed_csv = os.path.splitext(target_bedpe)[0] + ".csv"
+
+bash_script_contents = f"""#!/bin/bash
 
 # Activate environment
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -6293,1383 +6291,1379 @@ print({repr(stacked_signed_arcs_pdf)})
 PY
 """
 
-    with open(bash_script_path, "w") as f:
-        f.write(bash_script_contents)
+with open(bash_script_path, "w") as f:
+    f.write(bash_script_contents)
 
-    print(f"\nBash script written to:\n {bash_script_path}")
-    print(f'Bash command to run:\n bash {bash_script_path}')
+print(f"\nBash script written to:\n {bash_script_path}")
+print(f'Bash command to run:\n bash {bash_script_path}')
 
-    #%% AJIVE analysis
-    from mvlearn.decomposition import AJIVE
-    import seaborn as sns
+#%% AJIVE analysis
+from mvlearn.decomposition import AJIVE
+import seaborn as sns
 
-    ## spatial source inference
-    teacher_spatial_source_rna_emb, teacher_spatial_source_atac_emb = run_inference(
-        teacher_source_mgate, source_graph_tf, source_gp_tf, source_x1, source_x2, device
-    )    
-    ## non-spatial source inference
-    student_non_spatial_source_rna_emb, student_non_spatial_source_atac_emb = run_inference(
-        source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
-    )
+## spatial source inference
+teacher_spatial_source_rna_emb, teacher_spatial_source_atac_emb = run_inference(
+    teacher_source_mgate, source_graph_tf, source_gp_tf, source_x1, source_x2, device
+)    
+## non-spatial source inference
+student_non_spatial_source_rna_emb, student_non_spatial_source_atac_emb = run_inference(
+    source_mgate, source_infer_graph_tf, source_gp_tf, source_x1, source_x2, device
+)
 
-    ## AJIVE analysis
-    X1 = teacher_spatial_source_rna_emb.copy()
-    X2 = student_non_spatial_source_rna_emb.copy()
+## AJIVE analysis
+X1 = teacher_spatial_source_rna_emb.copy()
+X2 = student_non_spatial_source_rna_emb.copy()
 
-    U, S, V = np.linalg.svd(X1)
-    vars1 = S**2 / np.sum(S**2)
-    cumsum_vars1 = np.cumsum(vars1)
-    U, S, V = np.linalg.svd(X2)
-    vars2 = S**2 / np.sum(S**2)
-    cumsum_vars2 = np.cumsum(vars2)
-    n_plot_cps = X1.shape[1]
-    
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
-    axes[0].plot(np.arange(n_plot_cps) + 1, cumsum_vars1[:n_plot_cps], 'ro-', linewidth=2)
-    axes[1].plot(np.arange(n_plot_cps) + 1, cumsum_vars2[:n_plot_cps], 'ro-', linewidth=2)
-    axes[0].set_title('Cumulative Variance View 1')
-    axes[1].set_title('Cumulative Variance View 2')
-    axes[0].set_xlabel('Number of top singular values')
-    axes[1].set_xlabel('Number of top singular values')
-    axes[0].set_ylabel('Cumulative percent variance explained')
-    # Add grid to both plots
-    axes[0].grid(True, color='#dddddd', linewidth=0.5)
-    axes[1].grid(True, color='#dddddd', linewidth=0.5)
-    # Add horizontal line at cumsum_vars==0.9
-    axes[0].axhline(y=0.9, color='gray', linestyle='--', linewidth=1)
-    axes[1].axhline(y=0.9, color='gray', linestyle='--', linewidth=1)
-    plt.show()
+U, S, V = np.linalg.svd(X1)
+vars1 = S**2 / np.sum(S**2)
+cumsum_vars1 = np.cumsum(vars1)
+U, S, V = np.linalg.svd(X2)
+vars2 = S**2 / np.sum(S**2)
+cumsum_vars2 = np.cumsum(vars2)
+n_plot_cps = X1.shape[1]
 
-    ## fit AJIVE
-    source_rna_emb_list = [X1, X2]
+fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
+axes[0].plot(np.arange(n_plot_cps) + 1, cumsum_vars1[:n_plot_cps], 'ro-', linewidth=2)
+axes[1].plot(np.arange(n_plot_cps) + 1, cumsum_vars2[:n_plot_cps], 'ro-', linewidth=2)
+axes[0].set_title('Cumulative Variance View 1')
+axes[1].set_title('Cumulative Variance View 2')
+axes[0].set_xlabel('Number of top singular values')
+axes[1].set_xlabel('Number of top singular values')
+axes[0].set_ylabel('Cumulative percent variance explained')
+# Add grid to both plots
+axes[0].grid(True, color='#dddddd', linewidth=0.5)
+axes[1].grid(True, color='#dddddd', linewidth=0.5)
+# Add horizontal line at cumsum_vars==0.9
+axes[0].axhline(y=0.9, color='gray', linestyle='--', linewidth=1)
+axes[1].axhline(y=0.9, color='gray', linestyle='--', linewidth=1)
+plt.show()
 
-    ajive = AJIVE(
-        #init_signal_ranks=[7, 10],
-        joint_rank=None,
-        n_jobs=1)
+## fit AJIVE
+source_rna_emb_list = [X1, X2]
 
-    source_rna_joint = ajive.fit_transform(source_rna_emb_list)
+ajive = AJIVE(
+    #init_signal_ranks=[7, 10],
+    joint_rank=None,
+    n_jobs=1)
 
-    def plot_blocks(blocks, names):
-        n_views = len(blocks[0])
-        n_blocks = len(blocks)
-        for i in range(n_views):
-            for j in range(n_blocks):
-                plt.subplot(n_blocks, n_views, j*n_views+i+1)
-                sns.heatmap(blocks[j][i], xticklabels=False, yticklabels=False,
-                            cmap="RdBu")
-                plt.title(f"View {i}: {names[j]}")
+source_rna_joint = ajive.fit_transform(source_rna_emb_list)
 
-    ## plot AJIVE blocks
-    plt.figure(figsize=[15, 10])
-    plt.title('Different Views')
-    individual_mats = ajive.individual_mats_
-    Xs_inv = ajive.inverse_transform(source_rna_joint)
-    residuals = [v - X for v, X in zip(source_rna_emb_list, Xs_inv)]
-    plot_blocks([source_rna_emb_list, source_rna_joint, individual_mats, residuals],
-                ["Raw Data", "Joint", "Individual", "Noise"])
+def plot_blocks(blocks, names):
+    n_views = len(blocks[0])
+    n_blocks = len(blocks)
+    for i in range(n_views):
+        for j in range(n_blocks):
+            plt.subplot(n_blocks, n_views, j*n_views+i+1)
+            sns.heatmap(blocks[j][i], xticklabels=False, yticklabels=False,
+                        cmap="RdBu")
+            plt.title(f"View {i}: {names[j]}")
 
-    ## UMAP of AJIVE projection embeddings
-    import anndata as ad
-    obs_index = np.concatenate([source_rna.obs_names, source_rna.obs_names])
-    obs_df = pd.DataFrame(
-        {
-            "teacher_or_student": (["teacher"] * source_rna.n_obs + ["student"] * source_rna.n_obs),
-            "RNA_clusters": source_rna.obs["RNA_clusters"].tolist() + source_rna.obs["RNA_clusters"].tolist(),
-        },
-        index=obs_index
-    )
-    concat_ajive_joint = ad.AnnData(
-        X=np.concatenate([source_rna_joint[0], source_rna_joint[1]], axis=0),
-        obs=obs_df,
-    )
-    concat_individual_mats = ad.AnnData(
-        X=np.concatenate([individual_mats[0], individual_mats[1]], axis=0),
-        obs=obs_df,
-    )
-    concat_residuals = ad.AnnData(
-        X=np.concatenate([residuals[0], residuals[1]], axis=0),
-        obs=obs_df,
-    )
-    compute_concat_umap(
-        concat_ajive_joint,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    compute_concat_umap(
-        concat_individual_mats,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    compute_concat_umap(
-        concat_residuals,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
+## plot AJIVE blocks
+plt.figure(figsize=[15, 10])
+plt.title('Different Views')
+individual_mats = ajive.individual_mats_
+Xs_inv = ajive.inverse_transform(source_rna_joint)
+residuals = [v - X for v, X in zip(source_rna_emb_list, Xs_inv)]
+plot_blocks([source_rna_emb_list, source_rna_joint, individual_mats, residuals],
+            ["Raw Data", "Joint", "Individual", "Noise"])
 
-    sc.pl.umap(concat_ajive_joint, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
+## UMAP of AJIVE projection embeddings
+import anndata as ad
+obs_index = np.concatenate([source_rna.obs_names, source_rna.obs_names])
+obs_df = pd.DataFrame(
+    {
+        "teacher_or_student": (["teacher"] * source_rna.n_obs + ["student"] * source_rna.n_obs),
+        "RNA_clusters": source_rna.obs["RNA_clusters"].tolist() + source_rna.obs["RNA_clusters"].tolist(),
+    },
+    index=obs_index
+)
+concat_ajive_joint = ad.AnnData(
+    X=np.concatenate([source_rna_joint[0], source_rna_joint[1]], axis=0),
+    obs=obs_df,
+)
+concat_individual_mats = ad.AnnData(
+    X=np.concatenate([individual_mats[0], individual_mats[1]], axis=0),
+    obs=obs_df,
+)
+concat_residuals = ad.AnnData(
+    X=np.concatenate([residuals[0], residuals[1]], axis=0),
+    obs=obs_df,
+)
+compute_concat_umap(
+    concat_ajive_joint,
+    n_neighbors=10,
+    resolution=1.5,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
+compute_concat_umap(
+    concat_individual_mats,
+    n_neighbors=10,
+    resolution=1.5,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
+compute_concat_umap(
+    concat_residuals,
+    n_neighbors=10,
+    resolution=1.5,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
 
-    sc.pl.umap(concat_individual_mats, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
+sc.pl.umap(concat_ajive_joint, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+plt.tight_layout(); plt.show()
 
-    sc.pl.umap(concat_residuals, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
+sc.pl.umap(concat_individual_mats, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+plt.tight_layout(); plt.show()
 
-    teacher_individual_mat = concat_individual_mats[concat_individual_mats.obs["teacher_or_student"].eq("teacher")]
-    student_individual_mat = concat_individual_mats[concat_individual_mats.obs["teacher_or_student"].eq("student")]
+sc.pl.umap(concat_residuals, color=['teacher_or_student', 'RNA_clusters'], ncols=3, wspace=0.2, size=25)
+plt.tight_layout(); plt.show()
 
-    compute_concat_umap(
-        teacher_individual_mat,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    compute_concat_umap(
-        student_individual_mat,
-        n_neighbors=10,
-        resolution=1.5,
-        deterministic=True,
-        random_state=deterministic_seed,
-    )
-    sc.pl.umap(teacher_individual_mat, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
-    sc.pl.umap(student_individual_mat, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
+teacher_individual_mat = concat_individual_mats[concat_individual_mats.obs["teacher_or_student"].eq("teacher")]
+student_individual_mat = concat_individual_mats[concat_individual_mats.obs["teacher_or_student"].eq("student")]
+
+compute_concat_umap(
+    teacher_individual_mat,
+    n_neighbors=10,
+    resolution=1.5,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
+compute_concat_umap(
+    student_individual_mat,
+    n_neighbors=10,
+    resolution=1.5,
+    deterministic=True,
+    random_state=deterministic_seed,
+)
+sc.pl.umap(teacher_individual_mat, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
+plt.tight_layout(); plt.show()
+sc.pl.umap(student_individual_mat, color=['teacher_or_student'], ncols=3, wspace=0.2, size=25)
+plt.tight_layout(); plt.show()
 
 
-    #%% gene-set enrichment analysis
+#%% gene-set enrichment analysis
+import gseapy as gp
+
+def run_topic_gsea(topic_gene_weight_mat, gene_sets_dict, min_size=3, permutation_num=1000, seed=42, padj_thresh=0.05):
+    """Run gseapy prerank GSEA over a topic-by-gene weight matrix.
+
+    Each row (topic) is treated as an independent pre-ranked gene list; topic-gene
+    weights serve as the ranking statistic, not expression counts.
+
+    Parameters
+    ----------
+    topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
+    gene_sets_dict : dict {pathway: [gene, ...]}
+        Hallmark gene sets filtered to the scored gene universe.
+    min_size : int
+        Minimum gene set overlap with the ranked list to test.
+    permutation_num : int
+        Number of permutations for p-value estimation.
+
+    Returns
+    -------
+    dict with keys:
+        gsea_results_per_topic, gsea_long, gsea_long_filt, top_terms_per_topic
+    """
     import gseapy as gp
 
-    def run_topic_gsea(topic_gene_weight_mat, gene_sets_dict, min_size=3, permutation_num=1000, seed=42, padj_thresh=0.05):
-        """Run gseapy prerank GSEA over a topic-by-gene weight matrix.
+    gsea_results_per_topic = {}
+    rows = []
 
-        Each row (topic) is treated as an independent pre-ranked gene list; topic-gene
-        weights serve as the ranking statistic, not expression counts.
-
-        Parameters
-        ----------
-        topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
-        gene_sets_dict : dict {pathway: [gene, ...]}
-            Hallmark gene sets filtered to the scored gene universe.
-        min_size : int
-            Minimum gene set overlap with the ranked list to test.
-        permutation_num : int
-            Number of permutations for p-value estimation.
-
-        Returns
-        -------
-        dict with keys:
-            gsea_results_per_topic, gsea_long, gsea_long_filt, top_terms_per_topic
-        """
-        import gseapy as gp
-
-        gsea_results_per_topic = {}
-        rows = []
-
-        for topic in topic_gene_weight_mat.index:
-            rnk = (
-                topic_gene_weight_mat.loc[topic]
-                .dropna()
-                .sort_values(ascending=False)
-            )
-            pre = gp.prerank(
-                rnk=rnk,
-                gene_sets=gene_sets_dict,
-                min_size=min_size,
-                max_size=len(rnk),
-                permutation_num=permutation_num,
-                seed=seed,
-                no_plot=True,
-                outdir=None,
-                verbose=False,
-            )
-            gsea_results_per_topic[topic] = pre
-            res = pre.res2d.copy()
-            res = res.rename(columns={"Term": "pathway"})
-            res.insert(0, "topic", topic)
-            rows.append(res)
-
-        gsea_long = (
-            pd.concat(rows, ignore_index=True)
-            .rename(columns={"NOM p-val": "pval", "FDR q-val": "padj", "NES": "nes"})
-            [["topic", "pathway", "nes", "pval", "padj", "Lead_genes", "Tag %", "Gene %"]]
-            .sort_values(["topic", "padj", "nes"], ascending=[True, True, False])
-        )
-        top_terms_per_topic = gsea_long.groupby("topic", group_keys=False).head(10)
-        print(top_terms_per_topic)
-
-        gsea_long_filt = gsea_long[gsea_long["padj"].le(padj_thresh)]
-        significant_pathways_per_topic = (
-            gsea_long_filt.groupby("topic")["pathway"].apply(list).to_dict()
-        )
-        for topic_to_plot, pathways in significant_pathways_per_topic.items():
-            pre = gsea_results_per_topic[topic_to_plot]
-            for pathway in pathways:
-                row = gsea_long_filt.query("topic == @topic_to_plot and pathway == @pathway").iloc[0]
-                axes = gp.gseaplot(
-                    rank_metric=pre.ranking,
-                    term=pathway,
-                    **pre.results[pathway],
-                    ofname=None,
-                )
-                fig = axes[0].get_figure()
-                for ax in axes:
-                    ax.set_title("")
-                fig.suptitle(
-                    f"{topic_to_plot} | {pathway}\nNES={row['nes']:.2f}, adj. p={row['padj']:.2e}",
-                    fontsize=9,
-                    y=1.02,
-                )
-                plt.tight_layout(); plt.show()
-
-        return dict(
-            gsea_results_per_topic=gsea_results_per_topic,
-            gsea_long=gsea_long,
-            gsea_long_filt=gsea_long_filt,
-            top_terms_per_topic=top_terms_per_topic,
-        )
-
-    def run_topic_ora(topic_gene_weight_mat, gene_sets_dict, ora_tmin=3, padj_thresh=0.05):
-        """Run gseapy ORA for each topic using a triangle-threshold gene cutoff.
-
-        Top genes per topic are selected by a global triangle threshold applied to the
-        flattened topic-gene weight distribution.  Background is the scored gene universe
-        (columns of topic_gene_weight_mat).
-
-        Parameters
-        ----------
-        topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
-        gene_sets_dict : dict {pathway: [gene, ...]}
-            Hallmark gene sets filtered to the scored gene universe.
-
-        Returns
-        -------
-        dict with keys:
-            knee_value, top_genes_per_topic, ora_long, ora_long_filt, top_ora_terms_per_topic
-        """
-        from skimage.filters import threshold_triangle
-        import gseapy as gp
-
-        global_topic_gene_weights = (
-            topic_gene_weight_mat.melt()["value"]
+    for topic in topic_gene_weight_mat.index:
+        rnk = (
+            topic_gene_weight_mat.loc[topic]
             .dropna()
             .sort_values(ascending=False)
-            .reset_index(drop=True)
         )
-        knee_value = threshold_triangle(global_topic_gene_weights.values)
-        knee_index = int(np.argmin(np.abs(global_topic_gene_weights.values - knee_value)))
-
-        plt.figure(figsize=(3, 3))
-        global_topic_gene_weights.plot()
-        plt.scatter(knee_index, knee_value, color='red', label=f"knee={knee_value:.2e}")
-        plt.legend(); plt.tight_layout(); plt.show()
-        plt.close()
-
-        background_genes = topic_gene_weight_mat.columns.astype(str).tolist()
-
-        top_genes_per_topic = {
-            topic: (
-                topic_gene_weight_mat.loc[topic][topic_gene_weight_mat.loc[topic].ge(knee_value)]
-                .sort_values(ascending=False)
-                .index.astype(str)
-                .tolist()
-            )
-            for topic in topic_gene_weight_mat.index
-        }
-
-        rows = []
-        for topic, top_genes in top_genes_per_topic.items():
-            if not top_genes:
-                continue
-            enr = gp.enrich(
-                gene_list=top_genes,
-                gene_sets=gene_sets_dict,
-                background=background_genes,
-                cutoff=1.0,
-                no_plot=True,
-                outdir=None,
-            )
-            res = enr.res2d.copy()
-            res.index.name = "pathway"
-            res = res.reset_index()
-            res.insert(0, "topic", topic)
-            rows.append(res)
-
-        if not rows:
-            print("No ORA results produced. Consider lowering ora_tmin.")
-            empty = pd.DataFrame()
-            return dict(
-                knee_value=knee_value,
-                top_genes_per_topic=top_genes_per_topic,
-                ora_long=empty,
-                ora_long_filt=empty,
-                top_ora_terms_per_topic=empty,
-            )
-
-        ora_long = (
-            pd.concat(rows, ignore_index=True)
-            .rename(columns={
-                "Adjusted P-value": "padj",
-                "P-value": "pval",
-                "Overlap": "overlap",
-                "Genes": "overlap_genes",
-            })
-            [["topic", "pathway", "pval", "padj", "overlap", "overlap_genes"]]
-            .sort_values(["topic", "padj"], ascending=[True, True])
+        pre = gp.prerank(
+            rnk=rnk,
+            gene_sets=gene_sets_dict,
+            min_size=min_size,
+            max_size=len(rnk),
+            permutation_num=permutation_num,
+            seed=seed,
+            no_plot=True,
+            outdir=None,
+            verbose=False,
         )
-        ora_long_filt = ora_long[ora_long["padj"].le(padj_thresh)]
-        top_ora_terms_per_topic = ora_long.groupby("topic", group_keys=False).head(10)
-        print(top_ora_terms_per_topic)
+        gsea_results_per_topic[topic] = pre
+        res = pre.res2d.copy()
+        res = res.rename(columns={"Term": "pathway"})
+        res.insert(0, "topic", topic)
+        rows.append(res)
 
+    gsea_long = (
+        pd.concat(rows, ignore_index=True)
+        .rename(columns={"NOM p-val": "pval", "FDR q-val": "padj", "NES": "nes"})
+        [["topic", "pathway", "nes", "pval", "padj", "Lead_genes", "Tag %", "Gene %"]]
+        .sort_values(["topic", "padj", "nes"], ascending=[True, True, False])
+    )
+    top_terms_per_topic = gsea_long.groupby("topic", group_keys=False).head(10)
+    print(top_terms_per_topic)
+
+    gsea_long_filt = gsea_long[gsea_long["padj"].le(padj_thresh)]
+    significant_pathways_per_topic = (
+        gsea_long_filt.groupby("topic")["pathway"].apply(list).to_dict()
+    )
+    for topic_to_plot, pathways in significant_pathways_per_topic.items():
+        pre = gsea_results_per_topic[topic_to_plot]
+        for pathway in pathways:
+            row = gsea_long_filt.query("topic == @topic_to_plot and pathway == @pathway").iloc[0]
+            axes = gp.gseaplot(
+                rank_metric=pre.ranking,
+                term=pathway,
+                **pre.results[pathway],
+                ofname=None,
+            )
+            fig = axes[0].get_figure()
+            for ax in axes:
+                ax.set_title("")
+            fig.suptitle(
+                f"{topic_to_plot} | {pathway}\nNES={row['nes']:.2f}, adj. p={row['padj']:.2e}",
+                fontsize=9,
+                y=1.02,
+            )
+            plt.tight_layout(); plt.show()
+
+    return dict(
+        gsea_results_per_topic=gsea_results_per_topic,
+        gsea_long=gsea_long,
+        gsea_long_filt=gsea_long_filt,
+        top_terms_per_topic=top_terms_per_topic,
+    )
+
+def run_topic_ora(topic_gene_weight_mat, gene_sets_dict, ora_tmin=3, padj_thresh=0.05):
+    """Run gseapy ORA for each topic using a triangle-threshold gene cutoff.
+
+    Top genes per topic are selected by a global triangle threshold applied to the
+    flattened topic-gene weight distribution.  Background is the scored gene universe
+    (columns of topic_gene_weight_mat).
+
+    Parameters
+    ----------
+    topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
+    gene_sets_dict : dict {pathway: [gene, ...]}
+        Hallmark gene sets filtered to the scored gene universe.
+
+    Returns
+    -------
+    dict with keys:
+        knee_value, top_genes_per_topic, ora_long, ora_long_filt, top_ora_terms_per_topic
+    """
+    from skimage.filters import threshold_triangle
+    import gseapy as gp
+
+    global_topic_gene_weights = (
+        topic_gene_weight_mat.melt()["value"]
+        .dropna()
+        .sort_values(ascending=False)
+        .reset_index(drop=True)
+    )
+    knee_value = threshold_triangle(global_topic_gene_weights.values)
+    knee_index = int(np.argmin(np.abs(global_topic_gene_weights.values - knee_value)))
+
+    plt.figure(figsize=(3, 3))
+    global_topic_gene_weights.plot()
+    plt.scatter(knee_index, knee_value, color='red', label=f"knee={knee_value:.2e}")
+    plt.legend(); plt.tight_layout(); plt.show()
+    plt.close()
+
+    background_genes = topic_gene_weight_mat.columns.astype(str).tolist()
+
+    top_genes_per_topic = {
+        topic: (
+            topic_gene_weight_mat.loc[topic][topic_gene_weight_mat.loc[topic].ge(knee_value)]
+            .sort_values(ascending=False)
+            .index.astype(str)
+            .tolist()
+        )
+        for topic in topic_gene_weight_mat.index
+    }
+
+    rows = []
+    for topic, top_genes in top_genes_per_topic.items():
+        if not top_genes:
+            continue
+        enr = gp.enrich(
+            gene_list=top_genes,
+            gene_sets=gene_sets_dict,
+            background=background_genes,
+            cutoff=1.0,
+            no_plot=True,
+            outdir=None,
+        )
+        res = enr.res2d.copy()
+        res.index.name = "pathway"
+        res = res.reset_index()
+        res.insert(0, "topic", topic)
+        rows.append(res)
+
+    if not rows:
+        print("No ORA results produced. Consider lowering ora_tmin.")
+        empty = pd.DataFrame()
         return dict(
             knee_value=knee_value,
             top_genes_per_topic=top_genes_per_topic,
-            ora_long=ora_long,
-            ora_long_filt=ora_long_filt,
-            top_ora_terms_per_topic=top_ora_terms_per_topic,
+            ora_long=empty,
+            ora_long_filt=empty,
+            top_ora_terms_per_topic=empty,
         )
 
-    def run_topic_ora_leiden(feature_topic_adata, gene_sets_dict, background_genes, ora_tmin=3, padj_thresh=0.05):
+    ora_long = (
+        pd.concat(rows, ignore_index=True)
+        .rename(columns={
+            "Adjusted P-value": "padj",
+            "P-value": "pval",
+            "Overlap": "overlap",
+            "Genes": "overlap_genes",
+        })
+        [["topic", "pathway", "pval", "padj", "overlap", "overlap_genes"]]
+        .sort_values(["topic", "padj"], ascending=[True, True])
+    )
+    ora_long_filt = ora_long[ora_long["padj"].le(padj_thresh)]
+    top_ora_terms_per_topic = ora_long.groupby("topic", group_keys=False).head(10)
+    print(top_ora_terms_per_topic)
 
-        # Set categorical order so that 'topic' is before 'gene' in gene_or_topic
-        gene_topic_cat = pd.CategoricalDtype(['topic', 'gene'], ordered=True)
-        feature_topic_adata.obs['gene_or_topic'] = feature_topic_adata.obs['gene_or_topic'].astype(gene_topic_cat)
-        n_gene_topics_per_leiden = feature_topic_adata.obs.groupby('leiden')['gene_or_topic'].value_counts().sort_index(level=['leiden', 'gene_or_topic'])
+    return dict(
+        knee_value=knee_value,
+        top_genes_per_topic=top_genes_per_topic,
+        ora_long=ora_long,
+        ora_long_filt=ora_long_filt,
+        top_ora_terms_per_topic=top_ora_terms_per_topic,
+    )
+
+def run_topic_ora_leiden(feature_topic_adata, gene_sets_dict, background_genes, ora_tmin=3, padj_thresh=0.05):
+
+    # Set categorical order so that 'topic' is before 'gene' in gene_or_topic
+    gene_topic_cat = pd.CategoricalDtype(['topic', 'gene'], ordered=True)
+    feature_topic_adata.obs['gene_or_topic'] = feature_topic_adata.obs['gene_or_topic'].astype(gene_topic_cat)
+    n_gene_topics_per_leiden = feature_topic_adata.obs.groupby('leiden')['gene_or_topic'].value_counts().sort_index(level=['leiden', 'gene_or_topic'])
+    
+    index_per_leiden = feature_topic_adata.obs.groupby('leiden').apply(lambda x: x.index.tolist())
+    filt_enr_per_leiden = {}
+    for leiden, index in index_per_leiden.items():
+        data = feature_topic_adata[index].copy()
+        genes = data.obs.loc[data.obs['gene_or_topic'].eq('gene'), 'label'].tolist()
         
-        index_per_leiden = feature_topic_adata.obs.groupby('leiden').apply(lambda x: x.index.tolist())
-        filt_enr_per_leiden = {}
-        for leiden, index in index_per_leiden.items():
-            data = feature_topic_adata[index].copy()
-            genes = data.obs.loc[data.obs['gene_or_topic'].eq('gene'), 'label'].tolist()
-            
-            enr = gp.enrich(
-                gene_list=genes,
-                gene_sets='GO_Biological_Process_2025' if gene_sets_dict is None else gene_sets_dict,
-                background=background_genes,
-                cutoff=1.0,
-                no_plot=True,
-                outdir=None,
-            )
-            if enr.res2d is None:
-                print(f"No ORA results produced for leiden {leiden}. Consider lowering ora_tmin.")
-                continue
-
-            res = enr.res2d.copy()
-            res_filt = res[res['Adjusted P-value'].le(padj_thresh)]
-            filt_enr_per_leiden[leiden] = res_filt
-
-        return filt_enr_per_leiden, n_gene_topics_per_leiden
-            
-
-    def run_gsea_ora_overlap(gsea_long_filt, ora_long_filt):
-        """Compute per-topic Jaccard similarity between significant GSEA and ORA pathways.
-
-        Returns
-        -------
-        gsea_ora_jaccard : pd.Series
-            Per-topic Jaccard index, sorted descending.
-        """
-        gsea_hits_per_topic = (
-            gsea_long_filt.groupby("topic", group_keys=False)["pathway"].apply(np.unique)
+        enr = gp.enrich(
+            gene_list=genes,
+            gene_sets='GO_Biological_Process_2025' if gene_sets_dict is None else gene_sets_dict,
+            background=background_genes,
+            cutoff=1.0,
+            no_plot=True,
+            outdir=None,
         )
-        ora_hits_per_topic = (
-            ora_long_filt.groupby("topic", group_keys=False)["pathway"].apply(np.unique)
-        )
-        topics_union = set(gsea_hits_per_topic.index) | set(ora_hits_per_topic.index)
-        gsea_ora_jaccard = {}
-        for topic in topics_union:
-            gsea_paths = set(gsea_hits_per_topic.get(topic, []))
-            ora_paths = set(ora_hits_per_topic.get(topic, []))
-            union_n = len(gsea_paths | ora_paths)
-            gsea_ora_jaccard[topic] = (
-                len(gsea_paths & ora_paths) / union_n if union_n > 0 else 0.0
-            )
-        gsea_ora_jaccard = pd.Series(gsea_ora_jaccard).sort_values(ascending=False)
-        print("GSEA vs. ORA Jaccard similarity:")
-        print(gsea_ora_jaccard)
-        return gsea_ora_jaccard
+        if enr.res2d is None:
+            print(f"No ORA results produced for leiden {leiden}. Consider lowering ora_tmin.")
+            continue
 
-    ## convert net DataFrame to dict {pathway: [gene, ...]} for gseapy
-    def _net_to_gene_sets_dict(net, split_source_target=False):
-        if net.columns.equals(pd.Index(['source', 'target'])):
-            return net.groupby("source")["target"].apply(list).to_dict()
+        res = enr.res2d.copy()
+        res_filt = res[res['Adjusted P-value'].le(padj_thresh)]
+        filt_enr_per_leiden[leiden] = res_filt
+
+    return filt_enr_per_leiden, n_gene_topics_per_leiden
         
-        if split_source_target: # split by source/sender and target/receiver (nothing to do with source/target data)
-            combined_gene_sets = {}
-            combined_gene_sets.update({str(idx) + '_source': genes for idx, genes in net['source_genes'].to_dict().items()})
-            combined_gene_sets.update({str(idx) + '_target': genes for idx, genes in net['target_genes'].to_dict().items()})
-            return combined_gene_sets
-        else:
-            return net['all_genes'].to_dict()
-   
 
-    #source_gene_sets_dict = _net_to_gene_sets_dict(source_net)
-    #target_gene_sets_dict = _net_to_gene_sets_dict(target_net)
+def run_gsea_ora_overlap(gsea_long_filt, ora_long_filt):
+    """Compute per-topic Jaccard similarity between significant GSEA and ORA pathways.
 
-    source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_hallmark_grouped, split_source_target=True)
-    source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_resource_grouped, split_source_target=True)
-
-    ## fetch background genes
-    background_genes = source_x1.columns.tolist()
-
-    ## run ORA
-    source_ora, source_n_gene_topics_per_leiden = run_topic_ora_leiden(feature_topic_adatas['source_rna'], source_gene_sets_dict, background_genes)
-    target_ora, target_n_gene_topics_per_leiden = run_topic_ora_leiden(feature_topic_adatas['target_rna'], target_gene_sets_dict, background_genes)
-
-    ## run GSEA
-    source_gsea = run_topic_gsea(source_topic_mat, source_gene_sets_dict)
-    target_gsea = run_topic_gsea(target_topic_mat, target_gene_sets_dict)
-
-    ## compute jaccard similarity between GSEA and ORA results
-    source_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], source_ora["ora_long_filt"])
-    target_jaccard = run_gsea_ora_overlap(target_gsea["gsea_long_filt"], target_ora["ora_long_filt"])
-
-    #gsea_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], target_gsea["gsea_long_filt"])
-    #ora_jaccard = run_gsea_ora_overlap(source_ora["ora_long_filt"], target_ora["ora_long_filt"])
-
-    shared_gsea_paths = set(source_gsea["gsea_long_filt"]['pathway']) & set(target_gsea["gsea_long_filt"]['pathway'])
-    shared_ora_paths = set(source_ora["ora_long_filt"]['pathway']) & set(target_ora["ora_long_filt"]['pathway'])
-    shared_paths = shared_gsea_paths & shared_ora_paths
-    print("Shared GSEA and ORA pathways across source and target:\n", shared_paths)
-
-    #%% staircase heatmap for gene-program p-values
-
-    _gene_programs_plots_artifact_suffix = "source_mgate" if model is source_mgate else "target_mgate"
-    _gene_programs_plots_artifact_dir = "gene_programs_plots/{}".format(_gene_programs_plots_artifact_suffix)
-
-    def _log_mlflow_figure(fig, artifact_filename):
-        with tempfile.TemporaryDirectory() as _fig_tmp:
-            _path = os.path.join(_fig_tmp, artifact_filename)
-            fig.savefig(_path, format="svg", bbox_inches="tight")
-            client.log_artifact(run_id, _path, artifact_path=_gene_programs_plots_artifact_dir)
-        print(
-            "Logged {}/{} to MLflow run {}.".format(
-                _gene_programs_plots_artifact_dir, artifact_filename, run_id
-            )
+    Returns
+    -------
+    gsea_ora_jaccard : pd.Series
+        Per-topic Jaccard index, sorted descending.
+    """
+    gsea_hits_per_topic = (
+        gsea_long_filt.groupby("topic", group_keys=False)["pathway"].apply(np.unique)
+    )
+    ora_hits_per_topic = (
+        ora_long_filt.groupby("topic", group_keys=False)["pathway"].apply(np.unique)
+    )
+    topics_union = set(gsea_hits_per_topic.index) | set(ora_hits_per_topic.index)
+    gsea_ora_jaccard = {}
+    for topic in topics_union:
+        gsea_paths = set(gsea_hits_per_topic.get(topic, []))
+        ora_paths = set(ora_hits_per_topic.get(topic, []))
+        union_n = len(gsea_paths | ora_paths)
+        gsea_ora_jaccard[topic] = (
+            len(gsea_paths & ora_paths) / union_n if union_n > 0 else 0.0
         )
+    gsea_ora_jaccard = pd.Series(gsea_ora_jaccard).sort_values(ascending=False)
+    print("GSEA vs. ORA Jaccard similarity:")
+    print(gsea_ora_jaccard)
+    return gsea_ora_jaccard
 
-    def staircase_heatmap(pathway_embedding_results, adata, adata_label, plot_spatial=False, gp_name=None):
-        import seaborn as sns
+## convert net DataFrame to dict {pathway: [gene, ...]} for gseapy
+def _net_to_gene_sets_dict(net, split_source_target=False):
+    if net.columns.equals(pd.Index(['source', 'target'])):
+        return net.groupby("source")["target"].apply(list).to_dict()
+    
+    if split_source_target: # split by source/sender and target/receiver (nothing to do with source/target data)
+        combined_gene_sets = {}
+        combined_gene_sets.update({str(idx) + '_source': genes for idx, genes in net['source_genes'].to_dict().items()})
+        combined_gene_sets.update({str(idx) + '_target': genes for idx, genes in net['target_genes'].to_dict().items()})
+        return combined_gene_sets
+    else:
+        return net['all_genes'].to_dict()
 
-        cluster_gp_scores = pathway_embedding_results[adata_label].pathway_mean_by_cluster.T
-        cluster_gp_scores.columns = pd.Categorical(cluster_gp_scores.columns, ordered=True, categories=['R0', 'R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10'])
-        cluster_gp_scores = cluster_gp_scores.sort_index(axis=1)
 
-        topks = []
-        for clust in cluster_gp_scores.columns:
-            clust_p = cluster_gp_scores[clust]
-            topk_gps = clust_p.nlargest(3).index
-            topks.append(topk_gps)
+#source_gene_sets_dict = _net_to_gene_sets_dict(source_net)
+#target_gene_sets_dict = _net_to_gene_sets_dict(target_net)
 
-        topks = np.hstack(topks)
+source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_hallmark_grouped, split_source_target=True)
+source_gene_sets_dict = target_gene_sets_dict = _net_to_gene_sets_dict(lr_resource_grouped, split_source_target=True)
 
-        cluster_gp_scores_topks = cluster_gp_scores.loc[topks]
+## fetch background genes
+background_genes = source_x1.columns.tolist()
 
-        fig_heatmap, axs = plt.subplots(1, 2, figsize=(12, 12), sharey=True)
-        sns.heatmap(cluster_gp_scores_topks, cmap='viridis', ax=axs[0])
-        sign = np.sign(cluster_gp_scores_topks)
-        cluster_gp_scores_topks_abs = np.abs(cluster_gp_scores_topks)
-        col_min = cluster_gp_scores_topks_abs.min(axis=0)
-        col_max = cluster_gp_scores_topks_abs.max(axis=0)
-        cluster_gp_scores_topks_scaled = sign * (cluster_gp_scores_topks_abs - col_min) / (col_max - col_min)
-        sns.heatmap(cluster_gp_scores_topks_scaled, cmap='viridis', ax=axs[1])
+## run ORA
+source_ora, source_n_gene_topics_per_leiden = run_topic_ora_leiden(feature_topic_adatas['source_rna'], source_gene_sets_dict, background_genes)
+target_ora, target_n_gene_topics_per_leiden = run_topic_ora_leiden(feature_topic_adatas['target_rna'], target_gene_sets_dict, background_genes)
+
+## run GSEA
+source_gsea = run_topic_gsea(source_topic_mat, source_gene_sets_dict)
+target_gsea = run_topic_gsea(target_topic_mat, target_gene_sets_dict)
+
+## compute jaccard similarity between GSEA and ORA results
+source_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], source_ora["ora_long_filt"])
+target_jaccard = run_gsea_ora_overlap(target_gsea["gsea_long_filt"], target_ora["ora_long_filt"])
+
+#gsea_jaccard = run_gsea_ora_overlap(source_gsea["gsea_long_filt"], target_gsea["gsea_long_filt"])
+#ora_jaccard = run_gsea_ora_overlap(source_ora["ora_long_filt"], target_ora["ora_long_filt"])
+
+shared_gsea_paths = set(source_gsea["gsea_long_filt"]['pathway']) & set(target_gsea["gsea_long_filt"]['pathway'])
+shared_ora_paths = set(source_ora["ora_long_filt"]['pathway']) & set(target_ora["ora_long_filt"]['pathway'])
+shared_paths = shared_gsea_paths & shared_ora_paths
+print("Shared GSEA and ORA pathways across source and target:\n", shared_paths)
+
+#%% staircase heatmap for gene-program p-values
+
+_gene_programs_plots_artifact_suffix = "source_mgate" if model is source_mgate else "target_mgate"
+_gene_programs_plots_artifact_dir = "gene_programs_plots/{}".format(_gene_programs_plots_artifact_suffix)
+
+def _log_mlflow_figure(fig, artifact_filename):
+    with tempfile.TemporaryDirectory() as _fig_tmp:
+        _path = os.path.join(_fig_tmp, artifact_filename)
+        fig.savefig(_path, format="svg", bbox_inches="tight")
+        client.log_artifact(run_id, _path, artifact_path=_gene_programs_plots_artifact_dir)
+    print(
+        "Logged {}/{} to MLflow run {}.".format(
+            _gene_programs_plots_artifact_dir, artifact_filename, run_id
+        )
+    )
+
+def staircase_heatmap(pathway_embedding_results, adata, adata_label, plot_spatial=False, gp_name=None):
+    import seaborn as sns
+
+    cluster_gp_scores = pathway_embedding_results[adata_label].pathway_mean_by_cluster.T
+    cluster_gp_scores.columns = pd.Categorical(cluster_gp_scores.columns, ordered=True, categories=['R0', 'R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9', 'R10'])
+    cluster_gp_scores = cluster_gp_scores.sort_index(axis=1)
+
+    topks = []
+    for clust in cluster_gp_scores.columns:
+        clust_p = cluster_gp_scores[clust]
+        topk_gps = clust_p.nlargest(3).index
+        topks.append(topk_gps)
+
+    topks = np.hstack(topks)
+
+    cluster_gp_scores_topks = cluster_gp_scores.loc[topks]
+
+    fig_heatmap, axs = plt.subplots(1, 2, figsize=(12, 12), sharey=True)
+    sns.heatmap(cluster_gp_scores_topks, cmap='viridis', ax=axs[0])
+    sign = np.sign(cluster_gp_scores_topks)
+    cluster_gp_scores_topks_abs = np.abs(cluster_gp_scores_topks)
+    col_min = cluster_gp_scores_topks_abs.min(axis=0)
+    col_max = cluster_gp_scores_topks_abs.max(axis=0)
+    cluster_gp_scores_topks_scaled = sign * (cluster_gp_scores_topks_abs - col_min) / (col_max - col_min)
+    sns.heatmap(cluster_gp_scores_topks_scaled, cmap='viridis', ax=axs[1])
+    plt.tight_layout()
+    _log_mlflow_figure(fig_heatmap, "staircase_gp_heatmap_{}.svg".format(adata_label))
+    plt.show()
+
+    fig_spatial = None
+    if plot_spatial:
+        top_idxs = np.stack(np.where(cluster_gp_scores_topks == cluster_gp_scores_topks.values.max())).flatten()
+        top_gp_name = cluster_gp_scores_topks.iloc[top_idxs[0]].name
+        if gp_name is not None:
+            top_gp_name = gp_name
+        top_gp_scores = pathway_embedding_results[adata_label].pathway_scores.loc[:,top_gp_name]
+        adata.obs[top_gp_name] = top_gp_scores
+        sc.pl.embedding(
+            adata,
+            basis='spatial',
+            color=['RNA_clusters', top_gp_name],
+            ncols=3,
+            wspace=0.2,
+            size=75,
+            show=False,
+        )
+        fig_spatial = plt.gcf()
         plt.tight_layout()
-        _log_mlflow_figure(fig_heatmap, "staircase_gp_heatmap_{}.svg".format(adata_label))
+        _log_mlflow_figure(fig_spatial, "staircase_gp_spatial_{}.svg".format(adata_label))
         plt.show()
 
-        fig_spatial = None
-        if plot_spatial:
-            top_idxs = np.stack(np.where(cluster_gp_scores_topks == cluster_gp_scores_topks.values.max())).flatten()
-            top_gp_name = cluster_gp_scores_topks.iloc[top_idxs[0]].name
-            if gp_name is not None:
-                top_gp_name = gp_name
-            top_gp_scores = pathway_embedding_results[adata_label].pathway_scores.loc[:,top_gp_name]
-            adata.obs[top_gp_name] = top_gp_scores
-            sc.pl.embedding(
-                adata,
-                basis='spatial',
-                color=['RNA_clusters', top_gp_name],
-                ncols=3,
-                wspace=0.2,
-                size=75,
-                show=False,
-            )
-            fig_spatial = plt.gcf()
-            plt.tight_layout()
-            _log_mlflow_figure(fig_spatial, "staircase_gp_spatial_{}.svg".format(adata_label))
-            plt.show()
+    return cluster_gp_scores, fig_heatmap, fig_spatial
 
-        return cluster_gp_scores, fig_heatmap, fig_spatial
-
-    def cluster_pathway_embedding_heatmap(pathway_embedding_results, adata_label, top_k_pathways=3, row_ind=None, col_ind=None, pathway_order=None):
-        import seaborn as sns
-
-        result = pathway_embedding_results[adata_label]
-        corr = result.pathway_embedding_correlation_by_cluster
-        if corr is None or corr.empty:
-            return None, None
-
-        if pathway_order is None:
-            #pathway_order = corr.abs().max(axis=1).sort_values(ascending=False).head(top_k_pathways).index
-            pathway_order = pd.Series(corr.apply(lambda x: corr.index[np.argsort(x)[:top_k_pathways]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values
-            corr_top = corr.loc[pathway_order]
-            cg = sns.clustermap(corr_top, cmap='coolwarm', center=0.0)
-            _log_mlflow_figure(cg.figure, "pathway_embedding_by_cluster_{}.svg".format(adata_label))
-        else:
-            fig, ax = plt.subplots(figsize=(8, 8))
-            corr_top = corr.loc[pathway_order]
-            corr_top = corr_top.iloc[row_ind, col_ind]
-            sns.heatmap(corr_top, cmap='coolwarm', center=0.0, ax=ax)
-            _log_mlflow_figure(fig, "pathway_embedding_by_cluster_{}.svg".format(adata_label))
-            cg=None
-
-        plt.show()
-
-        return corr_top, cg, pathway_order
-
-    # Myc_TF_target_genes_GP, Apex1_TF_target_genes_GP
-    source_rna_cluster_gp_scores, _fig_stair_heatmap_source, _fig_stair_spatial_source = staircase_heatmap(
-        pathway_embedding_results, source_rna, 'source_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
-    )
-    target_rna_cluster_gp_scores, _fig_stair_heatmap_target, _fig_stair_spatial_target = staircase_heatmap(
-        pathway_embedding_results, target_rna, 'target_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
-    )
-
-
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    import pandas as pd
-
-
-    ## remove terms from correlation matrix, e.g. TF targets
-    terms_blacklist = None #['TF_target', 'combined']
-    if terms_blacklist is not None:
-        pathway_embedding_results_cp = pathway_embedding_results.copy()
-        pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster = \
-            pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster.loc[
-                ~pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster.index.str.contains('|'.join(terms_blacklist))
-            ]
-
-    # 1) Get source corr matrix and pathway order
-    source_corr, _, pathway_order_source = cluster_pathway_embedding_heatmap(
-        pathway_embedding_results, "source_rna", top_k_pathways=2
-    )
-    source_corr = source_corr.loc[pathway_order_source]
-
-    # 2) Temporary clustermap only to extract row/col ordering
-    cg = sns.clustermap(source_corr, cmap="coolwarm", center=0.0)
-    row_ind = cg.dendrogram_row.reordered_ind
-    col_ind = cg.dendrogram_col.reordered_ind
-    plt.close(cg.figure)
-
-    # Reorder source
-    source_corr_ord = source_corr.iloc[row_ind, col_ind]
-
-    # 3) Build target using same pathway + same row/col order
-    target_corr = pathway_embedding_results["target_rna"].pathway_embedding_correlation_by_cluster
-    target_corr = target_corr.loc[pathway_order_source].iloc[row_ind, col_ind]
-
-    # 4) Overlap
-    overlap = softmax(source_corr_ord * target_corr / 5.0)
-    overlap = (overlap - overlap.min()) / (overlap.max() - overlap.min())
-    overlap_df = pd.DataFrame(overlap, index=target_corr.index, columns=target_corr.columns)
-
-    '''
-    ## rename "emb" to "topic"
-    source_corr_ord.columns = source_corr_ord.columns.str.replace('emb', 'topic')
-    target_corr.columns = target_corr.columns.str.replace('emb', 'topic')
-    overlap_df.columns = overlap_df.columns.str.replace('emb', 'topic')
-
-    ## compare with alpha
-    alpha_df_ord = alpha_df.copy()
-    alpha_df_ord.columns = alpha_df_ord.columns.str.split('__').str[0]
-    alpha_df_ord = alpha_df_ord.groupby(alpha_df_ord.columns, axis=1).mean()
-    alpha_df_ord = alpha_df_ord.loc[overlap_df.columns, overlap_df.index]
-    plt.figure(figsize=(10, 12))
-    sns.heatmap(alpha_df_ord.T, cmap='coolwarm'); plt.tight_layout(); plt.show()
-    '''
-
-    # 5) One combined figure
-    fig, axes = plt.subplots(1, 3, figsize=(24, 10), constrained_layout=True, sharey=True, sharex=True)
-    sns.heatmap(source_corr_ord, cmap="coolwarm", center=0.0, ax=axes[0], cbar=True)
-    sns.heatmap(target_corr, cmap="coolwarm", center=0.0, ax=axes[1], cbar=True)
-    sns.heatmap(overlap_df, cmap="coolwarm", ax=axes[2], cbar=True)
-    axes[0].set_title("Source data")
-    axes[1].set_title("Target data")
-    axes[2].set_title("Source-target overlap")
-    _log_mlflow_figure(fig, "pathway_embedding_triptych.svg")
-    plt.show()
-
-    ## compare with p-values
-    corr_pvals = pathway_embedding_results['source_rna'].pathway_embedding_p_values_by_cluster.copy()
-    corr_pvals = corr_pvals.loc[overlap_df.index, overlap_df.columns]
-    corr_pvals_bin = corr_pvals < 0.05
-    sns.heatmap(corr_pvals_bin, center=0.0, cbar=False); plt.show()
-
-    # Cluster-by-cluster comparison: grid of panels (scatter + linear fit per cluster)
-    from scipy.stats import pearsonr
-
-    overlap_clusters = source_rna_cluster_gp_scores.columns.intersection(target_rna_cluster_gp_scores.columns)
-    all_data = []
-    for cluster in overlap_clusters:
-        source_cluster_gp_scores = source_rna_cluster_gp_scores[cluster]
-        target_cluster_gp_scores = target_rna_cluster_gp_scores[cluster]
-        for gp in source_cluster_gp_scores.index:
-            all_data.append({
-                'source': source_cluster_gp_scores[gp],
-                'target': target_cluster_gp_scores[gp],
-                'Gene Program': gp,
-                'Cluster': cluster
-            })
-    all_data_df = pd.DataFrame(all_data)
+def cluster_pathway_embedding_heatmap(pathway_embedding_results, adata_label, top_k_pathways=3, row_ind=None, col_ind=None, pathway_order=None):
     import seaborn as sns
 
-    n_clust = len(overlap_clusters)
-    rna_cluster_colormaps = dict(zip(
-        source_concat_adata.obs['RNA_clusters'].cat.categories.tolist(),
-        source_concat_adata.uns['RNA_clusters_colors']
-    ))
-    if n_clust > 0:
-        ncols = int(np.ceil(n_clust / 2))
-        nrows = 2
-        fig, axes = plt.subplots(
-            nrows,
-            ncols,
-            figsize=(3.4 * ncols, 3.4 * nrows),
-            sharex=True,
-            sharey=True,
-            squeeze=False,
-        )
-        axes_flat = axes.flatten()
-        line_color = '#1a1a1a'
-        for i, cluster in enumerate(overlap_clusters):
-            ax = axes_flat[i]
-            sub = all_data_df.loc[all_data_df['Cluster'] == cluster]
-            marker_color = rna_cluster_colormaps[cluster]
-            # Compute Pearson r for this cluster
-            if len(sub) > 1:
-                pearson_r, _ = pearsonr(sub['source'], sub['target'])
-                pearson_r_str = f" (r={pearson_r:.2f})"
-            else:
-                pearson_r_str = ""
-            sns.regplot(
-                data=sub,
-                x='source',
-                y='target',
-                ax=ax,
-                ci=None,
-                scatter_kws={
-                    's': 36,
-                    'alpha': 0.75,
-                    'marker': 'x',
-                    'color': marker_color,
-                    'edgecolor': marker_color,
-                },
-                line_kws={'color': line_color, 'lw': 2, 'alpha': 0.95},
-            )
-            ax.set_title(f"{cluster}{pearson_r_str}", fontsize=10)
-            ax.grid(True, color='#dddddd', linewidth=0.5)
-        for j in range(n_clust, len(axes_flat)):
-            axes_flat[j].set_visible(False)
-        fig.suptitle('Source vs target gene program scores (per cluster)', y=1.02)
-        fig.supxlabel('source cluster GP score')
-        fig.supylabel('target cluster GP score')
-        plt.tight_layout(rect=[0.04, 0.04, 1, 0.98])
-        _log_mlflow_figure(fig, "source_vs_target_gene_program_scores_per_cluster.svg")
-        plt.show()
+    result = pathway_embedding_results[adata_label]
+    corr = result.pathway_embedding_correlation_by_cluster
+    if corr is None or corr.empty:
+        return None, None
 
-    #%% FASTopic analysis
+    if pathway_order is None:
+        #pathway_order = corr.abs().max(axis=1).sort_values(ascending=False).head(top_k_pathways).index
+        pathway_order = pd.Series(corr.apply(lambda x: corr.index[np.argsort(x)[:top_k_pathways]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values
+        corr_top = corr.loc[pathway_order]
+        cg = sns.clustermap(corr_top, cmap='coolwarm', center=0.0)
+        _log_mlflow_figure(cg.figure, "pathway_embedding_by_cluster_{}.svg".format(adata_label))
+    else:
+        fig, ax = plt.subplots(figsize=(8, 8))
+        corr_top = corr.loc[pathway_order]
+        corr_top = corr_top.iloc[row_ind, col_ind]
+        sns.heatmap(corr_top, cmap='coolwarm', center=0.0, ax=ax)
+        _log_mlflow_figure(fig, "pathway_embedding_by_cluster_{}.svg".format(adata_label))
+        cg=None
 
-    import decoupler as dc
-    import decoupler.op
+    plt.show()
 
-    ## load from disk, after FASTopic analysis
-    source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_with_fastopic.h5ad"))
-    source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned_with_fastopic.h5ad"))
-    target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_fastopic.h5ad"))
-    target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_fastopic.h5ad"))
+    return corr_top, cg, pathway_order
 
-    ## extract fastopic results
-    def _extract_fastopic_topic_gene_weights(adata, net):
-        """Build the topic-by-gene weight matrix from FASTopic obsm/uns/varm keys.
+# Myc_TF_target_genes_GP, Apex1_TF_target_genes_GP
+source_rna_cluster_gp_scores, _fig_stair_heatmap_source, _fig_stair_spatial_source = staircase_heatmap(
+    pathway_embedding_results, source_rna, 'source_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
+)
+target_rna_cluster_gp_scores, _fig_stair_heatmap_target, _fig_stair_spatial_target = staircase_heatmap(
+    pathway_embedding_results, target_rna, 'target_rna', plot_spatial=True, gp_name='Apex1_TF_target_genes_GP'
+)
 
-        Returns
-        -------
-        topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
-            Topics ordered by descending global weight, cleaned of inf/NaN columns.
-        sorted_topics : np.ndarray
-            Topic indices in descending global-weight order.
-        net : pd.DataFrame
-            Hallmark net filtered to genes present in topic_gene_weight_mat.
-        """
-        topic_global_weights = adata.uns['fastopic']['global_weights'].copy()
-        topic_by_genes = adata.varm['fastopic_genes_topic_weights'].T.copy()
-        topic_by_genes_df = pd.DataFrame(
-            topic_by_genes,
-            columns=adata.var_names,
-            index=[f'topic_{i}' for i in range(len(topic_by_genes))],
-        )
-        sorted_topics = np.flip(np.argsort(topic_global_weights))
 
-        plt.figure(figsize=(12, 5))
-        plt.plot(topic_by_genes_df.index[sorted_topics], topic_global_weights[sorted_topics], marker='o')
-        plt.xticks(rotation=45); plt.tight_layout(); plt.show()
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
 
-        topic_gene_weight_mat = topic_by_genes_df.loc[[f"topic_{i}" for i in sorted_topics]].copy()
-        topic_gene_weight_mat = topic_gene_weight_mat.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="any")
 
-        net_filtered = net[net["target"].isin(topic_gene_weight_mat.columns)].copy()
-        if net_filtered.empty:
-            raise ValueError("No Hallmark mouse genes overlap with topic-gene weight columns.")
-
-        return topic_gene_weight_mat, sorted_topics, net_filtered
-
-    def extract_fastopic_embeddings(source_adata, target_adata, modality, do_procrustes=False, keep_cells=False):
-
-        ## extract gene and topic embeddings from source and target data
-        source_gene_embeddings = source_adata.varm['fastopic_gene_embeddings'].copy()
-        target_gene_embeddings = target_adata.varm['fastopic_gene_embeddings'].copy()
-        source_topic_embeddings = source_adata.uns['fastopic']['topic_embeddings'].copy()
-        target_topic_embeddings = target_adata.uns['fastopic']['topic_embeddings'].copy()
-        source_cell_embeddings = source_adata.obsm['MultiGATE_source_aligned'].copy()
-        target_cell_embeddings = target_adata.obsm['MultiGATE_source_aligned'].copy()
-
-        if do_procrustes:
-            from scipy.spatial import procrustes
-            source_gene_embeddings, target_gene_embeddings, disparity = procrustes(source_gene_embeddings, target_gene_embeddings)
-            source_topic_embeddings, target_topic_embeddings, disparity = procrustes(source_topic_embeddings, target_topic_embeddings)
-
-        ## form sinlge adata object
-        source_target_gene_embeddings = np.concatenate([source_gene_embeddings, target_gene_embeddings], axis=0)
-        source_target_topic_embeddings = np.concatenate([source_topic_embeddings, target_topic_embeddings], axis=0)
-        source_target_cell_embeddings = np.concatenate([source_cell_embeddings, target_cell_embeddings], axis=0)
-
-        feature_type = 'gene' if modality == 'rna' else 'peak'
-        gene_or_topic = np.concatenate([
-            np.full(source_target_gene_embeddings.shape[0], feature_type),
-            np.full(source_target_topic_embeddings.shape[0], 'topic'),
-            np.full(source_target_cell_embeddings.shape[0], 'cell'),
-        ])
-        label = np.concatenate([
-            source_adata.var_names,
-            target_adata.var_names,
-            [f'topic_{i}' for i in range(source_topic_embeddings.shape[0])],
-            [f'topic_{i}' for i in range(target_topic_embeddings.shape[0])],
-            source_adata.obs_names,
-            target_adata.obs_names,
-        ])
-        source_or_target = np.concatenate([
-            np.full(source_gene_embeddings.shape[0], 'source'),
-            np.full(target_gene_embeddings.shape[0], 'target'),
-            np.full(source_topic_embeddings.shape[0], 'source'),
-            np.full(target_topic_embeddings.shape[0], 'target'),
-            np.full(source_cell_embeddings.shape[0], 'source'),
-            np.full(target_cell_embeddings.shape[0], 'target'),
-        ])
-
-        gene_topic_adata = sc.AnnData(
-            X = np.concatenate(
-                [source_target_gene_embeddings, source_target_topic_embeddings, source_target_cell_embeddings],
-                axis=0,
-            ),
-            obs = pd.DataFrame(
-                data = {
-                'gene_or_topic': gene_or_topic,
-                'source_or_target': source_or_target,
-                'label': label},
-            )
-        )
-        gene_topic_adata.obs['combination'] = gene_topic_adata.obs['source_or_target'].astype(str) + '_' + gene_topic_adata.obs['gene_or_topic'].astype(str)
-
-        ## split source and target adatas
-        source_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('source')].copy()
-        target_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('target')].copy()
-
-        if not keep_cells:
-            source_adata = source_adata[~source_adata.obs['gene_or_topic'].eq('cell')]
-            target_adata = target_adata[~target_adata.obs['gene_or_topic'].eq('cell')]
-
-        return source_adata, target_adata
-
-    ## extract topic embeddings from source and target data
-    feature_topic_adatas = {}
-    feature_topic_adatas['source_rna'], feature_topic_adatas['target_rna'] = extract_fastopic_embeddings(source_rna, target_rna, modality='rna')
-    feature_topic_adatas['source_atac'], feature_topic_adatas['target_atac'] = extract_fastopic_embeddings(source_atac, target_atac, modality='atac')
-
-    ## concat a subset of the feature topic adatas for visualization
-    '''
-    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['target_rna'], feature_topic_adatas['target_atac']], axis=0)
-    sc.pp.neighbors(concat_feature_topic_adatas, use_rep='X', n_neighbors=10)
-    sc.tl.leiden(concat_feature_topic_adatas)
-    sc.tl.umap(concat_feature_topic_adatas, min_dist=0.3)
-    umap_axes = sc.pl.umap(
-        concat_feature_topic_adatas,
-        color=['gene_or_topic', 'leiden'],
-        ncols=3,
-        wspace=0.2,
-        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':250}),
-        show=False,
-    )
-    topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
-    topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
-    n_topics = int(feature_topic_adatas['target_rna'].obs['gene_or_topic'].eq('topic').sum())
-    topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
-    for ax in np.atleast_1d(umap_axes):
-        for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
-            ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
-    plt.tight_layout(); plt.show()
-    
-    '''
-    ## ingest ATAC embeddings into RNA UMAP - TARGET DATA
-    sc.pp.neighbors(feature_topic_adatas['target_rna'], use_rep='X', n_neighbors=10)
-    sc.tl.umap(feature_topic_adatas['target_rna'], min_dist=0.3)
-    sc.tl.leiden(feature_topic_adatas['target_rna'], resolution=0.5)
-    sc.tl.ingest(feature_topic_adatas['target_atac'], feature_topic_adatas['target_rna'], embedding_method='umap', obs='leiden')
-    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['target_rna'], feature_topic_adatas['target_atac']], axis=0)
-    umap_axes = sc.pl.umap(
-        concat_feature_topic_adatas,
-        color=['gene_or_topic', 'leiden'],
-        ncols=3,
-        wspace=0.1,
-        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':350}),
-        show=False,
-    )
-    topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
-    topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
-    n_topics = int(feature_topic_adatas['target_rna'].obs['gene_or_topic'].eq('topic').sum())
-    topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
-    for ax in np.atleast_1d(umap_axes):
-        for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
-            ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
-    plt.tight_layout(); plt.show()
-
-    ## ingest ATAC embeddings into RNA UMAP - SOURCE DATA
-    sc.pp.neighbors(feature_topic_adatas['source_rna'], use_rep='X', n_neighbors=10)
-    sc.tl.umap(feature_topic_adatas['source_rna'], min_dist=0.3)
-    sc.tl.leiden(feature_topic_adatas['source_rna'], resolution=0.5)
-    sc.tl.ingest(feature_topic_adatas['source_atac'], feature_topic_adatas['source_rna'], embedding_method='umap', obs='leiden')
-    concat_feature_topic_adatas = sc.concat([feature_topic_adatas['source_rna'], feature_topic_adatas['source_atac']], axis=0)
-    umap_axes = sc.pl.umap(
-        concat_feature_topic_adatas,
-        color=['gene_or_topic', 'leiden'],
-        ncols=3,
-        wspace=0.1,
-        size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':350}),
-        show=False,
-    )
-    topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
-    topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
-    n_topics = int(feature_topic_adatas['source_rna'].obs['gene_or_topic'].eq('topic').sum())
-    topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
-    for ax in np.atleast_1d(umap_axes):
-        for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
-            ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
-    plt.tight_layout(); plt.show()
-
-    ## compare topic embeddings across datasets and modalities
-    topic_embeddings = []
-    for dat in feature_topic_adatas.values():
-        embs = dat[dat.obs['gene_or_topic'].eq('topic')].X.copy()
-        topic_embeddings.append(embs)
-
-    if \
-        (topic_embeddings[0] == topic_embeddings[2]).all() and \
-        (topic_embeddings[1] == topic_embeddings[3]).all():
-        print("Tied topic embeddings confirmed.")
-
-    topic_embeddings = np.concatenate(topic_embeddings, axis=0)
-    corr_matrix = np.corrcoef(topic_embeddings)
-    plt.figure(figsize=(5, 4))
-    sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0)
-    plt.xticks([])
-    plt.yticks([])
-    plt.tight_layout(); plt.show()
-
-    ## build shared Hallmark mouse net once
-    hallmark_human = dc.op.hallmark(organism="human")
-    map_path = os.path.join(os.environ["DATAPATH"], "gene_annotations", "human_mouse_gene_orthologs.csv")
-    map_df = (
-        pd.read_csv(map_path)
-        .rename(columns={"Gene name": "target_human", "Mouse gene name": "target"})[
-            ["target_human", "target"]
+## remove terms from correlation matrix, e.g. TF targets
+terms_blacklist = None #['TF_target', 'combined']
+if terms_blacklist is not None:
+    pathway_embedding_results_cp = pathway_embedding_results.copy()
+    pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster = \
+        pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster.loc[
+            ~pathway_embedding_results_cp['source_rna'].pathway_embedding_correlation_by_cluster.index.str.contains('|'.join(terms_blacklist))
         ]
-        .dropna()
-        .drop_duplicates()
+
+# 1) Get source corr matrix and pathway order
+source_corr, _, pathway_order_source = cluster_pathway_embedding_heatmap(
+    pathway_embedding_results, "source_rna", top_k_pathways=2
+)
+source_corr = source_corr.loc[pathway_order_source]
+
+# 2) Temporary clustermap only to extract row/col ordering
+cg = sns.clustermap(source_corr, cmap="coolwarm", center=0.0)
+row_ind = cg.dendrogram_row.reordered_ind
+col_ind = cg.dendrogram_col.reordered_ind
+plt.close(cg.figure)
+
+# Reorder source
+source_corr_ord = source_corr.iloc[row_ind, col_ind]
+
+# 3) Build target using same pathway + same row/col order
+target_corr = pathway_embedding_results["target_rna"].pathway_embedding_correlation_by_cluster
+target_corr = target_corr.loc[pathway_order_source].iloc[row_ind, col_ind]
+
+# 4) Overlap
+overlap = softmax(source_corr_ord * target_corr / 5.0)
+overlap = (overlap - overlap.min()) / (overlap.max() - overlap.min())
+overlap_df = pd.DataFrame(overlap, index=target_corr.index, columns=target_corr.columns)
+
+'''
+## rename "emb" to "topic"
+source_corr_ord.columns = source_corr_ord.columns.str.replace('emb', 'topic')
+target_corr.columns = target_corr.columns.str.replace('emb', 'topic')
+overlap_df.columns = overlap_df.columns.str.replace('emb', 'topic')
+
+## compare with alpha
+alpha_df_ord = alpha_df.copy()
+alpha_df_ord.columns = alpha_df_ord.columns.str.split('__').str[0]
+alpha_df_ord = alpha_df_ord.groupby(alpha_df_ord.columns, axis=1).mean()
+alpha_df_ord = alpha_df_ord.loc[overlap_df.columns, overlap_df.index]
+plt.figure(figsize=(10, 12))
+sns.heatmap(alpha_df_ord.T, cmap='coolwarm'); plt.tight_layout(); plt.show()
+'''
+
+# 5) One combined figure
+fig, axes = plt.subplots(1, 3, figsize=(24, 10), constrained_layout=True, sharey=True, sharex=True)
+sns.heatmap(source_corr_ord, cmap="coolwarm", center=0.0, ax=axes[0], cbar=True)
+sns.heatmap(target_corr, cmap="coolwarm", center=0.0, ax=axes[1], cbar=True)
+sns.heatmap(overlap_df, cmap="coolwarm", ax=axes[2], cbar=True)
+axes[0].set_title("Source data")
+axes[1].set_title("Target data")
+axes[2].set_title("Source-target overlap")
+_log_mlflow_figure(fig, "pathway_embedding_triptych.svg")
+plt.show()
+
+## compare with p-values
+corr_pvals = pathway_embedding_results['source_rna'].pathway_embedding_p_values_by_cluster.copy()
+corr_pvals = corr_pvals.loc[overlap_df.index, overlap_df.columns]
+corr_pvals_bin = corr_pvals < 0.05
+sns.heatmap(corr_pvals_bin, center=0.0, cbar=False); plt.show()
+
+# Cluster-by-cluster comparison: grid of panels (scatter + linear fit per cluster)
+from scipy.stats import pearsonr
+
+overlap_clusters = source_rna_cluster_gp_scores.columns.intersection(target_rna_cluster_gp_scores.columns)
+all_data = []
+for cluster in overlap_clusters:
+    source_cluster_gp_scores = source_rna_cluster_gp_scores[cluster]
+    target_cluster_gp_scores = target_rna_cluster_gp_scores[cluster]
+    for gp in source_cluster_gp_scores.index:
+        all_data.append({
+            'source': source_cluster_gp_scores[gp],
+            'target': target_cluster_gp_scores[gp],
+            'Gene Program': gp,
+            'Cluster': cluster
+        })
+all_data_df = pd.DataFrame(all_data)
+import seaborn as sns
+
+n_clust = len(overlap_clusters)
+rna_cluster_colormaps = dict(zip(
+    source_concat_adata.obs['RNA_clusters'].cat.categories.tolist(),
+    source_concat_adata.uns['RNA_clusters_colors']
+))
+if n_clust > 0:
+    ncols = int(np.ceil(n_clust / 2))
+    nrows = 2
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(3.4 * ncols, 3.4 * nrows),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
     )
-    hallmark_mouse_net = (
-        hallmark_human.rename(columns={"target": "target_human"})
-        .merge(map_df, on="target_human", how="inner")[["source", "target"]]
-        .drop_duplicates()
-    )
-
-    ## extract topic-by-gene weight matrix from source and target data
-    source_topic_mat, source_sorted_topics, source_net = _extract_fastopic_topic_gene_weights(
-        source_rna, hallmark_mouse_net,
-    )
-    target_topic_mat, target_sorted_topics, target_net = _extract_fastopic_topic_gene_weights(
-        target_rna, hallmark_mouse_net,
-    )
-
-    ## build LR-level sender-receiver gene sets
-    import liana as li
-    import decoupler as dc
-
-    # 1) Load ligand-receptor pairs from LIANA
-    lr_pairs = li.rs.select_resource('mouseconsensus')
-
-    # 2) Load pathway gene sets / weights from decoupler
-    #avail_resources = dc.op.show_resources()
-    #resource = dc.op.resource('HPA_secretome')
-
-
-    # 3) Generate LR-level sender-receiver gene sets
-    lr_hallmark = li.rs.generate_lr_geneset(
-        lr_pairs,
-        hallmark_mouse_net,
-        lr_sep="^",
-        weight=None
-    )
-
-    ortholog_mapper = map_df.set_index('target_human').to_dict()['target']
-    resource = dc.op.progeny(organism='human')
-    resource = resource.map(lambda x: ortholog_mapper.get(x, x) if pd.notnull(x) else x)
-
-    lr_resource = li.rs.generate_lr_geneset(
-        lr_pairs,
-        resource,
-        lr_sep="^",
-        weight=None
-    )
-
-    ## create LR genesets
-    lr_hallmark_grouped_source = lr_hallmark.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[0].explode().tolist()))
-    lr_hallmark_grouped_target = lr_hallmark.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[1].explode().tolist()))
-    lr_hallmark_grouped = pd.concat([lr_hallmark_grouped_source.rename('source_genes'), lr_hallmark_grouped_target.rename('target_genes')], axis=1)
-    lr_hallmark_grouped['all_genes'] = lr_hallmark_grouped.apply(lambda x: list(x['source_genes']) + list(x['target_genes']), axis=1)
-    lr_hallmark_grouped.index.rename('pathway', inplace=True)
-
-    lr_resource_grouped_source = lr_resource.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[0].explode().tolist()))
-    lr_resource_grouped_target = lr_resource.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[1].explode().tolist()))
-    lr_resource_grouped = pd.concat([lr_resource_grouped_source.rename('source_genes'), lr_resource_grouped_target.rename('target_genes')], axis=1)
-    lr_resource_grouped['all_genes'] = lr_resource_grouped.apply(lambda x: list(x['source_genes']) + list(x['target_genes']), axis=1)
-    lr_resource_grouped.index.rename('pathway', inplace=True)
-
-    #%% analysis of linear decoder
-    from sklearn.metrics.pairwise import euclidean_distances
-    from scipy.special import softmax
-    from post_hoc_utils import topic_betas_hallmark_gsea_mouse
-
-    assert teacher_source_mgate.linear_etm_decoder
-
-    ## extract decoder parameters
-    alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
-    rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
-    rho_atac = teacher_source_mgate.rho_atac.detach().cpu().numpy()
-
-    rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
-    rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
-    rho_rna_overlap = ((np.abs(rho_rna) == np.abs(rho_rna).max(1, keepdims=True)) * rho_rna_mask).any(1).mean()
-    rho_atac_overlap = ((np.abs(rho_atac) == np.abs(rho_atac).max(1, keepdims=True)) * rho_atac_mask).any(1).mean()
-    print(f"RNA overlap: {rho_rna_overlap}, ATAC overlap: {rho_atac_overlap}")
-
-    rho_rna_mask_gain = (np.abs(rho_rna) * rho_rna_mask).sum(1) / rho_rna_mask.sum(1) / np.abs(rho_rna).mean(1)
-    rho_atac_mask_gain = (np.abs(rho_atac) * rho_atac_mask).sum(1) / rho_atac_mask.sum(1) / np.abs(rho_atac).mean(1)
-    fig, ax = plt.subplots(1, 2, figsize=(10, 5), sharex=True)
-    ax[0].hist(rho_rna_mask_gain, bins=50)
-    ax[1].hist(rho_atac_mask_gain, bins=50)
-    plt.tight_layout(); plt.show()
-
-    topk=25
-    topk_genes = []
-    for topic in range(alpha.shape[0]):
-        topk_genes_topic = pd.Series(alpha[topic]).nlargest(topk).index
-        topk_genes.append(topk_genes_topic)
-    topk_genes = np.concatenate(topk_genes)
-    top_alpha = alpha[:,topk_genes]
-    plt.figure(figsize=(10, 10))
-    plt.matshow(top_alpha, aspect='auto'); plt.colorbar()
-    plt.tight_layout(); plt.show()
-
-    pathway_names = teacher_source_mgate.pathway_names
-    source_pathway_names = [pw for pw in pathway_names if pw.endswith('source')]
-    target_pathway_names = [pw for pw in pathway_names if pw.endswith('target')]
-
-    alpha_df = pd.DataFrame(alpha, index=[f'topic_{i}' for i in range(30)], columns=pathway_names)
-    pd.concat([
-        alpha_df.abs().max(1),
-        alpha_df.abs().median(1)
-    ], axis=1).sort_values(0).plot(kind='bar')
-
-
-    # alpha = F.normalize(alpha, dim=1)
-    # rho_rna = F.normalize(rho_rna, dim=1)
-    # rho_atac = F.normalize(rho_atac, dim=1)
-    # topic_var = teacher_source_mgate.topic_var.detach().cpu().numpy()
-
-    beta_rna = alpha @ rho_rna
-    beta_atac = alpha @ rho_atac
-
-    ## derive theta from delta embeddings
-    source_theta = softmax(np.concatenate([source_rna_emb, source_atac_emb], axis=0), axis=1)
-    source_theta_df = pd.DataFrame(source_theta, index=np.concatenate([source_rna.obs_names, source_atac.obs_names]))
-
-    target_theta = softmax(np.concatenate([target_rna_emb, target_atac_emb], axis=0), axis=1)
-    target_theta_df = pd.DataFrame(target_theta, index=np.concatenate([target_rna.obs_names, target_atac.obs_names]))
-
-    ## cluster delta by leiden clusters, then apply softmax to get theta
-    source_clust_by_topic_theta = (
-        pd.DataFrame(source_rna_emb, index=source_rna.obs_names)
-        .assign(RNA_leiden=source_concat_adata.obs.loc[
-            source_concat_adata.obs['modality'].eq('rna'),
-            'leiden'
-            ].values)
-        .groupby('RNA_leiden')
-        .mean()
-        .apply(softmax, axis=1, result_type='expand')
-    )
-
-    target_clust_by_topic_theta = (
-        pd.DataFrame(target_rna_emb, index=target_rna.obs_names)
-        .assign(RNA_leiden=target_concat_adata.obs.loc[
-            target_concat_adata.obs['modality'].eq('rna'),
-            'leiden'
-            ].values)
-        .groupby('RNA_leiden')
-        .mean()
-        .apply(softmax, axis=1, result_type='expand')
-    )
-    
-    ## get top topics for each cluster and plot staircase heatmap
-    topk = 5
-    fig, axs = plt.subplots(1, 2, figsize=(10, 10))
-
-    topk_topics = []
-    topics = source_clust_by_topic_theta.columns.values
-    clusters = source_clust_by_topic_theta.max(1).sort_values(ascending=False).index
-    for cluster in clusters:
-        topk_topics_cluster = source_clust_by_topic_theta.loc[cluster].nlargest(topk).index
-        topk_topics_cluster = topk_topics_cluster[topk_topics_cluster.isin(topics)]
-        topics = topics[~np.isin(topics, topk_topics_cluster)]
-        topk_topics.append(topk_topics_cluster)
-    source_topk_topics = np.concatenate(topk_topics + [pd.Index(topics)]) # could also just keep topk_topics
-    source_clust_by_topic_theta = source_clust_by_topic_theta.loc[clusters, source_topk_topics]
-    sns.heatmap(source_clust_by_topic_theta.T, cmap='viridis', ax=axs[0])
-
-    topk_topics = []
-    topics = target_clust_by_topic_theta.columns.values
-    clusters = target_clust_by_topic_theta.max(1).sort_values(ascending=False).index
-    for cluster in clusters:
-        topk_topics_cluster = target_clust_by_topic_theta.loc[cluster].nlargest(topk).index
-        topk_topics_cluster = topk_topics_cluster[topk_topics_cluster.isin(topics)]
-        topics = topics[~np.isin(topics, topk_topics_cluster)]
-        topk_topics.append(topk_topics_cluster)
-    target_topk_topics = np.concatenate(topk_topics + [pd.Index(topics)])
-    target_clust_by_topic_theta = target_clust_by_topic_theta.loc[clusters, target_topk_topics]
-    sns.heatmap(target_clust_by_topic_theta.T, cmap='viridis', ax=axs[1])
-    plt.tight_layout(); plt.show()
-
-    ## add alpha embeddings to source and target data
-    source_alpha_embs = source_theta @ alpha
-    target_alpha_embs = target_theta @ alpha
-    source_target_adata.obsm['alpha_embs'] = np.concatenate([source_alpha_embs, target_alpha_embs], axis=0)
-
-    import liana as li
-    
-    pathways_adata = sc.AnnData(
-        source_alpha_embs,
-        obs=source_target_adata[source_target_adata.obs['source_or_target'].eq('source')].obs,
-        var=pd.DataFrame(
-            data=np.vstack([
-                [pw.split('__')[0] for pw in pathway_names],
-                ['sender' if pw.endswith('source') else 'receiver' for pw in pathway_names],
-            ]).T,
-            index=pathway_names,
-            columns=['basename', 'sender_or_receiver']),
-        obsm={'spatial': source_target_adata[source_target_adata.obs['source_or_target'].eq('source')].obsm['spatial']},
-        )
-    pathways_adata.var['paired'] = pathways_adata.var['basename'].isin(pathways_adata.var['basename'].value_counts().index[pathways_adata.var['basename'].value_counts().eq(2)])
-
-    li.ut.spatial_neighbors(pathways_adata, bandwidth=1000, set_diag=False)
-    paired_pathways_adata = pathways_adata[:,pathways_adata.var['paired']].copy()
-    sender_pathways_adata = paired_pathways_adata[:,paired_pathways_adata.var['sender_or_receiver'].eq('sender')]
-    receiver_pathways_adata = paired_pathways_adata[:,paired_pathways_adata.var['sender_or_receiver'].eq('receiver')]
-    assert np.all(sender_pathways_adata.var['basename'].values == receiver_pathways_adata.var['basename'].values)
-
-    X = pathways_adata.X.copy()
-    W = pathways_adata.obsp['spatial_connectivities']
-    plt.matshow(X.T @ W @ X, aspect='auto'); plt.colorbar()
-    plt.tight_layout(); plt.show()
-
-    S = sender_pathways_adata.X.copy()
-    R = receiver_pathways_adata.X.copy()
-    W = pathways_adata.obsp['spatial_connectivities']
-    plt.scatter(S.sum(axis=0), R.sum(axis=0)); plt.colorbar()
-
-    #S = softmax(S, axis=0)
-    #R = softmax(R, axis=0)
-
-    M = S.T @ W @ R
-    plt.matshow(M); plt.colorbar()
-
-    sc.pp.pca(pathways_adata, n_comps=50)
-    sc.external.pp.bbknn(pathways_adata, batch_key='source_or_target', use_rep='X_pca', neighbors_within_batch=10)
-    sc.tl.umap(pathways_adata, min_dist=0.3)
-    sc.pl.umap(pathways_adata, color=['source_or_target'], ncols=3, wspace=0.2, size=25)
-    plt.tight_layout(); plt.show()
-
-    ## compute mean distance between source and target for each cluster
-    source_adata = source_target_adata[source_target_adata.obs['source_or_target'].eq('source')]
-    target_adata = source_target_adata[source_target_adata.obs['source_or_target'].eq('target')]
-    mean_dists = pd.DataFrame(index=source_adata.obs['leiden'].cat.categories, columns=['multigate', 'alpha'])
-    for cluster in source_adata.obs['leiden'].cat.categories:
-        source_dat = source_adata[source_adata.obs['leiden'].eq(cluster)]
-        target_dat = target_adata[target_adata.obs['leiden'].eq(cluster)]
-        mean_dists.loc[cluster, 'multigate'] = np.mean(euclidean_distances(source_dat.X, target_dat.X)) # could replace with wasserstein distance
-        mean_dists.loc[cluster, 'alpha'] = np.mean(euclidean_distances(source_dat.obsm['alpha_embs'], target_dat.obsm['alpha_embs']))
-    mean_dists = mean_dists.sort_values(by='multigate', ascending=True)
-    mean_dists.loc['all', 'multigate'] = np.mean(euclidean_distances(source_adata.X, target_adata.X))
-    mean_dists.loc['all', 'alpha'] = np.mean(euclidean_distances(source_adata.obsm['alpha_embs'], target_adata.obsm['alpha_embs']))
-    print(mean_dists)
-
-    ## get top active topics and perform GSEA
-    top_active_cluster = mean_dists.index[0] #'5'
-    top_active_topics = source_clust_by_topic_theta.loc[top_active_cluster].nlargest(topk).index
-    top_active_gsea = topic_betas_hallmark_gsea_mouse(
-        beta_rna=beta_rna,
-        gene_names=np.asarray(source_rna.var_names).astype(str),
-        topic_indices=top_active_topics,
-        datapath=os.environ["DATAPATH"],
-    )
-    top_active_genes = top_active_gsea["top_active_genes"]
-    top_active_rna_betas = top_active_gsea["ranked_gene_indices"]
-    print("\nHallmark GSEA (mouse) — top terms per active topic:")
-    print(
-        top_active_gsea["top_terms_per_row"].loc[
-            top_active_gsea["top_terms_per_row"]['padj'].le(0.05)
-        ]
-    )
-
-    # Categorical.map(dict) looks up category values with their native dtype; string
-    # keys in lut won't match int categories and yield NaN floats mixed with RGB
-    # tuples, which breaks pandas' Index reconstruction (TypeError).
-    cluster_key = source_theta_df.obs['RNA_clusters'].astype(str)
-    unique_clusters = cluster_key.unique()
-    network_pal = sns.husl_palette(len(unique_clusters), s=0.45)
-    lut = dict(zip(unique_clusters, network_pal))
-    row_colors = cluster_key.map(lut)
-
-    cg = sns.clustermap(source_theta_df, cmap='viridis', row_colors=row_colors)
-    cg.ax_heatmap.set_yticklabels([])
-
-    alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
-    rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
-    rho_atac = teacher_source_mgate.rho_atac.detach().cpu().numpy()
-    rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
-    rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
-
-    beta_rna = alpha @ rho_rna
-    beta_atac = alpha @ rho_atac
-
-    ## topic-topic correlation
-    topic_topic_corr = np.corrcoef(alpha)
-    topic_topic_corr[np.eye(topic_topic_corr.shape[0]) == 1] = 0
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(topic_topic_corr, cmap='viridis')
-    plt.tight_layout()
-    plt.show()
-
-    ## topic norms
-    topic_norm = np.linalg.norm(alpha, axis=1)
-    beta_rna_norm = np.linalg.norm(beta_rna, axis=1)
-    beta_atac_norm = np.linalg.norm(beta_atac, axis=1)
-    fig, ax = plt.subplots(3, 1, figsize=(6, 8))
-    ax[0].bar(np.arange(alpha.shape[0]), topic_norm)
-    ax[1].bar(np.arange(beta_rna.shape[0]), beta_rna_norm)
-    ax[2].bar(np.arange(beta_atac.shape[0]), beta_atac_norm)
-    ax[0].set_title("Topic norm")
-    ax[1].set_title("Beta RNA norm")
-    ax[2].set_title("Beta ATAC norm")
-    plt.tight_layout()
-    plt.show()
-
-    ## topic & feature co-embedding
-    alpha_norm = alpha / np.linalg.norm(alpha, axis=1, keepdims=True)
-    rho_rna_norm = rho_rna / np.linalg.norm(rho_rna, axis=1, keepdims=True)
-    rho_atac_norm = rho_atac / np.linalg.norm(rho_atac, axis=1, keepdims=True)
-
-    alpha_rho_rna_adata = sc.AnnData(
-        np.concatenate([rho_rna_norm.T, alpha_norm], axis=0),
-    )
-    alpha_rho_rna_adata.obs_names = np.concatenate([[f'gp_{gp}' for gp in range(rho_rna.shape[1])], [f'topic_{topic}' for topic in range(alpha.shape[0])]])
-    alpha_rho_rna_adata.obs['gene_or_topic'] = np.concatenate([['gene'] * rho_rna.shape[1], ['topic'] * alpha.shape[0]])
-    alpha_rho_rna_adata.obs['max_abs_beta'] = list(np.abs(beta_rna).argmax(0)) + list(np.arange(alpha.shape[0]))
-
-    sc.pp.pca(alpha_rho_rna_adata, n_comps=100)
-    sc.pp.neighbors(alpha_rho_rna_adata, use_rep='X_pca', n_neighbors=30)
-    #sc.external.pp.bbknn(alpha_rho_rna_adata, batch_key='gene_or_topic', neighbors_within_batch=30)
-    sc.tl.umap(alpha_rho_rna_adata, min_dist=0.3)
-
-    topic_gene_dists = euclidean_distances(
-        alpha_rho_rna_adata.obsm['X_pca'],
-    )[:rho_rna.shape[1], -alpha.shape[0]:].argmin(axis=1)
-    alpha_rho_rna_adata.obs['topic_gene_dist'] = list(topic_gene_dists) + list(np.arange(alpha.shape[0]))
-
-    # 1. Extract coordinates and groups into a lightweight dataframe
-    df = pd.DataFrame(alpha_rho_rna_adata.obsm['X_umap'], columns=['UMAP1', 'UMAP2'], index=alpha_rho_rna_adata.obs_names)
-    df = df.join(alpha_rho_rna_adata.obs[['gene_or_topic', 'max_abs_beta']])
-
-    # 2. Plot using seaborn, adding labels for topics
-    plt.figure(figsize=(8, 6))
-    scatter = sns.scatterplot(
-        data=df, 
-        x='UMAP1', 
-        y='UMAP2', 
-        hue='gene_or_topic',   # Colors by group
-        style='gene_or_topic', # Assigns different markers by group
-        palette='Set2',
-        s=list([5] * rho_rna.shape[1]) + list([60] * alpha.shape[0]),  # Marker size
-        edgecolor='none'
-    )
-
-    # Add text labels for topics
-    topic_indices = df[df['gene_or_topic'] == 'topic'].index
-    topic_labels = [f'topic_{i}' for i in range(alpha.shape[0])]
-    for idx, label in zip(topic_indices, topic_labels):
-        plt.annotate(
-            label,
-            (df.loc[idx, 'UMAP1'], df.loc[idx, 'UMAP2']),
-            textcoords="offset points",
-            xytext=(0,5),
-            ha='center',
-            fontsize=8,
-            color='black',
-            alpha=0.8
-        )
-
-    # 3. Move the legend outside the plot
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.show()
-
-    sc.pl.umap(
-        alpha_rho_rna_adata,
-        color=['gene_or_topic', 'topic_gene_dist', 'max_abs_beta'],
-        color_map='Set2',
-        ncols=3, wspace=0.2, size=25)
-
-    #%% compare spatial graph with latent knn graph
-    n_neighbors = 100
-
-    sc.pp.neighbors(source_rna, use_rep='MultiGATE', n_neighbors=n_neighbors)
-    sc.pp.neighbors(source_atac, use_rep='MultiGATE', n_neighbors=n_neighbors)
-    rna_multigate_knn_graph = source_rna.obsp['connectivities']
-    atac_multigate_knn_graph = source_atac.obsp['connectivities']
-
-    source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
-    source_concat_adata.obs['jaccard_similarity'] = jaccard_similarity
-    source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
-
-    MultiGATE.Cal_Spatial_Net(source_rna, model='KNN', k_cutoff=n_neighbors)
-    MultiGATE.Cal_Spatial_Net(source_atac, model='KNN', k_cutoff=n_neighbors)
-
-    spatial_knn_graph, _, _, _ = build_graph_inputs(source_rna, source_atac)
-    indices, values, shape = spatial_knn_graph
-    indices = np.asarray(indices)
-    row, col = indices[:, 0], indices[:, 1]
-    spatial_knn_graph = sp.coo_matrix((values, (row, col)), shape=shape).tocsr()
-    assert indices.shape[1] == 2, "spatial_knn_graph should have 2 columns"
-
-    def jaccard_per_sample_csr(
-        a: sp.csr_matrix,
-        b: sp.csr_matrix,
-        *,
-        binarize: bool = True,
-        empty_value: float = 1.0,
-    ) -> np.ndarray:
-        if not sp.isspmatrix_csr(a):
-            a = a.tocsr()
+    axes_flat = axes.flatten()
+    line_color = '#1a1a1a'
+    for i, cluster in enumerate(overlap_clusters):
+        ax = axes_flat[i]
+        sub = all_data_df.loc[all_data_df['Cluster'] == cluster]
+        marker_color = rna_cluster_colormaps[cluster]
+        # Compute Pearson r for this cluster
+        if len(sub) > 1:
+            pearson_r, _ = pearsonr(sub['source'], sub['target'])
+            pearson_r_str = f" (r={pearson_r:.2f})"
         else:
-            a = a.copy()
-
-        if not sp.isspmatrix_csr(b):
-            b = b.tocsr()
-        else:
-            b = b.copy()
-
-        if a.shape != b.shape:
-            raise ValueError(f"Shape mismatch: {a.shape} vs {b.shape}")
-
-        a.sum_duplicates()
-        b.sum_duplicates()
-        a.eliminate_zeros()
-        b.eliminate_zeros()
-
-        if binarize:
-            a.data = np.ones_like(a.data, dtype=np.uint8)
-            b.data = np.ones_like(b.data, dtype=np.uint8)
-
-        # For binary matrices:
-        # intersection count per row = number of coordinates nonzero in both
-        inter = a.multiply(b).count_nonzero(axis=1)
-
-        # union count per row = nnz(a_row) + nnz(b_row) - intersection
-        a_nnz = a.count_nonzero(axis=1)
-        b_nnz = b.count_nonzero(axis=1)
-        union = a_nnz + b_nnz - inter
-
-        inter = np.asarray(inter).ravel()
-        union = np.asarray(union).ravel()
-
-        out = np.empty(a.shape[0], dtype=float)
-        mask = union == 0
-        out[~mask] = inter[~mask] / union[~mask]
-        out[mask] = empty_value
-        return out
-        
-    # compute the Jaccard similarity between the two graphs
-    rna_jaccard_similarity = jaccard_per_sample_csr(rna_multigate_knn_graph, spatial_knn_graph)
-    atac_jaccard_similarity = jaccard_per_sample_csr(atac_multigate_knn_graph, spatial_knn_graph)
-    jaccard_similarity = np.concatenate([rna_jaccard_similarity, atac_jaccard_similarity])
-    plt.hist(jaccard_similarity, bins=50)
-
-    sc.pl.embedding(source_concat_adata, basis="spatial", color="jaccard_similarity", s=50, legend_loc='None')
-    sc.pl.embedding(source_concat_adata, basis="spatial", color="RNA_clusters", s=50, legend_loc='None')
-
-    #%% ── Save outputs ─────────────────────────────────────────────────────────
-    if args.save_h5ad:
-        print("\nSaving h5ad files to {}...".format(output_dir))
-        paths = {
-            "source_rna":  (source_rna,  "source_rna_co_embed.h5ad"),
-            "source_atac": (source_atac, "source_atac_co_embed.h5ad"),
-            "target_rna":  (target_rna,  "target_rna_co_embed.h5ad"),
-            "target_atac": (target_atac, "target_atac_co_embed.h5ad"),
-        }
-        for label, (adata, fname) in paths.items():
-            out_path = os.path.join(output_dir, fname)
-            adata.write_h5ad(out_path)
-            print("  {} ({} cells): {}".format(label, adata.n_obs, out_path))
-
-    print(
-        "\nDone. Embeddings are stored in obsm['MultiGATE'] and "
-        "obsm['MultiGATE_clip_all'] for each AnnData."
-    )
-    if pathway_embedding_results is not None:
-        print(
-            "Pathway embedding analysis: "
-            + ", ".join(
-                "{}={}".format(k, "ok" if v is not None else "skipped/failed")
-                for k, v in pathway_embedding_results.items()
-            )
+            pearson_r_str = ""
+        sns.regplot(
+            data=sub,
+            x='source',
+            y='target',
+            ax=ax,
+            ci=None,
+            scatter_kws={
+                's': 36,
+                'alpha': 0.75,
+                'marker': 'x',
+                'color': marker_color,
+                'edgecolor': marker_color,
+            },
+            line_kws={'color': line_color, 'lw': 2, 'alpha': 0.95},
         )
-    return source_rna, source_atac, target_rna, target_atac, pathway_embedding_results
-#%%
-if __name__ == "__main__":
-    main()
+        ax.set_title(f"{cluster}{pearson_r_str}", fontsize=10)
+        ax.grid(True, color='#dddddd', linewidth=0.5)
+    for j in range(n_clust, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+    fig.suptitle('Source vs target gene program scores (per cluster)', y=1.02)
+    fig.supxlabel('source cluster GP score')
+    fig.supylabel('target cluster GP score')
+    plt.tight_layout(rect=[0.04, 0.04, 1, 0.98])
+    _log_mlflow_figure(fig, "source_vs_target_gene_program_scores_per_cluster.svg")
+    plt.show()
+
+#%% FASTopic analysis
+
+import decoupler as dc
+import decoupler.op
+
+## load from disk, after FASTopic analysis
+source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_with_fastopic.h5ad"))
+source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned_with_fastopic.h5ad"))
+target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_fastopic.h5ad"))
+target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_fastopic.h5ad"))
+
+## extract fastopic results
+def _extract_fastopic_topic_gene_weights(adata, net):
+    """Build the topic-by-gene weight matrix from FASTopic obsm/uns/varm keys.
+
+    Returns
+    -------
+    topic_gene_weight_mat : pd.DataFrame, shape (n_topics, n_genes)
+        Topics ordered by descending global weight, cleaned of inf/NaN columns.
+    sorted_topics : np.ndarray
+        Topic indices in descending global-weight order.
+    net : pd.DataFrame
+        Hallmark net filtered to genes present in topic_gene_weight_mat.
+    """
+    topic_global_weights = adata.uns['fastopic']['global_weights'].copy()
+    topic_by_genes = adata.varm['fastopic_genes_topic_weights'].T.copy()
+    topic_by_genes_df = pd.DataFrame(
+        topic_by_genes,
+        columns=adata.var_names,
+        index=[f'topic_{i}' for i in range(len(topic_by_genes))],
+    )
+    sorted_topics = np.flip(np.argsort(topic_global_weights))
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(topic_by_genes_df.index[sorted_topics], topic_global_weights[sorted_topics], marker='o')
+    plt.xticks(rotation=45); plt.tight_layout(); plt.show()
+
+    topic_gene_weight_mat = topic_by_genes_df.loc[[f"topic_{i}" for i in sorted_topics]].copy()
+    topic_gene_weight_mat = topic_gene_weight_mat.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="any")
+
+    net_filtered = net[net["target"].isin(topic_gene_weight_mat.columns)].copy()
+    if net_filtered.empty:
+        raise ValueError("No Hallmark mouse genes overlap with topic-gene weight columns.")
+
+    return topic_gene_weight_mat, sorted_topics, net_filtered
+
+def extract_fastopic_embeddings(source_adata, target_adata, modality, do_procrustes=False, keep_cells=False):
+
+    ## extract gene and topic embeddings from source and target data
+    source_gene_embeddings = source_adata.varm['fastopic_gene_embeddings'].copy()
+    target_gene_embeddings = target_adata.varm['fastopic_gene_embeddings'].copy()
+    source_topic_embeddings = source_adata.uns['fastopic']['topic_embeddings'].copy()
+    target_topic_embeddings = target_adata.uns['fastopic']['topic_embeddings'].copy()
+    source_cell_embeddings = source_adata.obsm['MultiGATE_source_aligned'].copy()
+    target_cell_embeddings = target_adata.obsm['MultiGATE_source_aligned'].copy()
+
+    if do_procrustes:
+        from scipy.spatial import procrustes
+        source_gene_embeddings, target_gene_embeddings, disparity = procrustes(source_gene_embeddings, target_gene_embeddings)
+        source_topic_embeddings, target_topic_embeddings, disparity = procrustes(source_topic_embeddings, target_topic_embeddings)
+
+    ## form sinlge adata object
+    source_target_gene_embeddings = np.concatenate([source_gene_embeddings, target_gene_embeddings], axis=0)
+    source_target_topic_embeddings = np.concatenate([source_topic_embeddings, target_topic_embeddings], axis=0)
+    source_target_cell_embeddings = np.concatenate([source_cell_embeddings, target_cell_embeddings], axis=0)
+
+    feature_type = 'gene' if modality == 'rna' else 'peak'
+    gene_or_topic = np.concatenate([
+        np.full(source_target_gene_embeddings.shape[0], feature_type),
+        np.full(source_target_topic_embeddings.shape[0], 'topic'),
+        np.full(source_target_cell_embeddings.shape[0], 'cell'),
+    ])
+    label = np.concatenate([
+        source_adata.var_names,
+        target_adata.var_names,
+        [f'topic_{i}' for i in range(source_topic_embeddings.shape[0])],
+        [f'topic_{i}' for i in range(target_topic_embeddings.shape[0])],
+        source_adata.obs_names,
+        target_adata.obs_names,
+    ])
+    source_or_target = np.concatenate([
+        np.full(source_gene_embeddings.shape[0], 'source'),
+        np.full(target_gene_embeddings.shape[0], 'target'),
+        np.full(source_topic_embeddings.shape[0], 'source'),
+        np.full(target_topic_embeddings.shape[0], 'target'),
+        np.full(source_cell_embeddings.shape[0], 'source'),
+        np.full(target_cell_embeddings.shape[0], 'target'),
+    ])
+
+    gene_topic_adata = sc.AnnData(
+        X = np.concatenate(
+            [source_target_gene_embeddings, source_target_topic_embeddings, source_target_cell_embeddings],
+            axis=0,
+        ),
+        obs = pd.DataFrame(
+            data = {
+            'gene_or_topic': gene_or_topic,
+            'source_or_target': source_or_target,
+            'label': label},
+        )
+    )
+    gene_topic_adata.obs['combination'] = gene_topic_adata.obs['source_or_target'].astype(str) + '_' + gene_topic_adata.obs['gene_or_topic'].astype(str)
+
+    ## split source and target adatas
+    source_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('source')].copy()
+    target_adata = gene_topic_adata[gene_topic_adata.obs['source_or_target'].eq('target')].copy()
+
+    if not keep_cells:
+        source_adata = source_adata[~source_adata.obs['gene_or_topic'].eq('cell')]
+        target_adata = target_adata[~target_adata.obs['gene_or_topic'].eq('cell')]
+
+    return source_adata, target_adata
+
+## extract topic embeddings from source and target data
+feature_topic_adatas = {}
+feature_topic_adatas['source_rna'], feature_topic_adatas['target_rna'] = extract_fastopic_embeddings(source_rna, target_rna, modality='rna')
+feature_topic_adatas['source_atac'], feature_topic_adatas['target_atac'] = extract_fastopic_embeddings(source_atac, target_atac, modality='atac')
+
+## concat a subset of the feature topic adatas for visualization
+'''
+concat_feature_topic_adatas = sc.concat([feature_topic_adatas['target_rna'], feature_topic_adatas['target_atac']], axis=0)
+sc.pp.neighbors(concat_feature_topic_adatas, use_rep='X', n_neighbors=10)
+sc.tl.leiden(concat_feature_topic_adatas)
+sc.tl.umap(concat_feature_topic_adatas, min_dist=0.3)
+umap_axes = sc.pl.umap(
+    concat_feature_topic_adatas,
+    color=['gene_or_topic', 'leiden'],
+    ncols=3,
+    wspace=0.2,
+    size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':250}),
+    show=False,
+)
+topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
+topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
+n_topics = int(feature_topic_adatas['target_rna'].obs['gene_or_topic'].eq('topic').sum())
+topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
+for ax in np.atleast_1d(umap_axes):
+    for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
+        ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
+plt.tight_layout(); plt.show()
+
+'''
+## ingest ATAC embeddings into RNA UMAP - TARGET DATA
+sc.pp.neighbors(feature_topic_adatas['target_rna'], use_rep='X', n_neighbors=10)
+sc.tl.umap(feature_topic_adatas['target_rna'], min_dist=0.3)
+sc.tl.leiden(feature_topic_adatas['target_rna'], resolution=0.5)
+sc.tl.ingest(feature_topic_adatas['target_atac'], feature_topic_adatas['target_rna'], embedding_method='umap', obs='leiden')
+concat_feature_topic_adatas = sc.concat([feature_topic_adatas['target_rna'], feature_topic_adatas['target_atac']], axis=0)
+umap_axes = sc.pl.umap(
+    concat_feature_topic_adatas,
+    color=['gene_or_topic', 'leiden'],
+    ncols=3,
+    wspace=0.1,
+    size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':350}),
+    show=False,
+)
+topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
+topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
+n_topics = int(feature_topic_adatas['target_rna'].obs['gene_or_topic'].eq('topic').sum())
+topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
+for ax in np.atleast_1d(umap_axes):
+    for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
+        ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
+plt.tight_layout(); plt.show()
+
+## ingest ATAC embeddings into RNA UMAP - SOURCE DATA
+sc.pp.neighbors(feature_topic_adatas['source_rna'], use_rep='X', n_neighbors=10)
+sc.tl.umap(feature_topic_adatas['source_rna'], min_dist=0.3)
+sc.tl.leiden(feature_topic_adatas['source_rna'], resolution=0.5)
+sc.tl.ingest(feature_topic_adatas['source_atac'], feature_topic_adatas['source_rna'], embedding_method='umap', obs='leiden')
+concat_feature_topic_adatas = sc.concat([feature_topic_adatas['source_rna'], feature_topic_adatas['source_atac']], axis=0)
+umap_axes = sc.pl.umap(
+    concat_feature_topic_adatas,
+    color=['gene_or_topic', 'leiden'],
+    ncols=3,
+    wspace=0.1,
+    size=concat_feature_topic_adatas.obs['gene_or_topic'].map({'gene':20, 'peak':20, 'topic':350}),
+    show=False,
+)
+topic_mask = concat_feature_topic_adatas.obs['gene_or_topic'].eq('topic').to_numpy()
+topic_coords = concat_feature_topic_adatas.obsm['X_umap'][topic_mask]
+n_topics = int(feature_topic_adatas['source_rna'].obs['gene_or_topic'].eq('topic').sum())
+topic_labels = [str(i % n_topics) for i in range(topic_coords.shape[0])]
+for ax in np.atleast_1d(umap_axes):
+    for (x_coord, y_coord), topic_label in zip(topic_coords, topic_labels):
+        ax.text(x_coord, y_coord, topic_label, fontsize=8, ha='center', va='center')
+plt.tight_layout(); plt.show()
+
+## compare topic embeddings across datasets and modalities
+topic_embeddings = []
+for dat in feature_topic_adatas.values():
+    embs = dat[dat.obs['gene_or_topic'].eq('topic')].X.copy()
+    topic_embeddings.append(embs)
+
+if \
+    (topic_embeddings[0] == topic_embeddings[2]).all() and \
+    (topic_embeddings[1] == topic_embeddings[3]).all():
+    print("Tied topic embeddings confirmed.")
+
+topic_embeddings = np.concatenate(topic_embeddings, axis=0)
+corr_matrix = np.corrcoef(topic_embeddings)
+plt.figure(figsize=(5, 4))
+sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0)
+plt.xticks([])
+plt.yticks([])
+plt.tight_layout(); plt.show()
+
+## build shared Hallmark mouse net once
+hallmark_human = dc.op.hallmark(organism="human")
+map_path = os.path.join(os.environ["DATAPATH"], "gene_annotations", "human_mouse_gene_orthologs.csv")
+map_df = (
+    pd.read_csv(map_path)
+    .rename(columns={"Gene name": "target_human", "Mouse gene name": "target"})[
+        ["target_human", "target"]
+    ]
+    .dropna()
+    .drop_duplicates()
+)
+hallmark_mouse_net = (
+    hallmark_human.rename(columns={"target": "target_human"})
+    .merge(map_df, on="target_human", how="inner")[["source", "target"]]
+    .drop_duplicates()
+)
+
+## extract topic-by-gene weight matrix from source and target data
+source_topic_mat, source_sorted_topics, source_net = _extract_fastopic_topic_gene_weights(
+    source_rna, hallmark_mouse_net,
+)
+target_topic_mat, target_sorted_topics, target_net = _extract_fastopic_topic_gene_weights(
+    target_rna, hallmark_mouse_net,
+)
+
+## build LR-level sender-receiver gene sets
+import liana as li
+import decoupler as dc
+
+# 1) Load ligand-receptor pairs from LIANA
+lr_pairs = li.rs.select_resource('mouseconsensus')
+
+# 2) Load pathway gene sets / weights from decoupler
+#avail_resources = dc.op.show_resources()
+#resource = dc.op.resource('HPA_secretome')
+
+
+# 3) Generate LR-level sender-receiver gene sets
+lr_hallmark = li.rs.generate_lr_geneset(
+    lr_pairs,
+    hallmark_mouse_net,
+    lr_sep="^",
+    weight=None
+)
+
+ortholog_mapper = map_df.set_index('target_human').to_dict()['target']
+resource = dc.op.progeny(organism='human')
+resource = resource.map(lambda x: ortholog_mapper.get(x, x) if pd.notnull(x) else x)
+
+lr_resource = li.rs.generate_lr_geneset(
+    lr_pairs,
+    resource,
+    lr_sep="^",
+    weight=None
+)
+
+## create LR genesets
+lr_hallmark_grouped_source = lr_hallmark.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[0].explode().tolist()))
+lr_hallmark_grouped_target = lr_hallmark.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[1].explode().tolist()))
+lr_hallmark_grouped = pd.concat([lr_hallmark_grouped_source.rename('source_genes'), lr_hallmark_grouped_target.rename('target_genes')], axis=1)
+lr_hallmark_grouped['all_genes'] = lr_hallmark_grouped.apply(lambda x: list(x['source_genes']) + list(x['target_genes']), axis=1)
+lr_hallmark_grouped.index.rename('pathway', inplace=True)
+
+lr_resource_grouped_source = lr_resource.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[0].explode().tolist()))
+lr_resource_grouped_target = lr_resource.groupby('source')['interaction'].apply(lambda x: np.unique(x.str.split('^').str[1].explode().tolist()))
+lr_resource_grouped = pd.concat([lr_resource_grouped_source.rename('source_genes'), lr_resource_grouped_target.rename('target_genes')], axis=1)
+lr_resource_grouped['all_genes'] = lr_resource_grouped.apply(lambda x: list(x['source_genes']) + list(x['target_genes']), axis=1)
+lr_resource_grouped.index.rename('pathway', inplace=True)
+
+#%% analysis of linear decoder
+from sklearn.metrics.pairwise import euclidean_distances
+from scipy.special import softmax
+from post_hoc_utils import topic_betas_hallmark_gsea_mouse
+
+assert teacher_source_mgate.linear_etm_decoder
+
+## extract decoder parameters
+alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
+rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
+rho_atac = teacher_source_mgate.rho_atac.detach().cpu().numpy()
+
+rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
+rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
+rho_rna_overlap = ((np.abs(rho_rna) == np.abs(rho_rna).max(1, keepdims=True)) * rho_rna_mask).any(1).mean()
+rho_atac_overlap = ((np.abs(rho_atac) == np.abs(rho_atac).max(1, keepdims=True)) * rho_atac_mask).any(1).mean()
+print(f"RNA overlap: {rho_rna_overlap}, ATAC overlap: {rho_atac_overlap}")
+
+rho_rna_mask_gain = (np.abs(rho_rna) * rho_rna_mask).sum(1) / rho_rna_mask.sum(1) / np.abs(rho_rna).mean(1)
+rho_atac_mask_gain = (np.abs(rho_atac) * rho_atac_mask).sum(1) / rho_atac_mask.sum(1) / np.abs(rho_atac).mean(1)
+fig, ax = plt.subplots(1, 2, figsize=(10, 5), sharex=True)
+ax[0].hist(rho_rna_mask_gain, bins=50)
+ax[1].hist(rho_atac_mask_gain, bins=50)
+plt.tight_layout(); plt.show()
+
+topk=25
+topk_genes = []
+for topic in range(alpha.shape[0]):
+    topk_genes_topic = pd.Series(alpha[topic]).nlargest(topk).index
+    topk_genes.append(topk_genes_topic)
+topk_genes = np.concatenate(topk_genes)
+top_alpha = alpha[:,topk_genes]
+plt.figure(figsize=(10, 10))
+plt.matshow(top_alpha, aspect='auto'); plt.colorbar()
+plt.tight_layout(); plt.show()
+
+pathway_names = teacher_source_mgate.pathway_names
+source_pathway_names = [pw for pw in pathway_names if pw.endswith('source')]
+target_pathway_names = [pw for pw in pathway_names if pw.endswith('target')]
+
+alpha_df = pd.DataFrame(alpha, index=[f'topic_{i}' for i in range(30)], columns=pathway_names)
+pd.concat([
+    alpha_df.abs().max(1),
+    alpha_df.abs().median(1)
+], axis=1).sort_values(0).plot(kind='bar')
+
+
+# alpha = F.normalize(alpha, dim=1)
+# rho_rna = F.normalize(rho_rna, dim=1)
+# rho_atac = F.normalize(rho_atac, dim=1)
+# topic_var = teacher_source_mgate.topic_var.detach().cpu().numpy()
+
+beta_rna = alpha @ rho_rna
+beta_atac = alpha @ rho_atac
+
+## derive theta from delta embeddings
+source_theta = softmax(np.concatenate([source_rna_emb, source_atac_emb], axis=0), axis=1)
+source_theta_df = pd.DataFrame(source_theta, index=np.concatenate([source_rna.obs_names, source_atac.obs_names]))
+
+target_theta = softmax(np.concatenate([target_rna_emb, target_atac_emb], axis=0), axis=1)
+target_theta_df = pd.DataFrame(target_theta, index=np.concatenate([target_rna.obs_names, target_atac.obs_names]))
+
+## cluster delta by leiden clusters, then apply softmax to get theta
+source_clust_by_topic_theta = (
+    pd.DataFrame(source_rna_emb, index=source_rna.obs_names)
+    .assign(RNA_leiden=source_concat_adata.obs.loc[
+        source_concat_adata.obs['modality'].eq('rna'),
+        'leiden'
+        ].values)
+    .groupby('RNA_leiden')
+    .mean()
+    .apply(softmax, axis=1, result_type='expand')
+)
+
+target_clust_by_topic_theta = (
+    pd.DataFrame(target_rna_emb, index=target_rna.obs_names)
+    .assign(RNA_leiden=target_concat_adata.obs.loc[
+        target_concat_adata.obs['modality'].eq('rna'),
+        'leiden'
+        ].values)
+    .groupby('RNA_leiden')
+    .mean()
+    .apply(softmax, axis=1, result_type='expand')
+)
+
+## get top topics for each cluster and plot staircase heatmap
+topk = 5
+fig, axs = plt.subplots(1, 2, figsize=(10, 10))
+
+topk_topics = []
+topics = source_clust_by_topic_theta.columns.values
+clusters = source_clust_by_topic_theta.max(1).sort_values(ascending=False).index
+for cluster in clusters:
+    topk_topics_cluster = source_clust_by_topic_theta.loc[cluster].nlargest(topk).index
+    topk_topics_cluster = topk_topics_cluster[topk_topics_cluster.isin(topics)]
+    topics = topics[~np.isin(topics, topk_topics_cluster)]
+    topk_topics.append(topk_topics_cluster)
+source_topk_topics = np.concatenate(topk_topics + [pd.Index(topics)]) # could also just keep topk_topics
+source_clust_by_topic_theta = source_clust_by_topic_theta.loc[clusters, source_topk_topics]
+sns.heatmap(source_clust_by_topic_theta.T, cmap='viridis', ax=axs[0])
+
+topk_topics = []
+topics = target_clust_by_topic_theta.columns.values
+clusters = target_clust_by_topic_theta.max(1).sort_values(ascending=False).index
+for cluster in clusters:
+    topk_topics_cluster = target_clust_by_topic_theta.loc[cluster].nlargest(topk).index
+    topk_topics_cluster = topk_topics_cluster[topk_topics_cluster.isin(topics)]
+    topics = topics[~np.isin(topics, topk_topics_cluster)]
+    topk_topics.append(topk_topics_cluster)
+target_topk_topics = np.concatenate(topk_topics + [pd.Index(topics)])
+target_clust_by_topic_theta = target_clust_by_topic_theta.loc[clusters, target_topk_topics]
+sns.heatmap(target_clust_by_topic_theta.T, cmap='viridis', ax=axs[1])
+plt.tight_layout(); plt.show()
+
+## add alpha embeddings to source and target data
+source_alpha_embs = source_theta @ alpha
+target_alpha_embs = target_theta @ alpha
+source_target_adata.obsm['alpha_embs'] = np.concatenate([source_alpha_embs, target_alpha_embs], axis=0)
+
+import liana as li
+
+pathways_adata = sc.AnnData(
+    source_alpha_embs,
+    obs=source_target_adata[source_target_adata.obs['source_or_target'].eq('source')].obs,
+    var=pd.DataFrame(
+        data=np.vstack([
+            [pw.split('__')[0] for pw in pathway_names],
+            ['sender' if pw.endswith('source') else 'receiver' for pw in pathway_names],
+        ]).T,
+        index=pathway_names,
+        columns=['basename', 'sender_or_receiver']),
+    obsm={'spatial': source_target_adata[source_target_adata.obs['source_or_target'].eq('source')].obsm['spatial']},
+    )
+pathways_adata.var['paired'] = pathways_adata.var['basename'].isin(pathways_adata.var['basename'].value_counts().index[pathways_adata.var['basename'].value_counts().eq(2)])
+
+li.ut.spatial_neighbors(pathways_adata, bandwidth=1000, set_diag=False)
+paired_pathways_adata = pathways_adata[:,pathways_adata.var['paired']].copy()
+sender_pathways_adata = paired_pathways_adata[:,paired_pathways_adata.var['sender_or_receiver'].eq('sender')]
+receiver_pathways_adata = paired_pathways_adata[:,paired_pathways_adata.var['sender_or_receiver'].eq('receiver')]
+assert np.all(sender_pathways_adata.var['basename'].values == receiver_pathways_adata.var['basename'].values)
+
+X = pathways_adata.X.copy()
+W = pathways_adata.obsp['spatial_connectivities']
+plt.matshow(X.T @ W @ X, aspect='auto'); plt.colorbar()
+plt.tight_layout(); plt.show()
+
+S = sender_pathways_adata.X.copy()
+R = receiver_pathways_adata.X.copy()
+W = pathways_adata.obsp['spatial_connectivities']
+plt.scatter(S.sum(axis=0), R.sum(axis=0)); plt.colorbar()
+
+#S = softmax(S, axis=0)
+#R = softmax(R, axis=0)
+
+M = S.T @ W @ R
+plt.matshow(M); plt.colorbar()
+
+sc.pp.pca(pathways_adata, n_comps=50)
+sc.external.pp.bbknn(pathways_adata, batch_key='source_or_target', use_rep='X_pca', neighbors_within_batch=10)
+sc.tl.umap(pathways_adata, min_dist=0.3)
+sc.pl.umap(pathways_adata, color=['source_or_target'], ncols=3, wspace=0.2, size=25)
+plt.tight_layout(); plt.show()
+
+## compute mean distance between source and target for each cluster
+source_adata = source_target_adata[source_target_adata.obs['source_or_target'].eq('source')]
+target_adata = source_target_adata[source_target_adata.obs['source_or_target'].eq('target')]
+mean_dists = pd.DataFrame(index=source_adata.obs['leiden'].cat.categories, columns=['multigate', 'alpha'])
+for cluster in source_adata.obs['leiden'].cat.categories:
+    source_dat = source_adata[source_adata.obs['leiden'].eq(cluster)]
+    target_dat = target_adata[target_adata.obs['leiden'].eq(cluster)]
+    mean_dists.loc[cluster, 'multigate'] = np.mean(euclidean_distances(source_dat.X, target_dat.X)) # could replace with wasserstein distance
+    mean_dists.loc[cluster, 'alpha'] = np.mean(euclidean_distances(source_dat.obsm['alpha_embs'], target_dat.obsm['alpha_embs']))
+mean_dists = mean_dists.sort_values(by='multigate', ascending=True)
+mean_dists.loc['all', 'multigate'] = np.mean(euclidean_distances(source_adata.X, target_adata.X))
+mean_dists.loc['all', 'alpha'] = np.mean(euclidean_distances(source_adata.obsm['alpha_embs'], target_adata.obsm['alpha_embs']))
+print(mean_dists)
+
+## get top active topics and perform GSEA
+top_active_cluster = mean_dists.index[0] #'5'
+top_active_topics = source_clust_by_topic_theta.loc[top_active_cluster].nlargest(topk).index
+top_active_gsea = topic_betas_hallmark_gsea_mouse(
+    beta_rna=beta_rna,
+    gene_names=np.asarray(source_rna.var_names).astype(str),
+    topic_indices=top_active_topics,
+    datapath=os.environ["DATAPATH"],
+)
+top_active_genes = top_active_gsea["top_active_genes"]
+top_active_rna_betas = top_active_gsea["ranked_gene_indices"]
+print("\nHallmark GSEA (mouse) — top terms per active topic:")
+print(
+    top_active_gsea["top_terms_per_row"].loc[
+        top_active_gsea["top_terms_per_row"]['padj'].le(0.05)
+    ]
+)
+
+# Categorical.map(dict) looks up category values with their native dtype; string
+# keys in lut won't match int categories and yield NaN floats mixed with RGB
+# tuples, which breaks pandas' Index reconstruction (TypeError).
+cluster_key = source_theta_df.obs['RNA_clusters'].astype(str)
+unique_clusters = cluster_key.unique()
+network_pal = sns.husl_palette(len(unique_clusters), s=0.45)
+lut = dict(zip(unique_clusters, network_pal))
+row_colors = cluster_key.map(lut)
+
+cg = sns.clustermap(source_theta_df, cmap='viridis', row_colors=row_colors)
+cg.ax_heatmap.set_yticklabels([])
+
+alpha = teacher_source_mgate.alpha.detach().cpu().numpy()
+rho_rna = teacher_source_mgate.rho_rna.detach().cpu().numpy()
+rho_atac = teacher_source_mgate.rho_atac.detach().cpu().numpy()
+rho_rna_mask = teacher_source_mgate.rho_rna_mask.detach().cpu().numpy()
+rho_atac_mask = teacher_source_mgate.rho_atac_mask.detach().cpu().numpy()
+
+beta_rna = alpha @ rho_rna
+beta_atac = alpha @ rho_atac
+
+## topic-topic correlation
+topic_topic_corr = np.corrcoef(alpha)
+topic_topic_corr[np.eye(topic_topic_corr.shape[0]) == 1] = 0
+plt.figure(figsize=(8, 6))
+sns.heatmap(topic_topic_corr, cmap='viridis')
+plt.tight_layout()
+plt.show()
+
+## topic norms
+topic_norm = np.linalg.norm(alpha, axis=1)
+beta_rna_norm = np.linalg.norm(beta_rna, axis=1)
+beta_atac_norm = np.linalg.norm(beta_atac, axis=1)
+fig, ax = plt.subplots(3, 1, figsize=(6, 8))
+ax[0].bar(np.arange(alpha.shape[0]), topic_norm)
+ax[1].bar(np.arange(beta_rna.shape[0]), beta_rna_norm)
+ax[2].bar(np.arange(beta_atac.shape[0]), beta_atac_norm)
+ax[0].set_title("Topic norm")
+ax[1].set_title("Beta RNA norm")
+ax[2].set_title("Beta ATAC norm")
+plt.tight_layout()
+plt.show()
+
+## topic & feature co-embedding
+alpha_norm = alpha / np.linalg.norm(alpha, axis=1, keepdims=True)
+rho_rna_norm = rho_rna / np.linalg.norm(rho_rna, axis=1, keepdims=True)
+rho_atac_norm = rho_atac / np.linalg.norm(rho_atac, axis=1, keepdims=True)
+
+alpha_rho_rna_adata = sc.AnnData(
+    np.concatenate([rho_rna_norm.T, alpha_norm], axis=0),
+)
+alpha_rho_rna_adata.obs_names = np.concatenate([[f'gp_{gp}' for gp in range(rho_rna.shape[1])], [f'topic_{topic}' for topic in range(alpha.shape[0])]])
+alpha_rho_rna_adata.obs['gene_or_topic'] = np.concatenate([['gene'] * rho_rna.shape[1], ['topic'] * alpha.shape[0]])
+alpha_rho_rna_adata.obs['max_abs_beta'] = list(np.abs(beta_rna).argmax(0)) + list(np.arange(alpha.shape[0]))
+
+sc.pp.pca(alpha_rho_rna_adata, n_comps=100)
+sc.pp.neighbors(alpha_rho_rna_adata, use_rep='X_pca', n_neighbors=30)
+#sc.external.pp.bbknn(alpha_rho_rna_adata, batch_key='gene_or_topic', neighbors_within_batch=30)
+sc.tl.umap(alpha_rho_rna_adata, min_dist=0.3)
+
+topic_gene_dists = euclidean_distances(
+    alpha_rho_rna_adata.obsm['X_pca'],
+)[:rho_rna.shape[1], -alpha.shape[0]:].argmin(axis=1)
+alpha_rho_rna_adata.obs['topic_gene_dist'] = list(topic_gene_dists) + list(np.arange(alpha.shape[0]))
+
+# 1. Extract coordinates and groups into a lightweight dataframe
+df = pd.DataFrame(alpha_rho_rna_adata.obsm['X_umap'], columns=['UMAP1', 'UMAP2'], index=alpha_rho_rna_adata.obs_names)
+df = df.join(alpha_rho_rna_adata.obs[['gene_or_topic', 'max_abs_beta']])
+
+# 2. Plot using seaborn, adding labels for topics
+plt.figure(figsize=(8, 6))
+scatter = sns.scatterplot(
+    data=df, 
+    x='UMAP1', 
+    y='UMAP2', 
+    hue='gene_or_topic',   # Colors by group
+    style='gene_or_topic', # Assigns different markers by group
+    palette='Set2',
+    s=list([5] * rho_rna.shape[1]) + list([60] * alpha.shape[0]),  # Marker size
+    edgecolor='none'
+)
+
+# Add text labels for topics
+topic_indices = df[df['gene_or_topic'] == 'topic'].index
+topic_labels = [f'topic_{i}' for i in range(alpha.shape[0])]
+for idx, label in zip(topic_indices, topic_labels):
+    plt.annotate(
+        label,
+        (df.loc[idx, 'UMAP1'], df.loc[idx, 'UMAP2']),
+        textcoords="offset points",
+        xytext=(0,5),
+        ha='center',
+        fontsize=8,
+        color='black',
+        alpha=0.8
+    )
+
+# 3. Move the legend outside the plot
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.show()
+
+sc.pl.umap(
+    alpha_rho_rna_adata,
+    color=['gene_or_topic', 'topic_gene_dist', 'max_abs_beta'],
+    color_map='Set2',
+    ncols=3, wspace=0.2, size=25)
+
+#%% compare spatial graph with latent knn graph
+n_neighbors = 100
+
+sc.pp.neighbors(source_rna, use_rep='MultiGATE', n_neighbors=n_neighbors)
+sc.pp.neighbors(source_atac, use_rep='MultiGATE', n_neighbors=n_neighbors)
+rna_multigate_knn_graph = source_rna.obsp['connectivities']
+atac_multigate_knn_graph = source_atac.obsp['connectivities']
+
+source_concat_adata = build_concat_adata_for_umap(source_rna, source_atac, embedding_key="MultiGATE")
+source_concat_adata.obs['jaccard_similarity'] = jaccard_similarity
+source_concat_adata.obsm['spatial'] = np.concatenate([source_rna.obsm['spatial'], source_atac.obsm['spatial']], axis=0)
+
+MultiGATE.Cal_Spatial_Net(source_rna, model='KNN', k_cutoff=n_neighbors)
+MultiGATE.Cal_Spatial_Net(source_atac, model='KNN', k_cutoff=n_neighbors)
+
+spatial_knn_graph, _, _, _ = build_graph_inputs(source_rna, source_atac)
+indices, values, shape = spatial_knn_graph
+indices = np.asarray(indices)
+row, col = indices[:, 0], indices[:, 1]
+spatial_knn_graph = sp.coo_matrix((values, (row, col)), shape=shape).tocsr()
+assert indices.shape[1] == 2, "spatial_knn_graph should have 2 columns"
+
+def jaccard_per_sample_csr(
+    a: sp.csr_matrix,
+    b: sp.csr_matrix,
+    *,
+    binarize: bool = True,
+    empty_value: float = 1.0,
+) -> np.ndarray:
+    if not sp.isspmatrix_csr(a):
+        a = a.tocsr()
+    else:
+        a = a.copy()
+
+    if not sp.isspmatrix_csr(b):
+        b = b.tocsr()
+    else:
+        b = b.copy()
+
+    if a.shape != b.shape:
+        raise ValueError(f"Shape mismatch: {a.shape} vs {b.shape}")
+
+    a.sum_duplicates()
+    b.sum_duplicates()
+    a.eliminate_zeros()
+    b.eliminate_zeros()
+
+    if binarize:
+        a.data = np.ones_like(a.data, dtype=np.uint8)
+        b.data = np.ones_like(b.data, dtype=np.uint8)
+
+    # For binary matrices:
+    # intersection count per row = number of coordinates nonzero in both
+    inter = a.multiply(b).count_nonzero(axis=1)
+
+    # union count per row = nnz(a_row) + nnz(b_row) - intersection
+    a_nnz = a.count_nonzero(axis=1)
+    b_nnz = b.count_nonzero(axis=1)
+    union = a_nnz + b_nnz - inter
+
+    inter = np.asarray(inter).ravel()
+    union = np.asarray(union).ravel()
+
+    out = np.empty(a.shape[0], dtype=float)
+    mask = union == 0
+    out[~mask] = inter[~mask] / union[~mask]
+    out[mask] = empty_value
+    return out
+    
+# compute the Jaccard similarity between the two graphs
+rna_jaccard_similarity = jaccard_per_sample_csr(rna_multigate_knn_graph, spatial_knn_graph)
+atac_jaccard_similarity = jaccard_per_sample_csr(atac_multigate_knn_graph, spatial_knn_graph)
+jaccard_similarity = np.concatenate([rna_jaccard_similarity, atac_jaccard_similarity])
+plt.hist(jaccard_similarity, bins=50)
+
+sc.pl.embedding(source_concat_adata, basis="spatial", color="jaccard_similarity", s=50, legend_loc='None')
+sc.pl.embedding(source_concat_adata, basis="spatial", color="RNA_clusters", s=50, legend_loc='None')
+
+#%% ── Save outputs ─────────────────────────────────────────────────────────
+if args.save_h5ad:
+    print("\nSaving h5ad files to {}...".format(output_dir))
+    paths = {
+        "source_rna":  (source_rna,  "source_rna_co_embed.h5ad"),
+        "source_atac": (source_atac, "source_atac_co_embed.h5ad"),
+        "target_rna":  (target_rna,  "target_rna_co_embed.h5ad"),
+        "target_atac": (target_atac, "target_atac_co_embed.h5ad"),
+    }
+    for label, (adata, fname) in paths.items():
+        out_path = os.path.join(output_dir, fname)
+        adata.write_h5ad(out_path)
+        print("  {} ({} cells): {}".format(label, adata.n_obs, out_path))
+
+print(
+    "\nDone. Embeddings are stored in obsm['MultiGATE'] and "
+    "obsm['MultiGATE_clip_all'] for each AnnData."
+)
+if pathway_embedding_results is not None:
+    print(
+        "Pathway embedding analysis: "
+        + ", ".join(
+            "{}={}".format(k, "ok" if v is not None else "skipped/failed")
+            for k, v in pathway_embedding_results.items()
+        )
+    )
