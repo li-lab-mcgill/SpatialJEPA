@@ -5846,6 +5846,11 @@ def plot_pls_biological_annotation(
 
 def get_liana_lrdata(adata, cell_type_col, lr_pairs):
 
+    ## work on a copy: the renormalisation below is only meant to feed LIANA, and
+    ## leaking it back into the caller's object silently re-scales every later plot
+    ## of that AnnData (spatial gene maps, PLS panels) to CPM-log1p of SCT_data
+    adata = adata.copy()
+
     adata.X = adata.layers["SCT_data"].copy()
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
@@ -6134,7 +6139,7 @@ print(target_all_pls_scores_grouped_df.head(10))
 
 ## select PLS-gene combinations
 pls_cmp = 'PLS_1'
-gene = 'Pde10a'
+gene = 'Mobp'
 
 # DORC plot and annotate the marker corresponding to 'gene'
 plt.figure(figsize=(2.5, 3))
