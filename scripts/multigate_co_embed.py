@@ -6138,7 +6138,7 @@ print(target_all_pls_scores_df.head(5))
 print(target_all_pls_scores_grouped_df.head(10))
 
 ## select PLS-gene combinations
-pls_cmp = 'PLS_1'
+pls_cmp = 'PLS_0'
 gene = 'Mobp'
 
 # DORC plot and annotate the marker corresponding to 'gene'
@@ -6170,9 +6170,12 @@ target_gp_link_df, target_peaks = select_gene_peak_link_df(
     pls_cmp,
     gene,
 )
-## create 'peak' scores out of peak set
-source_peak_scores = source_atac[:, source_gp_link_df['Peak']].X.multiply(source_gp_link_df[f'{pls_cmp}_peak_weight']).sum(axis=1)
-target_peak_scores = target_atac[:, target_gp_link_df['Peak']].X.multiply(target_gp_link_df[f'{pls_cmp}_peak_weight']).sum(axis=1)
+## create 'peak' scores out of peak set (Attention weights; matches Moran's I scan).
+## Signed PLS peak weights can cancel / go negative and hide signal under zero-spots in spatial plots.
+source_w = source_gp_link_df['Attention'].to_numpy(float)
+target_w = target_gp_link_df['Attention'].to_numpy(float)
+source_peak_scores = np.asarray(source_atac[:, source_gp_link_df['Peak']].X.multiply(source_w).sum(axis=1)).ravel()
+target_peak_scores = np.asarray(target_atac[:, target_gp_link_df['Peak']].X.multiply(target_w).sum(axis=1)).ravel()
 source_atac.obs[f'{gene}-linked peaks'] = source_peak_scores
 target_atac.obs[f'{gene}-linked peaks'] = target_peak_scores
 
@@ -6180,8 +6183,8 @@ target_atac.obs[f'{gene}-linked peaks'] = target_peak_scores
 fig, ax = plt.subplots(2, 2, figsize=(6, 6))
 sc.pl.embedding(source_rna, basis='spatial', color=gene, size=60, ax=ax[0, 0], show=False)
 sc.pl.embedding(target_rna, basis='spatial', color=gene, size=60, ax=ax[0, 1], show=False)
-sc.pl.embedding(source_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, vmax=0.08, ax=ax[1, 0], show=False)
-sc.pl.embedding(target_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, vmax=0.10, ax=ax[1, 1], show=False)
+sc.pl.embedding(source_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, cmap='magma', vmax=1.5, ax=ax[1, 0], show=False)
+sc.pl.embedding(target_atac, basis='spatial', color=f'{gene}-linked peaks', size=60, cmap='magma', vmax=1.5, ax=ax[1, 1], show=False)
 fig.suptitle(f'{gene} - {pls_cmp}')
 ax[0, 0].set_title('Source gene'); ax[0, 0].set_xlabel(''); ax[0, 0].set_ylabel('')
 ax[0, 1].set_title('Target gene'); ax[0, 1].set_xlabel(''); ax[0, 1].set_ylabel('')
@@ -6205,7 +6208,7 @@ target_bedpe = os.path.join(target_attention_analysis_summary["output_dir"], f"{
 target_gp_link_df.to_csv(gp_link_csv_path, index=False)
 save_gene_peak_links_bedpe(target_gp_link_df, target_bedpe, score_col="Attention")
 
-## Plot signed-weight arcs (blue = positive {pls_cmp}_peak_weight, orange = negative;
+## Plot signed-weight arcs (orange = positive {pls_cmp}_peak_weight, blue = negative;
 ## transparency scales with |peak_weight|). Produces per-domain figures plus a
 ## single stacked figure with source on top and target below, sharing genomic coordinates.
 signed_arcs_out_dir = f"{os.getenv('OUTPATH')}/MultiGATE/attention_analysis"
