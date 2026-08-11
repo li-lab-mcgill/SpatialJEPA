@@ -4511,6 +4511,448 @@ heldout_reconstruction_results = plot_heldout_spatial_reconstruction(
     source_rna, source_multivi_rna
 )
 
+#%% Spatial structure figure: position recovery, per-domain contrast, contiguity
+## Everything here is scored on the source section against MEASURED coordinates.
+## No target arm appears: the target sample carries no coordinates of its own (its
+## obsm['spatial'] is transferred from source spots by a 1-NN ingest in the
+## OT-aligned MultiGATE space), so a position-recovery score there would grade each
+## encoder against labels one of them produced. See the docstring of
+## compute_spatial_structure_stats for the three statistics and why each is here.
+SPATIAL_STRUCTURE_ARMS = ['teacher', 'student', 'no-KD', 'MultiVI']
+
+## no-KD darkened from the '#a6dba0' used in the CDF panel: at 1.54:1 against the
+## page it is invisible as dense scatter marks, where the CDF only needs a thin line.
+SPATIAL_STRUCTURE_COLORS = {
+    'teacher': '#00441b', 'student': '#1b7837', 'no-KD': '#5aae61',
+    'MultiVI': '#762a83', 'random floor': '#999999',
+}
+SPATIAL_STRUCTURE_STYLE = {
+    'teacher': ('--', 1.4), 'student': ('-', 2.4), 'no-KD': ('-', 1.4),
+    'MultiVI': ('-', 2.4), 'random floor': (':', 1.4),
+}
+
+
+def compute_spatial_structure_stats(
+    source_rna,
+    multivi_rna,
+    n_splits=40,
+    seed=0,
+    thresholds=(2.0, 10.0, 30.0),
+    k_overlap=10,
+    n_pcs=30,
+    contiguity_k=6,
+):
+    """Score how well each representation carries position, three ways.
+
+    The three statistics answer progressively finer questions and are kept
+    together because each covers a weakness of the others:
+
+    * ``hit`` -- P(a held-out spot's 1-NN in representation space lies within
+      ``t`` spot widths). One tolerance is one arbitrary cutoff, so several are
+      returned; the chance level rises with the square of the tolerance and is
+      returned alongside.
+    * ``auc`` -- area under a spot's own error curve on the logarithmic axis,
+      collapsing its whole distribution into one number in [0, 1]. Because the
+      axis is logarithmic this is dominated by the first decade of error, which
+      is the resolution at issue. All arms share one ``xmax`` so the areas are
+      comparable.
+    * ``overlap`` -- fraction of a spot's k nearest neighbours in representation
+      space that are also among its k nearest neighbours on the section. Rank
+      based, so it needs no distance scale and no held-out split, and it is what
+      the per-domain comparisons use.
+
+    Domain-level rows carry neighbourhood contiguity (how much of a spot's
+    spatial neighbourhood shares its label) because that is the only covariate
+    found to track the teacher-minus-student gap. Ten others did not; see
+    Section 4.x of the manuscript for the list.
+    """
+    from sklearn.neighbors import NearestNeighbors
+    from scipy.stats import spearmanr
+
+    ## restrict to spots every method covers, so the arms are comparable
+    pos = pd.Series(
+        np.arange(multivi_rna.n_obs), index=multivi_rna.obs_names
+    ).reindex(source_rna.obs_names)
+    mask = pos.notna().to_numpy()
+    obs_names = source_rna.obs_names[mask]
+    xy = np.asarray(source_rna.obsm['spatial'])[mask]
+    d_nn, _ = NearestNeighbors(n_neighbors=2).fit(xy).kneighbors(xy)
+    pitch = float(np.median(d_nn[:, 1]))
+
+    emb = {
+        'teacher': np.asarray(source_rna.obsm['MultiGATE_full_teacher'])[mask],
+        'student': np.asarray(source_rna.obsm['MultiGATE'])[mask],
+        'no-KD': np.asarray(source_rna.obsm['MultiGATE_nonspatial'])[mask],
+        'MultiVI': np.asarray(multivi_rna.obsm['X_multivi'])[
+            pos[mask].astype(int).to_numpy()],
+    }
+    ## molecular baseline: reported in the text, not drawn, so it stays out of `emb`
+    pcs = np.asarray(source_rna.obsm['X_pca'])[mask][:, :n_pcs]
+    for name, Z in {**emb, 'expression PCs': pcs}.items():
+        assert np.isfinite(Z).all(), f'{name} has non-finite values'
+    print(f'spatial structure: {mask.sum()} spots, pitch {pitch:.1f} units')
+
+    def _errors_by_spot(Z):
+        """(n_spots, n_splits); NaN where the spot served as a reference."""
+        E = np.full((len(Z), n_splits), np.nan)
+        for r in range(n_splits):
+            perm = np.random.default_rng(seed + r).permutation(len(Z))
+            ref, qry = perm[: len(perm) // 2], perm[len(perm) // 2:]
+            nn = ref[NearestNeighbors(n_neighbors=1).fit(Z[ref]).kneighbors(
+                Z[qry], return_distance=False)[:, 0]]
+            E[qry, r] = np.linalg.norm(xy[nn] - xy[qry], axis=1) / pitch
+        return E
+
+    err = {a: _errors_by_spot(Z) for a, Z in emb.items()}
+    err_pcs = _errors_by_spot(pcs)
+
+    ## one xmax for every arm, else the areas are not on a common scale
+    xmax = float(np.nanmax(np.concatenate(list(err.values()) + [err_pcs])))
+
+    ## `E <= t` silently maps NaN to False, which would count every split where a
+    ## spot served as a REFERENCE as a miss and cap every rate at ~50%. Reinstate
+    ## the NaN so nanmean averages only over the splits that scored the spot.
+    def _rate(E, t):
+        return np.nanmean(np.where(np.isnan(E), np.nan, (E <= t).astype(float)), axis=1)
+
+    def _ecdf_auc(E):
+        return np.nanmean(
+            1.0 - np.log10(np.clip(E, 1.0, xmax)) / np.log10(xmax), axis=1)
+
+    ## chance: what a matcher that ignores the representation would score.
+    ## Depends only on tissue geometry, so one sample serves every arm.
+    rng = np.random.default_rng(seed)
+    pairs = rng.integers(0, len(xy), size=(400_000, 2))
+    d_rand = np.linalg.norm(xy[pairs[:, 0]] - xy[pairs[:, 1]], axis=1) / pitch
+    floor_hit = {t: float((d_rand <= t).mean()) for t in thresholds}
+    floor_auc = float(np.mean(
+        1.0 - np.log10(np.clip(d_rand, 1.0, xmax)) / np.log10(xmax)))
+
+    ## a spot drawn as a reference in every split scores nothing and stays NaN;
+    ## at n_splits=40 that is a 1e-12 event, but the summaries skip NaN regardless
+    with np.errstate(invalid='ignore'), warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        hit = {t: {a: _rate(err[a], t) for a in emb} for t in thresholds}
+        auc = {a: _ecdf_auc(err[a]) for a in emb}
+        auc_pcs = _ecdf_auc(err_pcs)
+        hit_pcs = {t: float(np.nanmean(_rate(err_pcs, t))) for t in thresholds}
+    n_unscored = int(np.isnan(auc['student']).sum())
+    if n_unscored:
+        print(f'  note: {n_unscored} spot(s) never drawn as a query, left unscored')
+
+    def _knn_overlap(Z, XY, k):
+        iz = NearestNeighbors(n_neighbors=k + 1).fit(Z).kneighbors(
+            Z, return_distance=False)[:, 1:]
+        ix = NearestNeighbors(n_neighbors=k + 1).fit(XY).kneighbors(
+            XY, return_distance=False)[:, 1:]
+        return np.array([len(np.intersect1d(a, b, assume_unique=True))
+                         for a, b in zip(iz, ix)]) / k
+
+    overlap = {a: _knn_overlap(Z, xy, k_overlap) for a, Z in emb.items()}
+
+    labels = {
+        'RNA_clusters': pd.Series(
+            np.asarray(source_rna.obs.loc[obs_names, 'RNA_clusters']).astype(str),
+            index=obs_names),
+        'ATAC_clusters': pd.Series(
+            np.asarray(source_rna.obs.loc[obs_names, 'ATAC_clusters']).astype(str),
+            index=obs_names),
+    }
+
+    ## piecewise-constant maps: each spot painted with its domain's mean
+    auc_by_cluster = {
+        cname: {a: pd.Series(auc[a], index=obs_names).groupby(lab)
+                .transform('mean').to_numpy() for a in emb}
+        for cname, lab in labels.items()
+    }
+    contrast = {'per spot': auc['student'] - auc['MultiVI']}
+    for cname, lab in labels.items():
+        contrast[cname] = (pd.Series(contrast['per spot'], index=obs_names)
+                           .groupby(lab).transform('mean').to_numpy())
+
+    ## contiguity: fraction of a spot's spatial neighbours carrying its own label
+    nb = NearestNeighbors(n_neighbors=contiguity_k + 1).fit(xy).kneighbors(
+        xy, return_distance=False)[:, 1:]
+    rna = labels['RNA_clusters'].to_numpy()
+    contiguity = (rna[nb] == rna[:, None]).mean(axis=1)
+
+    domains = pd.DataFrame(
+        {a: pd.Series(overlap[a], index=obs_names).groupby(labels['RNA_clusters']).mean()
+         for a in emb})
+    domains['distil_gap'] = domains['teacher'] - domains['student']
+    domains['over_floor'] = domains['student'] - domains[['no-KD', 'MultiVI']].max(axis=1)
+    ## retention is the higher-is-better reading of the same ordering: the share of
+    ## the teacher's agreement that survives distillation. It is what the figure
+    ## plots, because it is a genuine fraction of an agreement score rather than a
+    ## difference of two. The difference is the stronger statistic (nuisance common
+    ## to both arms cancels additively, where a ratio puts the teacher back in the
+    ## denominator), so both correlations are computed and reported.
+    domains['retention'] = domains['student'] / domains['teacher']
+    domains['contiguity'] = (pd.Series(contiguity, index=obs_names)
+                             .groupby(labels['RNA_clusters']).mean())
+    domains['auc_student'] = (pd.Series(auc['student'], index=obs_names)
+                              .groupby(labels['RNA_clusters']).mean())
+    domains['size'] = labels['RNA_clusters'].value_counts()
+
+    ## leave-one-domain-out: with eleven points a rank correlation can be one
+    ## outlier restating itself, and this is the check that would show it
+    def _corr(col):
+        r = spearmanr(domains['contiguity'], domains[col])
+        lo = pd.Series({d: spearmanr(domains.drop(d)['contiguity'],
+                                     domains.drop(d)[col]).statistic
+                        for d in domains.index})
+        return r.statistic, r.pvalue, lo
+
+    rho, pval, loo = _corr('distil_gap')
+    rho_ret, pval_ret, loo_ret = _corr('retention')
+
+    print(f'expression PCs: {hit_pcs[2.0]:.3%} within 2 sp, '
+          f'ECDF area {np.nanmean(auc_pcs):.3f}')
+    for a in SPATIAL_STRUCTURE_ARMS:
+        line = '  '.join(f'{t:g}sp {np.nanmean(hit[t][a]):5.1%}' for t in thresholds)
+        print(f'{a:>9s}: {line}  area {np.nanmean(auc[a]):.3f}  '
+              f'overlap {overlap[a].mean():.3f}')
+    print(f'chance: ' + '  '.join(f'{t:g}sp {floor_hit[t]:5.1%}' for t in thresholds)
+          + f'  area {floor_auc:.3f}  overlap {k_overlap / (len(xy) - 1):.4f}')
+    print(f'contiguity vs distil_gap: rho={rho:+.3f}, p={pval:.3f}; '
+          f'leave-one-out rho in [{loo.min():+.3f}, {loo.max():+.3f}]')
+    print(f'contiguity vs retention:  rho={rho_ret:+.3f}, p={pval_ret:.3f}; '
+          f'leave-one-out rho in [{loo_ret.min():+.3f}, {loo_ret.max():+.3f}]')
+
+    return {
+        'obs_names': obs_names, 'xy': xy, 'pitch': pitch, 'emb': emb,
+        'labels': labels, 'thresholds': list(thresholds), 'xmax': xmax,
+        'hit': hit, 'auc': auc, 'auc_by_cluster': auc_by_cluster,
+        'overlap': overlap, 'contrast': contrast, 'contiguity': contiguity,
+        'domains': domains, 'floor_hit': floor_hit, 'floor_auc': floor_auc,
+        'auc_pcs': auc_pcs, 'hit_pcs': hit_pcs,
+        'rho': rho, 'pval': pval, 'loo': loo, 'k_overlap': k_overlap,
+        'rho_ret': rho_ret, 'pval_ret': pval_ret, 'loo_ret': loo_ret,
+        'errors': {**err, 'expression PCs': err_pcs},
+    }
+
+
+def place_scatter_labels(ax, x, y, labels, fontsize=7, color='0.35',
+                         radii=(6.0, 12.0, 19.0, 27.0), pad=1.5):
+    """Annotate points, choosing each label's offset so none collide.
+
+    Three of the eleven domains sit almost on top of one another at the low-
+    contiguity end, where a fixed offset renders them as one illegible smear.
+    Candidate offsets are tried in a fixed order -- eight directions at growing
+    radius -- and the first that clears every marker and every label already
+    placed wins, so the layout is deterministic and reproducible rather than
+    dependent on a stochastic solver. Falls back to the least-overlapping
+    candidate when a point is genuinely boxed in.
+    """
+    import matplotlib.transforms as mtransforms
+
+    def _overlap(a, b):
+        w = min(a.x1, b.x1) - max(a.x0, b.x0)
+        h = min(a.y1, b.y1) - max(a.y0, b.y0)
+        return max(w, 0.0) * max(h, 0.0)
+
+    fig = ax.figure
+    fig.canvas.draw()                       # transforms and renderer must be live
+    rend = fig.canvas.get_renderer()
+    pts = ax.transData.transform(np.column_stack([np.asarray(x), np.asarray(y)]))
+    ## markers are keep-out zones too, else labels land on neighbouring points
+    keepout = [mtransforms.Bbox.from_bounds(px - 4.5, py - 4.5, 9.0, 9.0)
+               for px, py in pts]
+    angles = (0.0, 40.0, -40.0, 90.0, -90.0, 140.0, -140.0, 180.0)
+
+    for xi, yi, lab in zip(np.asarray(x), np.asarray(y), labels):
+        t = ax.annotate(str(lab), (xi, yi), textcoords='offset points',
+                        xytext=(radii[0], 0.0), fontsize=fontsize, color=color,
+                        annotation_clip=False)
+        best, best_score = (radii[0], 0.0, 'left', 'center'), np.inf
+        for r in radii:
+            for a in angles:
+                dx, dy = r * np.cos(np.radians(a)), r * np.sin(np.radians(a))
+                ha = 'left' if dx > -1.0 else 'right'
+                va = 'bottom' if dy > 1.0 else ('top' if dy < -1.0 else 'center')
+                t.xyann = (dx, dy)
+                t.set_ha(ha)
+                t.set_va(va)
+                bb = t.get_window_extent(rend).padded(pad)
+                score = sum(_overlap(bb, k) for k in keepout)
+                if score < best_score:
+                    best, best_score = (dx, dy, ha, va), score
+                if best_score == 0.0:
+                    break
+            if best_score == 0.0:
+                break
+        dx, dy, ha, va = best
+        t.xyann = (dx, dy)
+        t.set_ha(ha)
+        t.set_va(va)
+        keepout.append(t.get_window_extent(rend).padded(pad))
+    return ax
+
+
+def plot_spatial_structure_figure(
+    stats,
+    filename='3_spatial_structure',
+    save_dir=CIBB_FIGURES_DIR,
+    smooth_k=7,
+    figsize=(11.0, 10.4),
+    dpi=600,
+):
+    """Four-panel composite, written as SVG (for assembly) and PNG (for LaTeX).
+
+    Colourbars sit in axes carved out of the gridspec rather than stolen from the
+    map axes: ``fig.colorbar(ax=...)`` shrinks its donors by an amount that
+    depends on their aspect, which is what makes stacked map blocks drift out of
+    alignment and lets one colourbar's labels land on top of the block below.
+    """
+    import matplotlib as mpl
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.lines import Line2D
+    from sklearn.neighbors import NearestNeighbors
+
+    xy, pitch, arms = stats['xy'], stats['pitch'], SPATIAL_STRUCTURE_ARMS
+    dom, errors = stats['domains'], stats['errors']
+
+    ## light spatial smoothing for legibility only: per-spot rates are estimated
+    ## from ~n_splits/2 draws and land on a visibly coarse grid without it
+    nb = NearestNeighbors(n_neighbors=smooth_k).fit(xy).kneighbors(
+        xy, return_distance=False)
+    sm = lambda v: np.asarray(v)[nb].mean(axis=1)
+
+    seq = mpl.colors.LinearSegmentedColormap.from_list(
+        'seq', plt.get_cmap('Blues')(np.linspace(0.05, 1.0, 256)))
+    ## diverging: two hues either side of a neutral grey midpoint, never a hue at
+    ## zero. Green/purple are the arm colours, so the sign reads without a lookup.
+    div = mpl.colors.LinearSegmentedColormap.from_list(
+        'div', ['#762a83', '#9970ab', '#e7e7e7', '#5aae61', '#1b7837'])
+
+    fig = plt.figure(figsize=figsize)
+    ## row 1 is an empty spacer: the plots in row 0 carry axis labels that would
+    ## otherwise run into the column titles of the map block below, and hspace
+    ## applies uniformly so it cannot open that one gap on its own
+    gs = GridSpec(4, 5, figure=fig, width_ratios=[1, 1, 1, 1, 0.09],
+                  height_ratios=[1.9, 0.18, 1, 1], hspace=0.25, wspace=0.10)
+
+    def _bare(ax):
+        ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
+        for s in ax.spines.values():
+            s.set_linewidth(0.6); s.set_color('0.7')
+        return ax
+
+    ## ---- (a) cumulative error distribution -------------------------------
+    ax_a = fig.add_subplot(gs[0, 0:2])
+    rng = np.random.default_rng(0)
+    n_e = errors['student'].size
+    floor = np.linalg.norm(
+        xy[rng.integers(0, len(xy), n_e)] - xy[rng.integers(0, len(xy), n_e)],
+        axis=1) / pitch
+    curves = {a: errors[a][~np.isnan(errors[a])].ravel() for a in arms}
+    curves['random floor'] = floor
+    for name, e in curves.items():
+        ls, lw = SPATIAL_STRUCTURE_STYLE[name]
+        x = np.sort(np.clip(e, 1.0, None))
+        ax_a.plot(x, np.arange(1, len(x) + 1) / len(x), ls, lw=lw,
+                  color=SPATIAL_STRUCTURE_COLORS[name],
+                  label=f'MultiGATE {name}' if name in ('teacher', 'student', 'no-KD') else name)
+    ax_a.axvline(2.0, color='0.6', lw=0.8, ls=':')
+    ax_a.text(2.15, 0.03, r'$\leq$2 sp', fontsize=7, color='0.4')
+    ax_a.set_xscale('log'); ax_a.set_xlim(1, stats['xmax']); ax_a.set_ylim(0, 1.02)
+    ax_a.set_xlabel('position error (spot widths)', fontsize=9)
+    ax_a.set_ylabel('cumulative fraction', fontsize=9)
+    ax_a.tick_params(labelsize=8)
+    ax_a.legend(fontsize=7, frameon=True, loc='upper left')
+    ax_a.set_box_aspect(1)
+    ax_a.text(-0.16, 1.04, 'a', transform=ax_a.transAxes, fontsize=15, fontweight='bold')
+
+    ## ---- (b) contiguity against the distillation gap ---------------------
+    ax_d = fig.add_subplot(gs[0, 2:4])
+    ax_d.scatter(dom['contiguity'], dom['retention'], s=34, linewidths=0.6,
+                 facecolor='#1b7837', edgecolor='white', zorder=3)
+    ax_d.margins(x=0.11, y=0.13)          # room for labels pushed outward
+    place_scatter_labels(ax_d, dom['contiguity'].to_numpy(),
+                         dom['retention'].to_numpy(), list(dom.index))
+    ax_d.set_xlabel('neighbourhood contiguity', fontsize=9)
+    ax_d.set_ylabel('kNN agreement retained\n(student / teacher)', fontsize=9)
+    ax_d.yaxis.set_label_position('right')
+    ax_d.yaxis.tick_right()
+    ax_d.tick_params(labelsize=8)
+    ax_d.text(0.03, 0.05,
+              rf'$\rho$ = {stats["rho_ret"]:.2f}, $p$ = {stats["pval_ret"]:.3f}'
+              '\n'
+              rf'LOO $\rho \in$ [{stats["loo_ret"].min():.2f}, {stats["loo_ret"].max():.2f}]',
+              transform=ax_d.transAxes, fontsize=7, va='bottom', color='0.3')
+    for s in ('top', 'left'):
+        ax_d.spines[s].set_visible(False)
+    ax_d.set_box_aspect(1)
+    ax_d.text(-0.06, 1.04, 'b', transform=ax_d.transAxes, fontsize=15, fontweight='bold')
+
+    ## ---- (c) ECDF area per spot -------------------------------------------
+    ## The cluster-averaged rows are dropped from the figure: panel (d) already
+    ## shows the same averaging applied to the contrast, and the per-domain
+    ## values are tabulated in stats['domains'] for the text.
+    for c, a in enumerate(arms):
+        ax = _bare(fig.add_subplot(gs[2, c]))
+        sca_b = ax.scatter(xy[:, 0], xy[:, 1], c=sm(stats['auc'][a]), s=3.0,
+                           linewidths=0, cmap=seq, vmin=0, vmax=1)
+        ax.set_title(f'{a}\narea {np.nanmean(stats["auc"][a]):.2f}', fontsize=9, pad=5)
+        if c == 0:
+            ax.text(-0.22, 1.02, 'c', transform=ax.transAxes,
+                    fontsize=15, fontweight='bold')
+
+    cax_b = fig.add_subplot(gs[2, 4])
+    cb_b = fig.colorbar(sca_b, cax=cax_b)
+    cb_b.set_label(f'ECDF area (log axis, 1\u2013{stats["xmax"]:.0f} sp; rule = chance)',
+                   fontsize=8)
+    cb_b.ax.tick_params(labelsize=7)
+    cb_b.ax.axhline(stats['floor_auc'], color='0.25', lw=1.0)
+
+    ## ---- (d) student minus MultiVI, three grain sizes ---------------------
+    keys_c = ['per spot', 'RNA_clusters', 'ATAC_clusters']
+    ## symmetric and robust: a handful of spots fail totally in one arm and would
+    ## otherwise set the limit and flatten everything else to grey
+    vlim = float(np.percentile(np.abs(stats['contrast']['per spot']), 98))
+    for c, key in enumerate(keys_c):
+        ax = _bare(fig.add_subplot(gs[3, c]))
+        v = sm(stats['contrast'][key]) if key == 'per spot' else stats['contrast'][key]
+        sca_c = ax.scatter(xy[:, 0], xy[:, 1], c=v, s=3.0, linewidths=0,
+                           cmap=div, vmin=-vlim, vmax=vlim)
+        lo, hi = stats['contrast'][key].min(), stats['contrast'][key].max()
+        ax.set_title(f'{key}\n{lo:+.2f} to {hi:+.2f}', fontsize=9, pad=5)
+        if c == 0:
+            ax.text(-0.22, 1.02, 'd', transform=ax.transAxes,
+                    fontsize=15, fontweight='bold')
+
+    cax_c = fig.add_subplot(gs[3, 4])
+    cb_c = fig.colorbar(sca_c, cax=cax_c, extend='both')
+    cb_c.set_label('ECDF area, student $-$ MultiVI', fontsize=8)
+    cb_c.ax.tick_params(labelsize=7)
+    cb_c.ax.axhline(0.0, color='0.35', lw=0.8)
+    for y, txt, col in ((vlim * 0.6, 'student\nahead', '#1b7837'),
+                        (-vlim * 0.6, 'MultiVI\nahead', '#762a83')):
+        cb_c.ax.text(-0.5, y, txt, transform=cb_c.ax.get_yaxis_transform(),
+                     fontsize=6.5, va='center', ha='right', color=col)
+
+    os.makedirs(save_dir, exist_ok=True)
+    paths = []
+    for ext in ('svg', 'png'):
+        p = os.path.join(save_dir, f'{filename}.{ext}')
+        with plt.rc_context({'svg.fonttype': 'none'}):
+            fig.savefig(p, format=ext, dpi=dpi, bbox_inches='tight')
+        paths.append(p)
+        print(f'Saved: {p}')
+    plt.show()
+    return fig, paths
+
+
+spatial_structure_stats = compute_spatial_structure_stats(
+    source_rna, source_multivi_rna
+)
+print(spatial_structure_stats['domains']
+      .sort_values('contiguity')[['contiguity', 'size', 'teacher', 'student',
+                                  'distil_gap', 'over_floor']].round(3))
+spatial_structure_fig, spatial_structure_paths = plot_spatial_structure_figure(
+    spatial_structure_stats
+)
+
 ## source-side agreement with the Inflow-NMF referee.
 ## The target-side referee is deliberately not scored: target spatial coordinates are
 ## imputed from the MultiGATE latent space being evaluated (see target_rna.obsm['spatial']
