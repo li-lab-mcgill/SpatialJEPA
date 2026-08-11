@@ -2694,7 +2694,7 @@ sc.pl.umap(source_target_adata, color=['modality', 'leiden', 'source_or_target']
 
 ## [COMMENTED OUT] load from disk
 #source_rna = sc.read_h5ad(os.path.join(base_path, "source_rna_aligned_with_latents.h5ad"))
-#source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))
+#source_atac = sc.read_h5ad(os.path.join(base_path, "source_atac_aligned_with_latents.h5ad"))∫∫∫∫
 #target_rna = sc.read_h5ad(os.path.join(base_path, "target_rna_aligned_with_latents.h5ad"))
 #target_atac = sc.read_h5ad(os.path.join(base_path, "target_atac_aligned_with_latents.h5ad"))
 
@@ -3790,6 +3790,43 @@ import plotnine as p9
 import gc
 from sklearn.model_selection import StratifiedShuffleSplit
 
+
+def get_source_multivi_rna_for_analysis(base_path):
+    """Return source MultiVI RNA, loading it when this cell is run standalone.
+
+    The script normally creates ``mdata`` in the earlier MultiVI cell.  Keeping
+    this small fallback here also makes the LIANA/Inflow analysis cell runnable
+    after restarting a notebook kernel without repeating all preceding panels.
+    """
+    source_multivi_mdata = globals().get("mdata")
+    if source_multivi_mdata is None:
+        import muon as mu
+
+        multivi_path = os.path.join(base_path, "multivi_mdata.h5mu")
+        if not os.path.exists(multivi_path):
+            raise FileNotFoundError(
+                "Source MultiVI data are required for the comparison panels, "
+                f"but were not found at {multivi_path}."
+            )
+        print(f"Loading source MultiVI data for LIANA/Inflow panels: {multivi_path}")
+        source_multivi_mdata = mu.read_h5mu(multivi_path)
+
+    source_multivi_rna = source_multivi_mdata.mod["rna"]
+    if "X_multivi" not in source_multivi_rna.obsm:
+        if "X_multivi_rna" not in source_multivi_rna.obsm:
+            raise KeyError(
+                "Source MultiVI RNA contains neither obsm['X_multivi'] nor "
+                "obsm['X_multivi_rna']."
+            )
+        source_multivi_rna.obsm["X_multivi"] = source_multivi_rna.obsm[
+            "X_multivi_rna"
+        ]
+    return source_multivi_rna
+
+
+source_multivi_rna = get_source_multivi_rna_for_analysis(base_path)
+
+
 def make_full_spatial_nmf_plot_adata(nmf, full_adata, spatial_key="spatial", preserve_obs_cols=None):
     nmf_scores = nmf.X.toarray() if sp.issparse(nmf.X) else np.asarray(nmf.X)
     nmf_scores_df = pd.DataFrame(
@@ -3815,6 +3852,183 @@ def make_full_spatial_nmf_plot_adata(nmf, full_adata, spatial_key="spatial", pre
         obs=full_obs,
         obsm={spatial_key: full_adata.obsm[spatial_key].copy()},
     )
+
+
+def collapse_inflow_across_senders(lrdata, sep="^"):
+    """Sum sender-conditioned Inflow features into sender-agnostic LR pairs.
+
+    Inflow names its features ``sender^ligand^receptor``. Because the sender
+    annotations are an exhaustive one-hot partition, summing over senders yields
+    the total spatially weighted ligand-receptor score while removing the explicit
+    RNA-cluster label that otherwise dominates the factor/domain comparison.
+    """
+    feature_parts = (
+        pd.Series(lrdata.var_names.astype(str), index=lrdata.var_names)
+        .str.split(sep, n=2, expand=True)
+    )
+    if feature_parts.shape[1] != 3 or feature_parts.isna().any(axis=None):
+        raise ValueError(
+            "Expected Inflow feature names formatted as "
+            "'sender^ligand^receptor'."
+        )
+
+    lr_names = (
+        feature_parts.iloc[:, 1].astype(str)
+        + sep
+        + feature_parts.iloc[:, 2].astype(str)
+    )
+    lr_codes, unique_lr = pd.factorize(lr_names, sort=False)
+    aggregation = sp.csr_matrix(
+        (
+            np.ones(lrdata.n_vars, dtype=np.float32),
+            (np.arange(lrdata.n_vars), lr_codes),
+        ),
+        shape=(lrdata.n_vars, len(unique_lr)),
+    )
+    X = (
+        lrdata.X.tocsr()
+        if sp.issparse(lrdata.X)
+        else sp.csr_matrix(np.asarray(lrdata.X))
+    )
+    X_collapsed = (X @ aggregation).tocsr()
+
+    collapsed_var = pd.DataFrame(
+        index=pd.Index(unique_lr.astype(str), name="interaction")
+    )
+    collapsed_parts = collapsed_var.index.to_series().str.split(
+        sep, n=1, expand=True
+    )
+    collapsed_var["ligand"] = collapsed_parts.iloc[:, 0].to_numpy()
+    collapsed_var["receptor"] = collapsed_parts.iloc[:, 1].to_numpy()
+    collapsed_var["n_sender_features"] = np.bincount(
+        lr_codes, minlength=len(unique_lr)
+    )
+
+    collapsed = sc.AnnData(
+        X=X_collapsed,
+        obs=lrdata.obs.copy(),
+        var=collapsed_var,
+        uns=lrdata.uns.copy(),
+        obsm={key: value.copy() for key, value in lrdata.obsm.items()},
+        obsp={key: value.copy() for key, value in lrdata.obsp.items()},
+    )
+    print(
+        f"Collapsed {lrdata.n_vars} sender-conditioned features into "
+        f"{collapsed.n_vars} sender-agnostic LR pairs."
+    )
+    return collapsed
+
+
+def fit_sender_collapsed_inflow_nmf(
+    source_liana_results,
+    full_adata,
+    n_components=5,
+    rank_range=range(2, 11),
+    spatial_key="spatial",
+    cell_type_col="RNA_clusters",
+    n_neighbors=30,
+    leiden_resolution=0.1,
+    random_state=0,
+    max_iter=1000,
+):
+    """Fit a separate NMF to sender-collapsed Inflow scores.
+
+    The original sender-resolved result remains untouched and continues to define
+    the LR-informed reference used by panels a--c. This result is used only for
+    factor interpretation and the domain-enrichment panel e.
+    """
+    from sklearn.decomposition import NMF as SklearnNMF
+
+    sender_resolved = source_liana_results["lrdata"]
+    lrdata = collapse_inflow_across_senders(sender_resolved)
+    max_rank = min(lrdata.n_obs, lrdata.n_vars)
+    ranks = sorted({int(k) for k in rank_range if 1 < int(k) <= max_rank})
+    if not ranks:
+        raise ValueError(
+            f"No valid collapsed-NMF ranks for matrix shape {lrdata.shape}."
+        )
+    if not 1 < int(n_components) <= max_rank:
+        raise ValueError(
+            f"n_components={n_components} is invalid for collapsed matrix "
+            f"shape {lrdata.shape}."
+        )
+
+    rank_rows = []
+    for rank in ranks:
+        model = SklearnNMF(
+            n_components=rank,
+            init="nndsvda",
+            random_state=random_state,
+            max_iter=max_iter,
+        )
+        model.fit(lrdata.X)
+        rank_rows.append(
+            {"rank": rank, "reconstruction_error": model.reconstruction_err_}
+        )
+    rank_errors = pd.DataFrame(rank_rows).set_index("rank")
+    rank_errors["relative_to_min_rank"] = (
+        rank_errors["reconstruction_error"]
+        / rank_errors["reconstruction_error"].iloc[0]
+    )
+    print("Sender-collapsed Inflow-NMF rank sweep:")
+    print(rank_errors.round(4))
+    print(f"Using sender-collapsed NMF rank {n_components}.")
+
+    li.multi.nmf(
+        lrdata,
+        n_components=n_components,
+        inplace=True,
+        init="nndsvda",
+        random_state=random_state,
+        max_iter=max_iter,
+        verbose=True,
+    )
+    lr_loadings = li.ut.get_variable_loadings(
+        lrdata, varm_key="NMF_H"
+    ).set_index("index")
+    factor_scores = li.ut.get_factor_scores(lrdata, obsm_key="NMF_W")
+
+    X_nmf = np.asarray(lrdata.obsm["NMF_W"])
+    keep_nmf = X_nmf.sum(axis=1) > 0
+    lrdata_nmf = lrdata[keep_nmf].copy()
+    nmf = sc.AnnData(
+        X=np.asarray(lrdata_nmf.obsm["NMF_W"]),
+        obs=lrdata_nmf.obs.copy(),
+        var=pd.DataFrame(index=lr_loadings.columns.astype(str)),
+        uns=lrdata.uns.copy(),
+        obsm={key: value.copy() for key, value in lrdata_nmf.obsm.items()},
+    )
+    sc.pp.neighbors(
+        nmf,
+        use_rep="X",
+        metric="euclidean",
+        n_neighbors=n_neighbors,
+        random_state=random_state,
+    )
+    sc.tl.leiden(
+        nmf,
+        resolution=leiden_resolution,
+        random_state=random_state,
+    )
+    sc.tl.umap(nmf, min_dist=0.5, random_state=random_state)
+    nmf_spatial = make_full_spatial_nmf_plot_adata(
+        nmf,
+        full_adata,
+        spatial_key=spatial_key,
+        preserve_obs_cols=[cell_type_col],
+    )
+
+    return {
+        "adata": full_adata,
+        "lrdata": lrdata,
+        "lrdata_sender_resolved": sender_resolved,
+        "nmf": nmf,
+        "nmf_spatial": nmf_spatial,
+        "lr_loadings": lr_loadings,
+        "factor_scores": factor_scores,
+        "rank_errors": rank_errors,
+        "n_components": int(n_components),
+    }
 
 def liana_spatial_analysis(
     adata,
@@ -4136,6 +4350,20 @@ source_liana_results = liana_spatial_analysis(
     labels=None, interaction=None, ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
     )
 
+## Sender-collapsed factors are kept separate from the sender-resolved Inflow-NMF
+## reference above. Rank 5 is a fixed parsimonious choice; retain the full feasible
+## sweep in the result for sensitivity reporting rather than changing the rank to
+## optimise agreement with MultiGATE.
+source_liana_collapsed_results = fit_sender_collapsed_inflow_nmf(
+    source_liana_results,
+    full_adata=source_rna_liana,
+    n_components=5,
+    rank_range=range(2, 11),
+    spatial_key="spatial",
+    cell_type_col="RNA_clusters",
+    random_state=0,
+)
+
 '''
 target_liana_results = liana_spatial_analysis(
     target_rna_liana,
@@ -4145,11 +4373,7 @@ target_liana_results = liana_spatial_analysis(
     )
 '''
 
-## LIANA-MultiGATE heatmaps
-from scipy.stats import rankdata
-adata = source_liana_results['adata'].copy()
-nmf = source_liana_results['nmf'].copy()
-nmf_spatial = source_liana_results['nmf_spatial'].copy()
+## LIANA-MultiGATE comparisons
 
 ## Held-out spatial reconstruction: the primary ground-truth spatial claim.
 ## Hide half the source spots, match each hidden spot to its nearest retained spot in
@@ -4305,7 +4529,7 @@ def plot_heldout_spatial_reconstruction(
     return {'summary': summary, 'curves': curves, 'pitch': pitch, 'fig': fig}
 
 heldout_reconstruction_results = plot_heldout_spatial_reconstruction(
-    source_rna, mdata.mod['rna']
+    source_rna, source_multivi_rna
 )
 
 ## source-side agreement with the Inflow-NMF referee.
@@ -4662,122 +4886,262 @@ def plot_source_referee_panels(
             'fig_panel_c': fig_panel_c}
 
 source_referee_results = plot_source_referee_panels(
-    source_rna, mdata.mod['rna'], source_liana_results
+    source_rna, source_multivi_rna, source_liana_results
 )
 
-## Align by barcode rather than by position. nmf has already dropped the cells the
-## keep_nmf filter removed and may have been stratified-subsampled, so positional
-## correspondence with adata is not guaranteed -- and np.corrcoef only rejects a row
-## *count* mismatch, never a row *order* one. A silent misalignment therefore does not
-## raise: it produces a correlation matrix at the noise floor (SD ~ 1/sqrt(n), so
-## ~0.014 at n=5000) that looks like a real, if weak, result.
-shared = adata.obs_names.intersection(nmf.obs_names)
-assert len(shared) > 0, 'adata and nmf share no barcodes'
-assert not shared.has_duplicates, 'duplicate barcodes make the alignment ambiguous'
-if len(shared) < min(adata.n_obs, nmf.n_obs):
-    print(f'WARNING: adata ({adata.n_obs}) and nmf ({nmf.n_obs}) overlap in only '
-            f'{len(shared)} barcodes; correlating on those')
-x1 = np.asarray(adata[shared].obsm['MultiGATE_source_aligned'])
-x2 = np.asarray(nmf[shared].X)
-print(f'NMF-MultiGATE correlation on {len(shared)} aligned cells, '
-        f'{x1.shape[1]} dimensions x {x2.shape[1]} factors')
-x1 = rankdata(x1, axis=0)
-x2 = rankdata(x2, axis=0)
-#x1 = np.argsort(x1, axis=0)
-#x2 = np.argsort(x2, axis=0)
-corrs = np.corrcoef(x1, x2, rowvar=False)
-corrs = corrs[x1.shape[1]:, :x1.shape[1]]
-## guard against the failure above coming back by another route: a real association
-## sits far above the null, whose SD is ~1/sqrt(n-1)
-null_sd = 1.0 / np.sqrt(len(shared) - 1)
-if np.abs(corrs).max() < 5 * null_sd:
-    print(f'WARNING: max |rho| = {np.abs(corrs).max():.3f} against a null SD of '
-            f'{null_sd:.3f} -- the embedding and the NMF factors are at the noise '
-            f'floor, check that the two are really row-aligned')
-corrs_df = pd.DataFrame(corrs, index=nmf.var_names.str.replace('Factor', 'NMF'))
-topk=3
-## keep the topk factors most strongly associated with each MultiGATE dimension,
-## ranked by |rho| so that an anti-correlated factor counts as much as a correlated one
-corrs_order = pd.Series(corrs_df.apply(lambda x: corrs_df.index[np.argsort(-np.abs(x))[:topk]], axis=0).T.values.flatten()).drop_duplicates(keep='first').values.tolist()
-corr_top = corrs_df.loc[corrs_order]
-
-def plot_nmf_multigate_corr_panel(
-    corr_top,
-    panel='e_nmf_multigate_corr',
+def plot_nmf_domain_enrichment_panel(
+    source_rna,
+    multivi_rna,
+    reference_liana_results,
+    factor_liana_results,
+    n_show=None,
+    seed=0,
+    n_neighbors=10,
+    panel="e_nmf_multigate_corr",
     save_dir=CIBB_PLS_FIGURES_DIR,
     dpi=600,
 ):
-    """Panel e of the assembled LIANA figure, at the size it is placed.
+    """Panel e: sender-collapsed Inflow factors across student domains.
 
-    Replaces the seaborn clustermap: the clustermap's dendrograms are dropped at
-    assembly anyway, and its own layout manager fixes the tick/colorbar placement,
-    which is what forced the panel to be rescaled by hand. Here the ordering is
-    computed with the same average-linkage clustering, and the axes rectangles are
-    set explicitly so the panel lands at its declared size.
+    ``reference_liana_results`` supplies the original sender-resolved Inflow-NMF
+    partition, so the matched-k student domains are identical to panels b/c.
+    ``factor_liana_results`` supplies the separately fitted sender-collapsed factors.
+    Values are mean within-domain factor z-scores: their signs indicate enrichment
+    or depletion relative to the tissue-wide mean, not arbitrary latent-axis signs.
     """
     from scipy.cluster.hierarchy import leaves_list, linkage
     from scipy.spatial.distance import pdist
 
-    ## rows MultiGATE dimensions, columns NMF factors: the orientation the panel is
-    ## placed in, with the labels on the outer edges of the assembled block
-    M = corr_top.T
+    overlap = source_rna.obs_names.intersection(multivi_rna.obs_names)
+    if len(overlap) == 0:
+        if multivi_rna.n_obs != source_rna.n_obs:
+            raise ValueError(
+                "MultiVI has neither matching barcodes nor the same number of cells."
+            )
+        mask = np.ones(source_rna.n_obs, dtype=bool)
+    else:
+        mask = source_rna.obs_names.isin(overlap)
+    obs_names = source_rna.obs_names[mask]
+    student_Z = np.asarray(source_rna.obsm["MultiGATE"])[mask]
 
-    def _order(mat):
-        if mat.shape[0] < 3:
-            return np.arange(mat.shape[0])
-        return leaves_list(linkage(pdist(mat, metric='euclidean'), method='average'))
+    reference_spatial = reference_liana_results["nmf_spatial"]
+    reference_labels = pd.Series(
+        reference_spatial.obs["leiden"].astype(object),
+        index=reference_spatial.obs_names,
+    ).reindex(obs_names)
+    reference_ok = reference_labels.notna()
+    reference_k = reference_labels[reference_ok].astype(str).nunique()
 
-    M = M.iloc[_order(M.to_numpy()), :]
-    M = M.iloc[:, _order(M.to_numpy().T)]
+    student_adata = sc.AnnData(
+        X=np.zeros((len(obs_names), 1), dtype=np.float32),
+        obsm={"X_emb": student_Z},
+    )
+    student_adata.obs_names = obs_names
+    sc.pp.neighbors(
+        student_adata,
+        use_rep="X_emb",
+        n_neighbors=n_neighbors,
+        random_state=seed,
+    )
+    student_labels, resolution, k_found = _leiden_at_k(
+        student_adata, reference_k, seed=seed
+    )
+    if k_found != reference_k:
+        raise RuntimeError(
+            f"Student clustering produced k={k_found}, expected k={reference_k}."
+        )
+    student_labels = pd.Series(
+        np.asarray(student_labels).astype(str),
+        index=obs_names,
+        name="student_domain",
+    )
 
-    ## symmetric limits off a robust quantile, so a single extreme cell cannot wash
-    ## the rest of the map out to white
-    vmax = float(np.nanpercentile(np.abs(M.to_numpy()), 99))
-    ## the colourbar takes the top band, so the factor-axis label moves to the bottom
-    ## and the map keeps the full panel width; the right band holds the dimension-axis
-    ## label. Both axis labels sit on outer edges of the assembled block.
-    ax_rect = [0.025, 0.050, 0.910, 0.840]
-    cbar_rect = [0.270, 0.935, 0.420, 0.018]
+    ## Match the model-specific student ids to panel b's displayed colours.
+    label_map = _hungarian_map(
+        student_labels[reference_ok].to_numpy(),
+        reference_labels[reference_ok].astype(str).to_numpy(),
+    )
+    student_domains = student_labels.map(label_map).astype(str)
+    student_domains.name = "student_domain"
+
+    factor_spatial = factor_liana_results["nmf_spatial"]
+    factor_names = [
+        str(factor)
+        for factor in factor_liana_results["nmf"].var_names
+        if str(factor) in factor_spatial.obs.columns
+    ]
+    if not factor_names:
+        raise ValueError(
+            "No sender-collapsed Inflow-NMF scores found in nmf_spatial.obs."
+        )
+    W = (
+        factor_spatial.obs.reindex(obs_names)[factor_names]
+        .apply(pd.to_numeric, errors="coerce")
+    )
+    valid = W.notna().all(axis=1) & student_domains.notna()
+    W = W.loc[valid]
+    domains = student_domains.loc[valid]
+
+    factor_sd = W.std(axis=0, ddof=0).replace(0, np.nan)
+    Wz = ((W - W.mean(axis=0)) / factor_sd).dropna(axis=1)
+    domain_enrichment = Wz.groupby(domains, observed=True).mean()
+
+    def natural_key(value):
+        try:
+            return (0, int(value))
+        except (TypeError, ValueError):
+            return (1, str(value))
+
+    domain_order = sorted(domain_enrichment.index, key=natural_key)
+    domain_enrichment = domain_enrichment.loc[domain_order]
+
+    ## Eta-squared is reported for interpretation. With the default n_show=None all
+    ## collapsed factors are displayed, so it is not used to select a flattering set.
+    counts = domains.value_counts().reindex(domain_enrichment.index)
+    grand_mean = Wz.mean(axis=0)
+    ss_between = (
+        domain_enrichment.sub(grand_mean, axis=1).pow(2)
+        .mul(counts, axis=0)
+        .sum(axis=0)
+    )
+    ss_total = Wz.sub(grand_mean, axis=1).pow(2).sum(axis=0)
+    eta_squared = (
+        ss_between.div(ss_total)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0)
+        .sort_values(ascending=False)
+    )
+    if n_show is None or int(n_show) >= len(eta_squared):
+        selected = eta_squared.index
+    else:
+        selected = eta_squared.head(int(n_show)).index
+    matrix = domain_enrichment.loc[:, selected]
+
+    if matrix.shape[1] >= 3:
+        column_order = leaves_list(
+            linkage(
+                pdist(matrix.to_numpy().T, metric="euclidean"),
+                method="average",
+            )
+        )
+        matrix = matrix.iloc[:, column_order]
+
+    loadings = factor_liana_results["lr_loadings"]
+    loading_columns = {str(column): column for column in loadings.columns}
+    factor_annotations, tick_labels = {}, []
+    for factor in matrix.columns:
+        factor_short = str(factor).replace("Factor", "F").replace("NMF_", "F")
+        top_feature = ""
+        if str(factor) in loading_columns:
+            values = pd.to_numeric(
+                loadings[loading_columns[str(factor)]], errors="coerce"
+            )
+            if values.notna().any():
+                top_feature = str(values.idxmax())
+        parts = top_feature.split("^")
+        lr_pair = (
+            f"{parts[-2]}–{parts[-1]}" if len(parts) >= 2 else top_feature
+        )
+        if len(lr_pair) > 18:
+            lr_pair = lr_pair[:17] + "…"
+        tick_labels.append(
+            f"{factor_short}\n{lr_pair}" if lr_pair else factor_short
+        )
+        factor_annotations[str(factor)] = {
+            "top_feature": top_feature,
+            "eta_squared": float(eta_squared.loc[factor]),
+        }
+
+    vmax = max(
+        float(np.nanpercentile(np.abs(matrix.to_numpy()), 99)), 0.25
+    )
+    reference_levels = sorted(
+        reference_labels.dropna().astype(str).unique(), key=natural_key
+    )
+    domain_palette = {
+        label: plt.get_cmap("tab10")(i)
+        for i, label in enumerate(reference_levels)
+    }
 
     with plt.rc_context(PANEL_RC):
         fig = panel_figure(panel)
-        cax = fig.add_axes(cbar_rect)
-        ax = fig.add_axes(ax_rect)
-        sns.heatmap(M, ax=ax, cmap='coolwarm', center=0.0, vmin=-vmax, vmax=vmax,
-                    cbar_ax=cax, cbar_kws={'orientation': 'horizontal'},
-                    xticklabels=False, yticklabels=False)
-
-        ## individual dimension identities are not read off this panel, so the ticks
-        ## go entirely; '(unsorted)' warns that position carries no meaning, the rows
-        ## and columns being in hierarchical-clustering order rather than index order
-        ax.yaxis.set_label_position('right')
-        ax.set_xlabel('Inflow-NMF dimensions (unsorted)',
-                        fontsize=PANEL_FS['label'], labelpad=3)
-        ax.set_ylabel('MultiGATE dimensions (unsorted)',
-                        fontsize=PANEL_FS['label'], labelpad=3)
-        ax.tick_params(length=0, width=0)
+        ## Leave a clean band between the heatmap and the top colourbar; panel title
+        ## text is intentionally omitted because the assembly caption supplies it.
+        ax = fig.add_axes([0.16, 0.245, 0.815, 0.625])
+        cax = fig.add_axes([0.34, 0.940, 0.46, 0.018])
+        sns.heatmap(
+            matrix,
+            ax=ax,
+            cmap="coolwarm",
+            center=0,
+            vmin=-vmax,
+            vmax=vmax,
+            xticklabels=tick_labels,
+            yticklabels=matrix.index,
+            linewidths=0.25,
+            linecolor="white",
+            cbar_ax=cax,
+            cbar_kws={"orientation": "horizontal"},
+        )
+        ax.set_xlabel(
+            "sender-collapsed Inflow-NMF factor (top LR pair)",
+            fontsize=PANEL_FS["label"],
+            labelpad=3,
+        )
+        ax.set_ylabel(
+            "MultiGATE student domain",
+            fontsize=PANEL_FS["label"],
+            labelpad=3,
+        )
+        ax.tick_params(axis="x", rotation=90, labelsize=PANEL_FS["annot"])
+        ax.tick_params(axis="y", rotation=0, labelsize=PANEL_FS["tick"])
+        for tick in ax.get_yticklabels():
+            tick.set_color(domain_palette.get(tick.get_text(), "black"))
+            tick.set_fontweight("bold")
         for spine in ax.spines.values():
             spine.set_visible(True)
             spine.set_linewidth(0.4)
 
-        ## rank-transformed inputs, so these Pearson correlations are Spearman's rho.
-        ## Title rather than an axis label: it puts the name above a horizontal bar in
-        ## one line, leaving the space under the bar to the tick labels.
-        cbar = ax.collections[0].colorbar
-        cbar.outline.set_linewidth(0.4)
-        cax.xaxis.set_ticks_position('bottom')
-        cax.set_title('Spearman ρ', fontsize=PANEL_FS['label'], pad=2)
-        cbar.locator = mpl.ticker.MaxNLocator(nbins=4, symmetric=True)
-        cbar.update_ticks()
-        cax.tick_params(labelsize=PANEL_FS['tick'], length=1.2, width=0.4, pad=1.2)
-
+        colorbar = ax.collections[0].colorbar
+        colorbar.outline.set_linewidth(0.4)
+        cax.set_title(
+            "mean standardized factor score",
+            fontsize=PANEL_FS["label"],
+            pad=2,
+        )
+        colorbar.locator = mpl.ticker.MaxNLocator(nbins=4, symmetric=True)
+        colorbar.update_ticks()
+        cax.tick_params(
+            labelsize=PANEL_FS["tick"], length=1.2, width=0.4, pad=1.2
+        )
         if panel is not None:
             save_panel_svg(fig, panel, save_dir=save_dir, dpi=dpi)
     plt.show()
-    return fig
 
-fig_panel_e = plot_nmf_multigate_corr_panel(corr_top)
-save_plot_to_svg(fig_panel_e, "liana_multigate_heatmap")
+    annotation_df = (
+        pd.DataFrame.from_dict(factor_annotations, orient="index")
+        .rename_axis("factor")
+        .sort_values("eta_squared", ascending=False)
+    )
+    print("Displayed sender-collapsed Inflow factors:")
+    print(annotation_df)
+    return {
+        "figure": fig,
+        "domain_enrichment": domain_enrichment,
+        "displayed_matrix": matrix,
+        "factor_annotations": annotation_df,
+        "student_domains": student_domains,
+        "student_resolution": resolution,
+    }
+
+
+panel_e_results = plot_nmf_domain_enrichment_panel(
+    source_rna=source_rna,
+    multivi_rna=source_multivi_rna,
+    reference_liana_results=source_liana_results,
+    factor_liana_results=source_liana_collapsed_results,
+    n_show=None,
+)
 
 ## The per-arm ARI/NMI barplot that used to live here scored every arm against a
 ## Leiden partition whose k was set by the referee's own fixed resolution, and scored
