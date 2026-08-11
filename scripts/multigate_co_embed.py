@@ -4364,7 +4364,7 @@ source_liana_collapsed_results = fit_sender_collapsed_inflow_nmf(
 ## Caveat for the caption: the split is held out at evaluation time, not training time,
 ## so this shows position is recoverable from the embedding, not that the model
 ## generalises to unseen tissue. The teacher sees the spatial graph and is a scale
-## reference, not a competitor; the no-KD ablation is the control that isolates
+## reference, not a competitor; the non-spatial ablation is the control that isolates
 ## distillation (same architecture, same data, no teacher).
 def plot_heldout_spatial_reconstruction(
     source_rna,
@@ -4398,7 +4398,7 @@ def plot_heldout_spatial_reconstruction(
             '#00441b', 1.4, '--'),
         'MultiGATE student (identity graph)': (
             np.asarray(source_rna.obsm['MultiGATE'])[mask], '#1b7837', 2.4, '-'),
-        'MultiGATE no-KD ablation': (
+        'MultiGATE non-spatial ablation': (
             np.asarray(source_rna.obsm['MultiGATE_nonspatial'])[mask], '#a6dba0', 1.4, '-'),
         'MultiVI': (
             np.asarray(multivi_rna.obsm['X_multivi'])[pos[mask].astype(int).to_numpy()],
@@ -4428,7 +4428,7 @@ def plot_heldout_spatial_reconstruction(
     ## size this panel is placed, the full arm names would take half the axes width.
     short = {'MultiGATE teacher (spatial graph)': 'MultiGATE teacher',
                 'MultiGATE student (identity graph)': 'MultiGATE student',
-                'MultiGATE no-KD ablation': 'MultiGATE no-KD',
+                'MultiGATE non-spatial ablation': 'MultiGATE non-spatial',
                 'MultiVI': 'MultiVI', 'random floor': 'random floor'}
 
     with plt.rc_context(PANEL_RC):
@@ -4518,16 +4518,16 @@ heldout_reconstruction_results = plot_heldout_spatial_reconstruction(
 ## OT-aligned MultiGATE space), so a position-recovery score there would grade each
 ## encoder against labels one of them produced. See the docstring of
 ## compute_spatial_structure_stats for the three statistics and why each is here.
-SPATIAL_STRUCTURE_ARMS = ['teacher', 'student', 'no-KD', 'MultiVI']
+SPATIAL_STRUCTURE_ARMS = ['teacher', 'student', 'non-spatial', 'MultiVI']
 
-## no-KD darkened from the '#a6dba0' used in the CDF panel: at 1.54:1 against the
+## non-spatial darkened from the '#a6dba0' used in the CDF panel: at 1.54:1 against the
 ## page it is invisible as dense scatter marks, where the CDF only needs a thin line.
 SPATIAL_STRUCTURE_COLORS = {
-    'teacher': '#00441b', 'student': '#1b7837', 'no-KD': '#5aae61',
+    'teacher': '#00441b', 'student': '#1b7837', 'non-spatial': '#5aae61',
     'MultiVI': '#762a83', 'random floor': '#999999',
 }
 SPATIAL_STRUCTURE_STYLE = {
-    'teacher': ('--', 1.4), 'student': ('-', 2.4), 'no-KD': ('-', 1.4),
+    'teacher': ('--', 1.4), 'student': ('-', 2.4), 'non-spatial': ('-', 1.4),
     'MultiVI': ('-', 2.4), 'random floor': (':', 1.4),
 }
 
@@ -4582,7 +4582,7 @@ def compute_spatial_structure_stats(
     emb = {
         'teacher': np.asarray(source_rna.obsm['MultiGATE_full_teacher'])[mask],
         'student': np.asarray(source_rna.obsm['MultiGATE'])[mask],
-        'no-KD': np.asarray(source_rna.obsm['MultiGATE_nonspatial'])[mask],
+        'non-spatial': np.asarray(source_rna.obsm['MultiGATE_nonspatial'])[mask],
         'MultiVI': np.asarray(multivi_rna.obsm['X_multivi'])[
             pos[mask].astype(int).to_numpy()],
     }
@@ -4680,7 +4680,7 @@ def compute_spatial_structure_stats(
         {a: pd.Series(overlap[a], index=obs_names).groupby(labels['RNA_clusters']).mean()
          for a in emb})
     domains['distil_gap'] = domains['teacher'] - domains['student']
-    domains['over_floor'] = domains['student'] - domains[['no-KD', 'MultiVI']].max(axis=1)
+    domains['over_floor'] = domains['student'] - domains[['non-spatial', 'MultiVI']].max(axis=1)
     ## retention is the higher-is-better reading of the same ordering: the share of
     ## the teacher's agreement that survives distillation. It is what the figure
     ## plots, because it is a genuine fraction of an agreement score rather than a
@@ -4852,7 +4852,7 @@ def plot_spatial_structure_figure(
         x = np.sort(np.clip(e, 1.0, None))
         ax_a.plot(x, np.arange(1, len(x) + 1) / len(x), ls, lw=lw,
                   color=SPATIAL_STRUCTURE_COLORS[name],
-                  label=f'MultiGATE {name}' if name in ('teacher', 'student', 'no-KD') else name)
+                  label=f'MultiGATE {name}' if name in ('teacher', 'student', 'non-spatial') else name)
     ax_a.axvline(2.0, color='0.6', lw=0.8, ls=':')
     ax_a.text(2.15, 0.03, r'$\leq$2 sp', fontsize=7, color='0.4')
     ax_a.set_xscale('log'); ax_a.set_xlim(1, stats['xmax']); ax_a.set_ylim(0, 1.02)
@@ -5150,7 +5150,7 @@ def plot_source_referee_panels(
     reps = {
         'MultiGATE teacher': np.asarray(source_rna.obsm['MultiGATE_full_teacher'])[mask],
         'MultiGATE student': np.asarray(source_rna.obsm['MultiGATE'])[mask],
-        'MultiGATE no-KD': np.asarray(source_rna.obsm['MultiGATE_nonspatial'])[mask],
+        'MultiGATE non-spatial': np.asarray(source_rna.obsm['MultiGATE_nonspatial'])[mask],
         'MultiVI': mv_full[mask],
     }
     for key, val in reps.items():
