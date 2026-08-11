@@ -4524,11 +4524,13 @@ SPATIAL_STRUCTURE_ARMS = ['teacher', 'student', 'non-spatial', 'MultiVI']
 ## page it is invisible as dense scatter marks, where the CDF only needs a thin line.
 SPATIAL_STRUCTURE_COLORS = {
     'teacher': '#00441b', 'student': '#1b7837', 'non-spatial': '#5aae61',
-    'MultiVI': '#762a83', 'random floor': '#999999',
+    'MultiVI': '#762a83', 'expression PCs': '#6e6e6e', 'random floor': '#999999',
 }
+## the molecular baseline lands on top of the floor, so the two are told apart by
+## dash pattern rather than by colour; both are references, hence both grey
 SPATIAL_STRUCTURE_STYLE = {
     'teacher': ('--', 1.4), 'student': ('-', 2.4), 'non-spatial': ('-', 1.4),
-    'MultiVI': ('-', 2.4), 'random floor': (':', 1.4),
+    'MultiVI': ('-', 2.4), 'expression PCs': ('-.', 1.2), 'random floor': (':', 1.4),
 }
 
 
@@ -4586,7 +4588,9 @@ def compute_spatial_structure_stats(
         'MultiVI': np.asarray(multivi_rna.obsm['X_multivi'])[
             pos[mask].astype(int).to_numpy()],
     }
-    ## molecular baseline: reported in the text, not drawn, so it stays out of `emb`
+    ## molecular baseline. Kept out of `emb` because it is scored but not mapped:
+    ## it appears as a curve in panel (a) and in the printed ladder, not in the
+    ## per-spot map block, which is reserved for the four learned representations.
     pcs = np.asarray(source_rna.obsm['X_pca'])[mask][:, :n_pcs]
     for name, Z in {**emb, 'expression PCs': pcs}.items():
         assert np.isfinite(Z).all(), f'{name} has non-finite values'
@@ -4732,6 +4736,47 @@ def compute_spatial_structure_stats(
     }
 
 
+## Panel (b) names two of the eleven domains after brain structures. The
+## annotation ships cluster codes, so that naming is an empirical claim and is
+## checked here rather than hard-coded on trust. Markers are the ones already
+## used for the spatial marker scores earlier in this script.
+DOMAIN_MARKER_MODULES = {
+    'white matter': ['Mobp', 'Mal'],
+    'striatum': ['Pde10a', 'Rgs9', 'Gng7'],
+}
+
+
+def domain_marker_summary(source_rna, stats, modules=None):
+    """Mean marker-module expression per RNA domain, highest-scoring domain first.
+
+    Only the ranking across domains is meaningful; the absolute values inherit
+    whatever normalisation ``source_rna.X`` currently carries. Use this to
+    confirm which cluster code each region alias in ``domain_aliases`` refers
+    to before quoting a region name in the text.
+    """
+    from scipy import sparse
+
+    modules = DOMAIN_MARKER_MODULES if modules is None else modules
+    lab = stats['labels']['RNA_clusters']
+    cols = {}
+    for name, genes in modules.items():
+        present = [g for g in genes if g in source_rna.var_names]
+        if not present:
+            print(f'{name}: none of {genes} present in var_names, skipped')
+            continue
+        if len(present) < len(genes):
+            print(f'{name}: using {present} ({set(genes) - set(present)} absent)')
+        X = source_rna[lab.index, present].X
+        v = np.asarray(X.todense() if sparse.issparse(X) else X).mean(axis=1)
+        cols[name] = pd.Series(v, index=lab.index).groupby(lab).mean()
+    out = pd.DataFrame(cols)
+    for name in out.columns:
+        print(f'{name}: top domains ' +
+              ', '.join(f'{d} ({v:.2f})'
+                        for d, v in out[name].nlargest(3).items()))
+    return out
+
+
 def place_scatter_labels(ax, x, y, labels, fontsize=7, color='0.35',
                          radii=(6.0, 12.0, 19.0, 27.0), pad=1.5, avoid=()):
     """Annotate points, choosing each label's offset so none collide.
@@ -4802,6 +4847,8 @@ def plot_spatial_structure_figure(
     smooth_k=7,
     figsize=(11.0, 9.8),
     dpi=600,
+    panel_b_metric='gap',
+    domain_aliases=None,
 ):
     """Four-panel composite, written as SVG (for assembly) and PNG (for LaTeX).
 
@@ -4809,6 +4856,23 @@ def plot_spatial_structure_figure(
     map axes: ``fig.colorbar(ax=...)`` shrinks its donors by an amount that
     depends on their aspect, which is what makes stacked map blocks drift out of
     alignment and lets one colourbar's labels land on top of the block below.
+
+    ``panel_b_metric`` selects what panel (b) plots against contiguity:
+
+    * ``'gap'`` (default) -- the teacher-minus-student difference in kNN
+      agreement, i.e. the spatial signal lost in distillation. Lower is better.
+    * ``'retention'`` -- the student/teacher ratio. Higher is better, which reads
+      more naturally, but it is the weaker statistic (rho ~ -0.55 against
+      rho ~ +0.73): variation common to both arms cancels in a subtraction and
+      re-enters a ratio through the denominator.
+
+    The default is ``'gap'`` so that the figure shows the same statistic the text
+    quotes; a figure showing a non-significant trend beside prose quoting a
+    significant one invites the reader to assume they are the same number.
+
+    ``domain_aliases`` maps cluster codes to display labels in panel (b), so that
+    the two domains the text discusses are identifiable without a lookup. Confirm
+    any mapping with :func:`domain_marker_summary` before adding it.
     """
     import matplotlib as mpl
     from matplotlib.gridspec import GridSpec
@@ -4817,6 +4881,21 @@ def plot_spatial_structure_figure(
 
     xy, pitch, arms = stats['xy'], stats['pitch'], SPATIAL_STRUCTURE_ARMS
     dom, errors = stats['domains'], stats['errors']
+    domain_aliases = {'R5': 'R5 (white matter)',
+                      'R2': 'R2 (striatum)'} if domain_aliases is None else domain_aliases
+
+    if panel_b_metric == 'gap':
+        y_b = dom['distil_gap']
+        ylab_b = ('spatial signal lost in distillation\n'
+                  '(teacher $-$ student kNN agreement)')
+        rho_b, pval_b, loo_b = stats['rho'], stats['pval'], stats['loo']
+    elif panel_b_metric == 'retention':
+        y_b = dom['retention']
+        ylab_b = 'kNN agreement retained\n(student / teacher)'
+        rho_b, pval_b, loo_b = stats['rho_ret'], stats['pval_ret'], stats['loo_ret']
+    else:
+        raise ValueError("panel_b_metric must be 'gap' or 'retention', "
+                         f'got {panel_b_metric!r}')
 
     ## light spatial smoothing for legibility only: per-spot rates are estimated
     ## from ~n_splits/2 draws and land on a visibly coarse grid without it
@@ -4852,6 +4931,11 @@ def plot_spatial_structure_figure(
         xy[rng.integers(0, len(xy), n_e)] - xy[rng.integers(0, len(xy), n_e)],
         axis=1) / pitch
     curves = {a: errors[a][~np.isnan(errors[a])].ravel() for a in arms}
+    ## the molecular baseline is drawn, not only tabulated: "raw expression sits
+    ## at the floor" is a load-bearing rung of the ladder the text quotes, and a
+    ## reader should be able to see it rather than take it on trust
+    e_pcs = errors['expression PCs']
+    curves['expression PCs'] = e_pcs[~np.isnan(e_pcs)].ravel()
     curves['random floor'] = floor
     ## Each arm holds ~n_splits/2 errors per spot, so plotting the raw sorted
     ## values would emit a polyline with hundreds of thousands of vertices per
@@ -4872,28 +4956,38 @@ def plot_spatial_structure_figure(
     ax_a.set_xlabel('position error (spot widths)', fontsize=9)
     ax_a.set_ylabel('cumulative fraction', fontsize=9)
     ax_a.tick_params(labelsize=8)
-    ax_a.legend(fontsize=7, frameon=True, loc='upper left')
+    ax_a.legend(fontsize=6.5, frameon=True, loc='upper left',
+                labelspacing=0.32, handlelength=1.9, borderpad=0.4)
+    ## six curves, but only one pair of them is a controlled contrast. Without
+    ## this the reader is free to read student-vs-MultiVI as the primary claim,
+    ## when that pair differs in backbone, objective and training data at once.
+    ax_a.text(0.97, 0.05, 'student vs non-spatial:\nmatched distillation contrast',
+              transform=ax_a.transAxes, fontsize=6.5, ha='right', va='bottom',
+              color='0.35', linespacing=1.35)
     ax_a.set_box_aspect(1)
     ax_a.text(-0.16, 1.04, 'a', transform=ax_a.transAxes, fontsize=15, fontweight='bold')
 
     ## ---- (b) contiguity against the distillation gap ---------------------
     ax_d = fig.add_subplot(gs[0, 2:4])
-    ax_d.scatter(dom['contiguity'], dom['retention'], s=34, linewidths=0.6,
+    ax_d.scatter(dom['contiguity'], y_b, s=34, linewidths=0.6,
                  facecolor='#1b7837', edgecolor='white', zorder=3)
     ax_d.margins(x=0.11, y=0.13)          # room for labels pushed outward
     ax_d.set_xlabel('neighbourhood contiguity', fontsize=9)
-    ax_d.set_ylabel('kNN agreement retained\n(student / teacher)', fontsize=9)
+    ax_d.set_ylabel(ylab_b, fontsize=9)
     ax_d.yaxis.set_label_position('right')
     ax_d.yaxis.tick_right()
     ax_d.tick_params(labelsize=8)
-    ax_d.text(0.03, 0.05,
-              rf'$\rho$ = {stats["rho_ret"]:.2f}, $p$ = {stats["pval_ret"]:.3f}'
+    ## a positive trend fills the upper-left and lower-right corners; the stats
+    ## block goes in whichever corner the trend leaves empty
+    corner = (0.03, 0.97, 'top') if rho_b > 0 else (0.03, 0.05, 'bottom')
+    ax_d.text(corner[0], corner[1],
+              rf'$\rho$ = {rho_b:.2f}, $p$ = {pval_b:.3f}'
               '\n'
-              rf'LOO $\rho \in$ [{stats["loo_ret"].min():.2f}, {stats["loo_ret"].max():.2f}]',
-              transform=ax_d.transAxes, fontsize=7, va='bottom', color='0.3')
+              rf'LOO $\rho \in$ [{loo_b.min():.2f}, {loo_b.max():.2f}]',
+              transform=ax_d.transAxes, fontsize=7, va=corner[2], color='0.3')
     ## placed last so the domain labels can steer around the stats block
-    place_scatter_labels(ax_d, dom['contiguity'].to_numpy(),
-                         dom['retention'].to_numpy(), list(dom.index),
+    place_scatter_labels(ax_d, dom['contiguity'].to_numpy(), y_b.to_numpy(),
+                         [domain_aliases.get(d, d) for d in dom.index],
                          avoid=[ax_d.texts[-1]])
     for s in ('top', 'left'):
         ax_d.spines[s].set_visible(False)
@@ -4966,7 +5060,13 @@ spatial_structure_stats = compute_spatial_structure_stats(
 )
 print(spatial_structure_stats['domains']
       .sort_values('contiguity')[['contiguity', 'size', 'teacher', 'student',
-                                  'distil_gap', 'over_floor']].round(3))
+                                  'distil_gap', 'retention', 'over_floor']].round(3))
+## confirms which cluster codes the region aliases in panel (b) refer to
+domain_marker_summary(source_rna, spatial_structure_stats)
+
+## NOTE: this overwrites figures/3_spatial_ecdf_analysis.{svg,png}, including any
+## manual polish applied to them in Inkscape. Pass filename='...' to write a new
+## pair and merge by hand instead.
 spatial_structure_fig, spatial_structure_paths = plot_spatial_structure_figure(
     spatial_structure_stats
 )
