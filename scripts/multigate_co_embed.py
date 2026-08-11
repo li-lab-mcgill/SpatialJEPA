@@ -4733,7 +4733,7 @@ def compute_spatial_structure_stats(
 
 
 def place_scatter_labels(ax, x, y, labels, fontsize=7, color='0.35',
-                         radii=(6.0, 12.0, 19.0, 27.0), pad=1.5):
+                         radii=(6.0, 12.0, 19.0, 27.0), pad=1.5, avoid=()):
     """Annotate points, choosing each label's offset so none collide.
 
     Three of the eleven domains sit almost on top of one another at the low-
@@ -4743,6 +4743,11 @@ def place_scatter_labels(ax, x, y, labels, fontsize=7, color='0.35',
     placed wins, so the layout is deterministic and reproducible rather than
     dependent on a stochastic solver. Falls back to the least-overlapping
     candidate when a point is genuinely boxed in.
+
+    ``avoid`` takes artists already drawn on the axes -- an annotation block, a
+    legend -- whose extents join the keep-out set. Without it a label can clear
+    every point and still land on top of text added earlier, which the collision
+    test would never see.
     """
     import matplotlib.transforms as mtransforms
 
@@ -4758,6 +4763,7 @@ def place_scatter_labels(ax, x, y, labels, fontsize=7, color='0.35',
     ## markers are keep-out zones too, else labels land on neighbouring points
     keepout = [mtransforms.Bbox.from_bounds(px - 4.5, py - 4.5, 9.0, 9.0)
                for px, py in pts]
+    keepout += [a.get_window_extent(rend).padded(pad) for a in avoid]
     angles = (0.0, 40.0, -40.0, 90.0, -90.0, 140.0, -140.0, 180.0)
 
     for xi, yi, lab in zip(np.asarray(x), np.asarray(y), labels):
@@ -4791,10 +4797,10 @@ def place_scatter_labels(ax, x, y, labels, fontsize=7, color='0.35',
 
 def plot_spatial_structure_figure(
     stats,
-    filename='3_spatial_structure',
+    filename='3_spatial_ecdf_analysis',
     save_dir=CIBB_FIGURES_DIR,
     smooth_k=7,
-    figsize=(11.0, 10.4),
+    figsize=(11.0, 9.8),
     dpi=600,
 ):
     """Four-panel composite, written as SVG (for assembly) and PNG (for LaTeX).
@@ -4830,7 +4836,7 @@ def plot_spatial_structure_figure(
     ## otherwise run into the column titles of the map block below, and hspace
     ## applies uniformly so it cannot open that one gap on its own
     gs = GridSpec(4, 5, figure=fig, width_ratios=[1, 1, 1, 1, 0.09],
-                  height_ratios=[1.9, 0.18, 1, 1], hspace=0.25, wspace=0.10)
+                  height_ratios=[1.5, 0.18, 1, 1], hspace=0.25, wspace=0.10)
 
     def _bare(ax):
         ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
@@ -4847,10 +4853,17 @@ def plot_spatial_structure_figure(
         axis=1) / pitch
     curves = {a: errors[a][~np.isnan(errors[a])].ravel() for a in arms}
     curves['random floor'] = floor
+    ## Each arm holds ~n_splits/2 errors per spot, so plotting the raw sorted
+    ## values would emit a polyline with hundreds of thousands of vertices per
+    ## curve. Evaluating the ECDF on a log grid is exact at every plotted x and
+    ## visually identical, and keeps the curves vector (crisp, editable) rather
+    ## than forcing them to be rasterised like the maps below.
+    grid = np.logspace(0.0, np.log10(stats['xmax']), 400)
     for name, e in curves.items():
         ls, lw = SPATIAL_STRUCTURE_STYLE[name]
-        x = np.sort(np.clip(e, 1.0, None))
-        ax_a.plot(x, np.arange(1, len(x) + 1) / len(x), ls, lw=lw,
+        srt = np.sort(np.clip(e, 1.0, None))
+        cdf = np.searchsorted(srt, grid, side='right') / len(srt)
+        ax_a.plot(grid, cdf, ls, lw=lw,
                   color=SPATIAL_STRUCTURE_COLORS[name],
                   label=f'MultiGATE {name}' if name in ('teacher', 'student', 'non-spatial') else name)
     ax_a.axvline(2.0, color='0.6', lw=0.8, ls=':')
@@ -4868,8 +4881,6 @@ def plot_spatial_structure_figure(
     ax_d.scatter(dom['contiguity'], dom['retention'], s=34, linewidths=0.6,
                  facecolor='#1b7837', edgecolor='white', zorder=3)
     ax_d.margins(x=0.11, y=0.13)          # room for labels pushed outward
-    place_scatter_labels(ax_d, dom['contiguity'].to_numpy(),
-                         dom['retention'].to_numpy(), list(dom.index))
     ax_d.set_xlabel('neighbourhood contiguity', fontsize=9)
     ax_d.set_ylabel('kNN agreement retained\n(student / teacher)', fontsize=9)
     ax_d.yaxis.set_label_position('right')
@@ -4880,6 +4891,10 @@ def plot_spatial_structure_figure(
               '\n'
               rf'LOO $\rho \in$ [{stats["loo_ret"].min():.2f}, {stats["loo_ret"].max():.2f}]',
               transform=ax_d.transAxes, fontsize=7, va='bottom', color='0.3')
+    ## placed last so the domain labels can steer around the stats block
+    place_scatter_labels(ax_d, dom['contiguity'].to_numpy(),
+                         dom['retention'].to_numpy(), list(dom.index),
+                         avoid=[ax_d.texts[-1]])
     for s in ('top', 'left'):
         ax_d.spines[s].set_visible(False)
     ax_d.set_box_aspect(1)
@@ -4891,8 +4906,11 @@ def plot_spatial_structure_figure(
     ## values are tabulated in stats['domains'] for the text.
     for c, a in enumerate(arms):
         ax = _bare(fig.add_subplot(gs[2, c]))
+        ## ~9k markers per map x 7 maps: rasterised so the SVG carries an image
+        ## per panel instead of tens of thousands of vector circles. Axes, text
+        ## and colour bars stay vector, so labels remain editable in Inkscape.
         sca_b = ax.scatter(xy[:, 0], xy[:, 1], c=sm(stats['auc'][a]), s=3.0,
-                           linewidths=0, cmap=seq, vmin=0, vmax=1)
+                           linewidths=0, cmap=seq, vmin=0, vmax=1, rasterized=True)
         ax.set_title(f'{a}\narea {np.nanmean(stats["auc"][a]):.2f}', fontsize=9, pad=5)
         if c == 0:
             ax.text(-0.22, 1.02, 'c', transform=ax.transAxes,
@@ -4914,7 +4932,7 @@ def plot_spatial_structure_figure(
         ax = _bare(fig.add_subplot(gs[3, c]))
         v = sm(stats['contrast'][key]) if key == 'per spot' else stats['contrast'][key]
         sca_c = ax.scatter(xy[:, 0], xy[:, 1], c=v, s=3.0, linewidths=0,
-                           cmap=div, vmin=-vlim, vmax=vlim)
+                           cmap=div, vmin=-vlim, vmax=vlim, rasterized=True)
         lo, hi = stats['contrast'][key].min(), stats['contrast'][key].max()
         ax.set_title(f'{key}\n{lo:+.2f} to {hi:+.2f}', fontsize=9, pad=5)
         if c == 0:
