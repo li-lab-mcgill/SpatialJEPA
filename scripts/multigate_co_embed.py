@@ -3785,7 +3785,9 @@ ax = g.axes.flat[0]
 ax.set_ylabel('Correlation coefficient ($\\rho$)')
 plt.show()
 
-#%% LIANA+ inflow analysis
+#%% LIANA+ inflow analysis — helpers
+## Defs + source MultiVI load only. No sc.tl.ingest here: that lives in a later cell
+## so an interrupt during ingest does not discard source Inflow / collapsed-NMF state.
 import plotnine as p9
 import gc
 from sklearn.model_selection import StratifiedShuffleSplit
@@ -4322,27 +4324,14 @@ source_fusion.X = source_fusion.layers['fusion_scores'].copy()
 del source_rna.layers['fusion_scores']
 '''
 
-## format combined_gp_dict to adapt to LIANA+
+#%% LIANA+ inflow analysis — source Inflow / NMF
+## Source path only. Does not call sc.tl.ingest; safe to interrupt the later target
+## ingest / UMAP-ingest cells without losing these results.
 resource = li.rs.select_resource('mouseconsensus')
 
-## ingest RNA_cluster assign RNA_clusters to target_rna
-print("Ingesting RNA_clusters to target_rna...")
-sc.tl.ingest(target_concat_adata, source_concat_adata, embedding_method='umap', obs='RNA_clusters', inplace=True)
-print("RNA_clusters ingested to target_rna")
-
-ingested_rna_clusters = target_concat_adata.obs.loc[
-    target_concat_adata.obs['modality'].eq('rna'), 'RNA_clusters'
-]
-ingested_rna_clusters.index = ingested_rna_clusters.index.str.replace('_rna', '')
-target_rna.obs['RNA_clusters'] = ingested_rna_clusters
-
-## set SCT_data as default assay
 source_rna_liana = source_rna.copy()
 source_rna_liana.X = source_rna_liana.layers['SCT_data'].copy()
-target_rna_liana = target_rna.copy()
-target_rna_liana.X = target_rna_liana.layers['SCT_data'].copy()
 
-## LIANA+ inflow analysis
 source_liana_results = liana_spatial_analysis(
     source_rna_liana,
     subsample_n=5000,
@@ -4364,17 +4353,7 @@ source_liana_collapsed_results = fit_sender_collapsed_inflow_nmf(
     random_state=0,
 )
 
-'''
-target_liana_results = liana_spatial_analysis(
-    target_rna_liana,
-    subsample_n=5000,
-    resource=resource,
-    labels=None, interaction=None, ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
-    )
-'''
-
-## LIANA-MultiGATE comparisons
-
+#%% LIANA-MultiGATE comparisons
 ## Held-out spatial reconstruction: the primary ground-truth spatial claim.
 ## Hide half the source spots, match each hidden spot to its nearest retained spot in
 ## embedding space, and inherit that neighbour's real coordinates as the prediction --
@@ -5143,6 +5122,38 @@ panel_e_results = plot_nmf_domain_enrichment_panel(
     n_show=None,
 )
 
+#%% LIANA+ inflow analysis — target RNA_clusters ingest (slow)
+## Needed only for target_rna LIANA / target panels. Source Inflow + MultiGATE
+## comparison panels above do not depend on this; interrupt here freely.
+print("Ingesting RNA_clusters to target_rna...")
+sc.tl.ingest(
+    target_concat_adata,
+    source_concat_adata,
+    embedding_method='umap',
+    obs='RNA_clusters',
+    inplace=True,
+)
+print("RNA_clusters ingested to target_rna")
+
+ingested_rna_clusters = target_concat_adata.obs.loc[
+    target_concat_adata.obs['modality'].eq('rna'), 'RNA_clusters'
+]
+ingested_rna_clusters.index = ingested_rna_clusters.index.str.replace('_rna', '')
+target_rna.obs['RNA_clusters'] = ingested_rna_clusters
+
+target_rna_liana = target_rna.copy()
+target_rna_liana.X = target_rna_liana.layers['SCT_data'].copy()
+
+'''
+target_liana_results = liana_spatial_analysis(
+    target_rna_liana,
+    subsample_n=5000,
+    resource=resource,
+    labels=None, interaction=None, ncomps=30, bandwidth=40, s=60, cell_type_col="RNA_clusters", spatial_key="spatial"
+    )
+'''
+
+#%% UMAP: ingest nonspatial source leiden (slow viz)
 ## The per-arm ARI/NMI barplot that used to live here scored every arm against a
 ## Leiden partition whose k was set by the referee's own fixed resolution, and scored
 ## the target arms against a referee built on model-imputed coordinates. Both are
