@@ -4777,8 +4777,112 @@ def domain_marker_summary(source_rna, stats, modules=None):
     return out
 
 
+def panel_b_association_tests(stats, cols=('distil_gap', 'retention'),
+                              n_perm=9999, seed=0):
+    """Re-test panel (b)'s association under tests that assume different things.
+
+    Spearman is the reported statistic, and this exists so that choice is
+    checked rather than asserted. Eleven domains with two extreme ones is
+    exactly the configuration in which the choice of test can decide the
+    verdict, so all of the following are computed on the same points:
+
+    * **Spearman** ``r_s`` with scipy's asymptotic p *and* a permutation p.
+      At n = 11 the asymptotic p is a t-approximation whose tail is not
+      trustworthy to the third decimal -- awkward when the number lands near
+      0.05. The permutation p assumes nothing; prefer it when they disagree.
+    * **Kendall** ``tau_b``, the other rank coefficient. It is generally the
+      better-behaved of the two at this sample size, so a Spearman value it
+      fails to corroborate is a Spearman value resting on how the ranks
+      happen to space out.
+    * **Pearson** ``r`` on the raw values: the scale-sensitive alternative,
+      using the magnitudes Spearman discards. It buys that sensitivity by
+      assuming a straight line *and* by letting the most extreme domains set
+      the slope, so its leave-one-out range is reported beside it. A Pearson
+      p that is small only until one domain is dropped is not evidence.
+    * **Curvature**: OLS of ``y`` on centred ``x`` and ``x^2``, with the
+      nested F-test of whether the quadratic term earns its degree of
+      freedom. This is the test of "it looks quadratic" -- but note that on
+      the retention column any curvature is partly arithmetic rather than
+      biological, since ``retention = 1 - gap / teacher`` bends a linear gap
+      through its varying denominator.
+
+    A conclusion that holds across all four is a conclusion about the data; one
+    that holds only under the most favourable test is a conclusion about the
+    test.
+    """
+    from scipy import stats as sps
+
+    d = stats['domains']
+    x = d['contiguity'].to_numpy(float)
+    n = len(x)
+
+    def _pearson(a, b, axis=-1):
+        """Vectorised so the permutation loop stays cheap; on ranks this is r_s."""
+        a = a - a.mean(axis=axis, keepdims=True)
+        b = b - b.mean(axis=axis, keepdims=True)
+        return ((a * b).sum(axis=axis)
+                / np.sqrt((a ** 2).sum(axis=axis) * (b ** 2).sum(axis=axis)))
+
+    def _perm_p(a, b, stat, **kw):
+        return float(sps.permutation_test(
+            (a, b), stat, permutation_type='pairings', alternative='two-sided',
+            n_resamples=n_perm, rng=np.random.default_rng(seed), **kw).pvalue)
+
+    rows = {}
+    for col in cols:
+        y = d[col].to_numpy(float)
+        sp, kt, pe = sps.spearmanr(x, y), sps.kendalltau(x, y), sps.pearsonr(x, y)
+        ## permuting the pairings of the ranks is the same experiment as
+        ## permuting the pairings of the values and ranking afterwards, so this
+        ## is an exact Spearman permutation test at vectorised speed
+        rx, ry = sps.rankdata(x), sps.rankdata(y)
+        loo_r = np.array([sps.pearsonr(np.delete(x, i), np.delete(y, i)).statistic
+                          for i in range(n)])
+
+        ## linear against quadratic, x centred so the quadratic term is not just
+        ## restating the linear one through their collinearity
+        xc = x - x.mean()
+        designs = (np.column_stack([np.ones(n), xc]),
+                   np.column_stack([np.ones(n), xc, xc ** 2]))
+        rss = [float(((y - A @ np.linalg.lstsq(A, y, rcond=None)[0]) ** 2).sum())
+               for A in designs]
+        tss = float(((y - y.mean()) ** 2).sum())
+        f_quad = ((rss[0] - rss[1]) / 1.0) / (rss[1] / (n - 3))
+
+        rows[col] = {
+            'spearman_rs': sp.statistic,
+            'spearman_p_asymp': sp.pvalue,
+            'spearman_p_perm': _perm_p(rx, ry, _pearson, vectorized=True),
+            'kendall_tau': kt.statistic,
+            'kendall_p_perm': _perm_p(
+                x, y, lambda a, b: sps.kendalltau(a, b).statistic),
+            'pearson_r': pe.statistic,
+            'pearson_p_perm': _perm_p(x, y, _pearson, vectorized=True),
+            'pearson_loo_min': loo_r.min(), 'pearson_loo_max': loo_r.max(),
+            'R2_linear': 1.0 - rss[0] / tss,
+            'R2_quadratic': 1.0 - rss[1] / tss,
+            'quad_F': f_quad, 'quad_p': float(sps.f.sf(f_quad, 1, n - 3)),
+        }
+
+    out = pd.DataFrame(rows).T
+    for col, r in out.iterrows():
+        print(f'\n{col} vs contiguity  (n = {n}, {n_perm} permutations)')
+        print(f"  Spearman  r_s = {r['spearman_rs']:+.3f}  "
+              f"p_asymp = {r['spearman_p_asymp']:.4f}  "
+              f"p_perm = {r['spearman_p_perm']:.4f}")
+        print(f"  Kendall   tau = {r['kendall_tau']:+.3f}  "
+              f"p_perm = {r['kendall_p_perm']:.4f}")
+        print(f"  Pearson   r   = {r['pearson_r']:+.3f}  "
+              f"p_perm = {r['pearson_p_perm']:.4f}  "
+              f"LOO r in [{r['pearson_loo_min']:+.3f}, {r['pearson_loo_max']:+.3f}]")
+        print(f"  Curvature R2 {r['R2_linear']:.3f} -> {r['R2_quadratic']:.3f}  "
+              f"F(1,{n - 3}) = {r['quad_F']:.2f}  p = {r['quad_p']:.4f}")
+    return out
+
+
 def place_scatter_labels(ax, x, y, labels, fontsize=7, color='0.35',
-                         radii=(6.0, 12.0, 19.0, 27.0), pad=1.5, avoid=()):
+                         radii=(6.0, 12.0, 19.0, 27.0), pad=1.5, avoid=(),
+                         keep_inside=True):
     """Annotate points, choosing each label's offset so none collide.
 
     Three of the eleven domains sit almost on top of one another at the low-
@@ -4810,6 +4914,11 @@ def place_scatter_labels(ax, x, y, labels, fontsize=7, color='0.35',
                for px, py in pts]
     keepout += [a.get_window_extent(rend).padded(pad) for a in avoid]
     angles = (0.0, 40.0, -40.0, 90.0, -90.0, 140.0, -140.0, 180.0)
+    ## a label on an edge point has no neighbour to collide with, so collision
+    ## scoring alone happily pushes it off the axes and into the tick labels.
+    ## Area falling outside the axes is charged at the same rate as a collision,
+    ## which turns edge points around without disturbing interior ones.
+    frame = ax.get_window_extent() if keep_inside else None
 
     for xi, yi, lab in zip(np.asarray(x), np.asarray(y), labels):
         t = ax.annotate(str(lab), (xi, yi), textcoords='offset points',
@@ -4826,6 +4935,9 @@ def place_scatter_labels(ax, x, y, labels, fontsize=7, color='0.35',
                 t.set_va(va)
                 bb = t.get_window_extent(rend).padded(pad)
                 score = sum(_overlap(bb, k) for k in keepout)
+                if frame is not None:
+                    area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0)
+                    score += area - _overlap(bb, frame)     # spill past the axes
                 if score < best_score:
                     best, best_score = (dx, dy, ha, va), score
                 if best_score == 0.0:
@@ -4840,6 +4952,220 @@ def place_scatter_labels(ax, x, y, labels, fontsize=7, color='0.35',
     return ax
 
 
+## Three readings of the same ordering, differing in what they cost.
+##
+## 'shortfall' is the default: it is the *same statistic* as 'gap', negated, so
+## it keeps the significant p-value while putting the good end at the top and
+## running the cloud from upper-left to lower-right, which is how a reader
+## expects a "more context, more loss" relationship to look. Negation is exact
+## for a rank correlation -- it reverses the ranks and nothing else -- so the
+## p-value is untouched and only the sign of r_s flips.
+##
+## 'gap' is the same numbers with the axis the other way up: r_s is positive,
+## matching the text's teacher-minus-student framing, but up is worse.
+##
+## 'retention' is the ratio. It reads the natural way round with strictly
+## positive values, but it is the weaker statistic (p = 0.083 against 0.011),
+## because variation common to both arms cancels in a difference and re-enters
+## a ratio through the denominator.
+##
+## No rescaling of the ratio recovers that, so do not go looking for one:
+## log(r+1), log(r), sqrt(r), logit(r) and r**3 all leave the Spearman p-value
+## bit-identical (checked to 0.0e+00 across 20000 random contiguity vectors),
+## because a strictly monotone transform preserves ranks and a rank correlation
+## sees nothing else. The weakness is the denominator, not the functional form:
+## dividing discards what a difference keeps, and nothing applied afterwards
+## brings it back. Such a transform would move Pearson, which does see
+## magnitudes, but choosing one post hoc because it lowers a p-value is
+## dredging -- at n = 11 with two extreme domains, indefensibly so.
+##
+## ``negate`` flips a column and its correlation together, so a derived reading
+## cannot drift from the statistics it was derived from.
+CONTIGUITY_PANEL_METRICS = {
+    'shortfall': {
+        'col': 'distil_gap', 'negate': True,
+        ## the axis is a signed difference and every value is <= 0, so it must
+        ## not be described as an amount "retained" or "lost": a retention of
+        ## -0.10 is incoherent, and a loss that improves as it grows reads
+        ## backwards. Name the quantity and anchor the zero instead, and let the
+        ## direction note carry which way is good.
+        'ylabel': ('student $-$ teacher kNN agreement\n'
+                   '($0$ = student matches teacher)'),
+        'stat_keys': ('rho', 'pval', 'loo'),
+        'direction': r'$\uparrow$ student closer to teacher',
+    },
+    'gap': {
+        'col': 'distil_gap',
+        'ylabel': ('spatial signal lost in distillation\n'
+                   '(teacher $-$ student kNN agreement)'),
+        'stat_keys': ('rho', 'pval', 'loo'),
+        'direction': r'$\downarrow$ student closer to teacher',
+    },
+    'retention': {
+        'col': 'retention',
+        'ylabel': 'kNN agreement retained\n(student / teacher)',
+        'stat_keys': ('rho_ret', 'pval_ret', 'loo_ret'),
+        'direction': r'$\uparrow$ student closer to teacher',
+    },
+}
+
+## y axis on the right: panel (b) sits in the right half of the composite, so
+## this is what makes it read as part of it. All four spines are drawn, matching
+## panel (a). Kept here rather than in the composite so a standalone matches.
+## axes_size_in is measured, not guessed: contiguity_panel_box_size() on the
+## composite at its default figsize=(11.0, 9.8) reports 2.59 in square.
+CONTIGUITY_PANEL_DEFAULTS = {'axes_size_in': 2.59, 'panel_letter': 'b'}
+
+
+def draw_contiguity_panel(ax, stats, panel_b_metric='shortfall', domain_aliases=None,
+                          panel_letter='b', direction_note=True):
+    """Draw panel (b) into an existing axes. Single source of the panel's look.
+
+    Both :func:`plot_spatial_structure_figure` and :func:`plot_contiguity_panel`
+    route through here, so a panel re-rendered on its own cannot drift from the
+    one it is meant to replace in the composite.
+
+    ``direction_note`` puts an arrow-and-phrase in the corner the trend leaves
+    empty, saying which way is the good way. Pass a string to override the
+    wording, or ``False`` to drop it. It matters most under ``'gap'``, whose y
+    axis is a *loss*, but it is kept under every metric so that switching
+    between them can never silently reverse what the panel appears to claim.
+
+    Returns ``(y, rho, pval, loo)`` -- the plotted series and its statistics, so
+    a caller can quote the same numbers it just drew.
+    """
+    dom = stats['domains']
+    domain_aliases = {'R5': 'R5 (white matter)',
+                      'R2': 'R2 (striatum)'} if domain_aliases is None else domain_aliases
+    if panel_b_metric not in CONTIGUITY_PANEL_METRICS:
+        raise ValueError(
+            f'panel_b_metric must be one of {sorted(CONTIGUITY_PANEL_METRICS)}, '
+            f'got {panel_b_metric!r}')
+    spec = CONTIGUITY_PANEL_METRICS[panel_b_metric]
+    rho, pval, loo = (stats[k] for k in spec['stat_keys'])
+    y = dom[spec['col']]
+    ## negating a column negates its rank correlation exactly and leaves the
+    ## p-value alone, so the flip is applied to both here rather than recomputed
+    if spec.get('negate', False):
+        y, rho, loo = -y, -rho, -loo
+
+    ax.scatter(dom['contiguity'], y, s=34, linewidths=0.6,
+               facecolor='#1b7837', edgecolor='white', zorder=3)
+    ax.margins(x=0.11, y=0.13)          # room for labels pushed outward
+    ax.set_xlabel('neighbourhood contiguity', fontsize=9)
+    ax.set_ylabel(spec['ylabel'], fontsize=9)
+    ax.yaxis.set_label_position('right')
+    ax.yaxis.tick_right()
+    ax.tick_params(labelsize=8)
+    ## a positive trend fills the lower-left and upper-right corners, a negative
+    ## one the other two; the stats block and the direction note take whichever
+    ## pair the trend leaves empty
+    if rho > 0:
+        corner, dir_corner = (0.03, 0.97, 'top'), (0.97, 0.03, 'bottom', 'right')
+    else:
+        corner, dir_corner = (0.03, 0.05, 'bottom'), (0.97, 0.97, 'top', 'right')
+    ## the coefficient is written $r_s$, not $\rho$: in the sans-serif mathtext
+    ## face this figure uses, rho and p are near-indistinguishable glyphs, so
+    ## "rho = -0.55, p = 0.083" reads as one quantity stated twice. $r_s$ is the
+    ## other standard notation for Spearman's coefficient and shares no glyph
+    ## with p, so the p-value keeps the lowercase form used in the text. Naming
+    ## the test as well keeps the panel readable without the caption.
+    p_txt = f'$p$ = {pval:.3f}' if pval >= 5e-4 else '$p$ < 0.001'
+    ax.text(corner[0], corner[1],
+            rf'Spearman $r_s$ = {rho:.2f}, ' + p_txt
+            + '\n'
+            + rf'LOO $r_s \in$ [{loo.min():.2f}, {loo.max():.2f}]',
+            transform=ax.transAxes, fontsize=7, va=corner[2], color='0.3')
+    ## which way is good. The 'gap' axis is a loss, so without this the panel
+    ## reads upside down to anyone skimming it: the best domains sit at the
+    ## bottom, where a reader expects the worst ones.
+    if direction_note:
+        note = (spec['direction'] if direction_note is True else direction_note)
+        ax.text(dir_corner[0], dir_corner[1], note, transform=ax.transAxes,
+                fontsize=7, va=dir_corner[2], ha=dir_corner[3], color='0.45')
+    ## placed last so the domain labels can steer around both annotations
+    place_scatter_labels(ax, dom['contiguity'].to_numpy(), y.to_numpy(),
+                         [domain_aliases.get(d, d) for d in dom.index],
+                         avoid=list(ax.texts))
+    ## all four spines, matching panel (a): a scatter reads as a plot, not as a
+    ## pair of axes, and the box is what separates it from the panel beside it
+    ax.set_box_aspect(1)
+    if panel_letter:
+        ax.text(-0.06, 1.04, panel_letter, transform=ax.transAxes,
+                fontsize=15, fontweight='bold')
+    return y, rho, pval, loo
+
+
+def plot_contiguity_panel(stats, filename='3b_contiguity_panel',
+                          save_dir=CIBB_FIGURES_DIR, dpi=600,
+                          axes_size_in=CONTIGUITY_PANEL_DEFAULTS['axes_size_in'],
+                          panel_b_metric='shortfall', domain_aliases=None,
+                          panel_letter=CONTIGUITY_PANEL_DEFAULTS['panel_letter'],
+                          direction_note=True):
+    """Panel (b) on its own, sized to drop straight back into the composite.
+
+    Use this to re-render one panel without re-running
+    :func:`plot_spatial_structure_figure`, which would overwrite the composite
+    and discard any manual polish applied to it.
+
+    The axes box is placed at exactly ``axes_size_in`` inches square, which is
+    the size it occupies in the composite, so the SVG imports at 1:1 into the
+    assembled figure and no type needs rescaling by hand. ``bbox_inches='tight'``
+    trims the surrounding canvas but leaves the axes box itself untouched, so
+    that guarantee survives the save. Measure the target with
+    ``contiguity_panel_box_size()`` if the composite's geometry ever changes.
+
+    Pass ``panel_letter=None`` to omit the bold 'b' if the assembly tool is
+    supplying panel letters itself.
+    """
+    ## generous margins: the two-line y label and its ticks sit on the right,
+    ## the x label below, the panel letter above-left. Oversizing is free
+    ## because the tight bbox trims whatever is left over.
+    fig = plt.figure(figsize=(axes_size_in + 1.9, axes_size_in + 0.9))
+    w, h = fig.get_figwidth(), fig.get_figheight()
+    ax = fig.add_axes([0.35 / w, 0.55 / h, axes_size_in / w, axes_size_in / h])
+
+    y, rho, pval, loo = draw_contiguity_panel(
+        ax, stats, panel_b_metric=panel_b_metric,
+        domain_aliases=domain_aliases, panel_letter=panel_letter,
+        direction_note=direction_note)
+    print(f'panel (b) [{panel_b_metric}]: r_s = {rho:+.3f}, p = {pval:.4f}, '
+          f'LOO r_s in [{loo.min():+.3f}, {loo.max():+.3f}], n = {len(y)}')
+
+    os.makedirs(save_dir, exist_ok=True)
+    paths = []
+    for ext in ('svg', 'png'):
+        p = os.path.join(save_dir, f'{filename}.{ext}')
+        ## svg.fonttype 'none' keeps text as text, so the labels stay editable
+        ## and re-typesettable once the panel is placed in the assembly tool
+        with plt.rc_context({'svg.fonttype': 'none'}):
+            fig.savefig(p, format=ext, dpi=dpi, bbox_inches='tight',
+                        transparent=(ext == 'svg'))
+        paths.append(p)
+        print(f'Saved: {p}')
+    plt.show()
+    return fig, paths
+
+
+def contiguity_panel_box_size(fig=None):
+    """Size of panel (b)'s axes box, in inches, as drawn in the composite.
+
+    ``plot_contiguity_panel``'s ``axes_size_in`` default is this number. Re-run
+    it after any change to the composite's ``figsize`` or gridspec ratios and
+    update the default, otherwise standalone panels stop importing at 1:1.
+    """
+    if fig is None:
+        raise ValueError('pass the figure returned by plot_spatial_structure_figure')
+    ## panel (b) is the axes at gs[0, 2:4]; it is the only one with its y axis
+    ## on the right, which identifies it without depending on creation order
+    for ax in fig.axes:
+        if ax.yaxis.get_ticks_position() == 'right' and ax.get_xlabel():
+            bb = ax.get_window_extent().transformed(fig.dpi_scale_trans.inverted())
+            print(f'panel (b) axes box: {bb.width:.3f} x {bb.height:.3f} in')
+            return bb.width, bb.height
+    raise LookupError('panel (b) axes not found in this figure')
+
+
 def plot_spatial_structure_figure(
     stats,
     filename='3_spatial_ecdf_analysis',
@@ -4847,7 +5173,7 @@ def plot_spatial_structure_figure(
     smooth_k=7,
     figsize=(11.0, 9.8),
     dpi=600,
-    panel_b_metric='gap',
+    panel_b_metric='shortfall',
     domain_aliases=None,
 ):
     """Four-panel composite, written as SVG (for assembly) and PNG (for LaTeX).
@@ -4857,18 +5183,22 @@ def plot_spatial_structure_figure(
     depends on their aspect, which is what makes stacked map blocks drift out of
     alignment and lets one colourbar's labels land on top of the block below.
 
-    ``panel_b_metric`` selects what panel (b) plots against contiguity:
+    ``panel_b_metric`` selects what panel (b) plots against contiguity; see
+    :data:`CONTIGUITY_PANEL_METRICS` for the full comparison. In brief:
 
-    * ``'gap'`` (default) -- the teacher-minus-student difference in kNN
-      agreement, i.e. the spatial signal lost in distillation. Lower is better.
-    * ``'retention'`` -- the student/teacher ratio. Higher is better, which reads
-      more naturally, but it is the weaker statistic (rho ~ -0.55 against
-      rho ~ +0.73): variation common to both arms cancels in a subtraction and
-      re-enters a ratio through the denominator.
+    * ``'shortfall'`` (default) -- student minus teacher kNN agreement. Higher
+      is better, the cloud runs upper-left to lower-right, and because it is
+      only the sign of ``'gap'`` it keeps that reading's p-value exactly.
+    * ``'gap'`` -- the same numbers as teacher minus student, so r_s is positive
+      and matches the text's framing, but up is worse.
+    * ``'retention'`` -- the student/teacher ratio. Strictly positive and reads
+      naturally, but it is the weaker statistic (rho ~ -0.55 against ~0.73):
+      variation common to both arms cancels in a subtraction and re-enters a
+      ratio through the denominator.
 
-    The default is ``'gap'`` so that the figure shows the same statistic the text
-    quotes; a figure showing a non-significant trend beside prose quoting a
-    significant one invites the reader to assume they are the same number.
+    The default avoids the two failure modes that matter: a figure showing a
+    non-significant trend beside prose quoting a significant one, and a y axis
+    whose best domains sit where a reader expects the worst.
 
     ``domain_aliases`` maps cluster codes to display labels in panel (b), so that
     the two domains the text discusses are identifiable without a lookup. Confirm
@@ -4881,21 +5211,12 @@ def plot_spatial_structure_figure(
 
     xy, pitch, arms = stats['xy'], stats['pitch'], SPATIAL_STRUCTURE_ARMS
     dom, errors = stats['domains'], stats['errors']
-    domain_aliases = {'R5': 'R5 (white matter)',
-                      'R2': 'R2 (striatum)'} if domain_aliases is None else domain_aliases
-
-    if panel_b_metric == 'gap':
-        y_b = dom['distil_gap']
-        ylab_b = ('spatial signal lost in distillation\n'
-                  '(teacher $-$ student kNN agreement)')
-        rho_b, pval_b, loo_b = stats['rho'], stats['pval'], stats['loo']
-    elif panel_b_metric == 'retention':
-        y_b = dom['retention']
-        ylab_b = 'kNN agreement retained\n(student / teacher)'
-        rho_b, pval_b, loo_b = stats['rho_ret'], stats['pval_ret'], stats['loo_ret']
-    else:
-        raise ValueError("panel_b_metric must be 'gap' or 'retention', "
-                         f'got {panel_b_metric!r}')
+    ## validated up front rather than at draw time, so a typo fails before the
+    ## expensive map panels are rendered
+    if panel_b_metric not in CONTIGUITY_PANEL_METRICS:
+        raise ValueError(
+            f'panel_b_metric must be one of {sorted(CONTIGUITY_PANEL_METRICS)}, '
+            f'got {panel_b_metric!r}')
 
     ## light spatial smoothing for legibility only: per-spot rates are estimated
     ## from ~n_splits/2 draws and land on a visibly coarse grid without it
@@ -4968,31 +5289,11 @@ def plot_spatial_structure_figure(
     ax_a.text(-0.16, 1.04, 'a', transform=ax_a.transAxes, fontsize=15, fontweight='bold')
 
     ## ---- (b) contiguity against the distillation gap ---------------------
-    ax_d = fig.add_subplot(gs[0, 2:4])
-    ax_d.scatter(dom['contiguity'], y_b, s=34, linewidths=0.6,
-                 facecolor='#1b7837', edgecolor='white', zorder=3)
-    ax_d.margins(x=0.11, y=0.13)          # room for labels pushed outward
-    ax_d.set_xlabel('neighbourhood contiguity', fontsize=9)
-    ax_d.set_ylabel(ylab_b, fontsize=9)
-    ax_d.yaxis.set_label_position('right')
-    ax_d.yaxis.tick_right()
-    ax_d.tick_params(labelsize=8)
-    ## a positive trend fills the upper-left and lower-right corners; the stats
-    ## block goes in whichever corner the trend leaves empty
-    corner = (0.03, 0.97, 'top') if rho_b > 0 else (0.03, 0.05, 'bottom')
-    ax_d.text(corner[0], corner[1],
-              rf'$\rho$ = {rho_b:.2f}, $p$ = {pval_b:.3f}'
-              '\n'
-              rf'LOO $\rho \in$ [{loo_b.min():.2f}, {loo_b.max():.2f}]',
-              transform=ax_d.transAxes, fontsize=7, va=corner[2], color='0.3')
-    ## placed last so the domain labels can steer around the stats block
-    place_scatter_labels(ax_d, dom['contiguity'].to_numpy(), y_b.to_numpy(),
-                         [domain_aliases.get(d, d) for d in dom.index],
-                         avoid=[ax_d.texts[-1]])
-    for s in ('top', 'left'):
-        ax_d.spines[s].set_visible(False)
-    ax_d.set_box_aspect(1)
-    ax_d.text(-0.06, 1.04, 'b', transform=ax_d.transAxes, fontsize=15, fontweight='bold')
+    ## drawn by the shared helper, which plot_contiguity_panel also calls, so a
+    ## panel re-rendered on its own is byte-for-byte the same panel
+    draw_contiguity_panel(fig.add_subplot(gs[0, 2:4]), stats,
+                          panel_b_metric=panel_b_metric,
+                          domain_aliases=domain_aliases)
 
     ## ---- (c) ECDF area per spot -------------------------------------------
     ## The cluster-averaged rows are dropped from the figure: panel (d) already
@@ -5064,6 +5365,13 @@ print(spatial_structure_stats['domains']
 ## confirms which cluster codes the region aliases in panel (b) refer to
 domain_marker_summary(source_rna, spatial_structure_stats)
 
+## checks that panel (b)'s conclusion is a fact about the eleven domains rather
+## than about Spearman: permutation p-values (the asymptotic one is a
+## t-approximation at n = 11), Kendall as a second rank coefficient, Pearson as
+## the scale-sensitive alternative with its leave-one-out range, and the nested
+## F-test for curvature.
+panel_b_tests = panel_b_association_tests(spatial_structure_stats)
+
 ## NOTE: this overwrites figures/3_spatial_ecdf_analysis.{svg,png}, including any
 ## manual polish applied to them in Inkscape. Pass filename='...' to write a new
 ## pair and merge by hand instead.
@@ -5071,7 +5379,16 @@ spatial_structure_fig, spatial_structure_paths = plot_spatial_structure_figure(
     spatial_structure_stats
 )
 
-## source-side agreement with the Inflow-NMF referee.
+#%% Panel (b) alone, for hand-assembly into the polished composite
+## Run this cell on its own (it needs only spatial_structure_stats) to re-render
+## panel (b) without touching 3_spatial_ecdf_analysis.{svg,png}. The axes box
+## comes out at the same 2.59 in square it occupies in the composite, so the SVG
+## drops in at 1:1 -- import it in Inkscape, delete the old panel, align, done.
+contiguity_panel_fig, contiguity_panel_paths = plot_contiguity_panel(
+    spatial_structure_stats
+)
+
+#%% (continues) source-side agreement with the Inflow-NMF referee.
 ## The target-side referee is deliberately not scored: target spatial coordinates are
 ## imputed from the MultiGATE latent space being evaluated (see target_rna.obsm['spatial']
 ## assignment above), so any target agreement is circular. On the source the referee is
