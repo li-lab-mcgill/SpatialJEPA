@@ -2658,7 +2658,50 @@ sc.tl.score_genes(target_rna, gene_list=striatal_markers, score_name=striatal_sc
 sc.tl.score_genes(target_rna, gene_list=wm_markers, score_name=wm_score_name)
 
 sc.pl.embedding(source_rna, color=[striatal_score_name, wm_score_name], basis='spatial', ncols=2, wspace=0.05, size=60)
-sc.pl.embedding(target_rna, color=[striatal_score_name, wm_score_name], basis='spatial', ncols=2, wspace=0.05, size=60)
+
+## plot and save individual marker UMAPs, into two rows
+
+figure_dir = '/home/mcb/users/dmannk/THESIS_base/overleaf-cibb-2026/figures'
+os.makedirs(figure_dir, exist_ok=True)
+
+# Striatal markers row
+fig_str, axs_str = plt.subplots(1, len(striatal_markers), figsize=(9, 3))
+for i, marker in enumerate(striatal_markers):
+    sc.pl.embedding(
+        source_rna,
+        color=marker,
+        basis='spatial',
+        size=60,
+        ax=axs_str[i],
+        show=False,
+    )
+    axs_str[i].set_xlabel("")
+    axs_str[i].set_ylabel("")
+plt.tight_layout()
+str_row_path = os.path.join(figure_dir, "marker_umaps_striatum.png")
+plt.savefig(str_row_path, dpi=300)
+fig_str.savefig(str_row_path)
+plt.close(fig_str)
+
+# WM markers row
+fig_wm, axs_wm = plt.subplots(1, len(wm_markers), figsize=(6, 3))
+for i, marker in enumerate(wm_markers):
+    sc.pl.embedding(
+        source_rna,
+        color=marker,
+        basis='spatial',
+        size=60,
+        ax=axs_wm[i],
+        show=False,
+    )
+    axs_wm[i].set_xlabel("")
+    axs_wm[i].set_ylabel("")
+plt.tight_layout()
+wm_row_path = os.path.join(figure_dir, "marker_umaps_wm.png")
+fig_wm.savefig(wm_row_path, dpi=300)
+plt.close(fig_wm)
+
+print(f"Saved marker UMAPs to: \n {str_row_path} \n {wm_row_path}")
 
 '''
 source_target_rna = sc.concat([source_rna, target_rna], axis=0)
