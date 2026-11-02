@@ -718,8 +718,17 @@ def parse_args(notebook: bool = False):
         type=int,
         default=20,
         help=(
-            "Number of bootstrap replicates used for the error bars of the scib/FOSCTTM "
-            "barplot. Set to 0 (or 1) to disable error bars."
+            "Number of subsample replicates used for the error bars of the scib metrics "
+            "(each re-runs the full benchmark). Set to 0 (or 1) to disable them."
+        ),
+    )
+    p.add_argument(
+        "--foscttm-n-bootstrap",
+        type=int,
+        default=1000,
+        help=(
+            "Number of bootstrap replicates for the FOSCTTM percentile interval. Cheap "
+            "(resamples precomputed per-cell scores). Set to 0 (or 1) to disable."
         ),
     )
     p.add_argument(
@@ -1648,6 +1657,27 @@ def _spatial_target_from_target_reference(
     )
 
 
+def _leiden_on_X(adata, n_neighbors, resolution, random_state=0):
+    sc.pp.neighbors(adata, use_rep="X", n_neighbors=n_neighbors, knn=True, method="umap",
+                    metric="euclidean", random_state=random_state)
+    sc.tl.leiden(adata, resolution=resolution, random_state=random_state)
+
+
+def _match_clusters_by_overlap(labels, reference_labels):
+    """Rename clusters to the reference cluster they overlap most (one-to-one, Hungarian)."""
+    from scipy.optimize import linear_sum_assignment
+
+    ct = pd.crosstab(pd.Series(np.asarray(reference_labels).astype(str), name="reference"),
+                     pd.Series(np.asarray(labels).astype(str), name="labels"))
+    rows, cols = linear_sum_assignment(-ct.to_numpy())
+    mapping = {ct.columns[j]: ct.index[i] for i, j in zip(rows, cols)}
+    unmatched = sorted(set(ct.columns) - set(mapping), key=int)
+    if unmatched:
+        warnings.warn("Clusters without a one-to-one reference match: {}".format(unmatched))
+        mapping.update({c: "unmatched_" + c for c in unmatched})
+    return np.array([mapping[c] for c in np.asarray(labels).astype(str)]), mapping
+
+
 def run_alignment_and_spatial_plot(
     model,
     source_mgate,
@@ -1662,10 +1692,16 @@ def run_alignment_and_spatial_plot(
     leiden_neighbors: int = 100,
     leiden_resolution: float = 0.5,
     embedding_point_size: float = 50.0,
+    target_leiden: str = "transferred",
 ):
     """
     Full path: inference → MultiGATE in obsm → concat → UMAP ref → ingest → Leiden →
     joint AnnData → spatial → sc.pl.embedding (spatial + UMAP panels).
+
+    target_leiden (source_mgate only): "transferred" copies each target's nearest-source Leiden
+    label; "independent" clusters the target on its own embedding with the same Leiden
+    parameters as the source, then renames each target cluster to the source cluster it
+    overlaps most (target vs nearest-source labels, one-to-one).
     """
 
     # --- 3) Reference-specific UMAP + ingest + Leiden ----------------------------
@@ -1685,13 +1721,36 @@ def run_alignment_and_spatial_plot(
             obs="source_obs_names",
             k=1,
         )
-        sc.pp.neighbors(source_concat_adata, use_rep="X", n_neighbors=leiden_neighbors)
-        sc.tl.leiden(source_concat_adata, resolution=leiden_resolution)
-        target_concat_adata.obs["leiden"] = (
-            source_concat_adata.obs["leiden"]
-            .loc[target_concat_adata.obs["source_obs_names"]]
-            .values
-        )
+        nearest_source_leiden = None
+        if target_leiden == "transferred":
+            sc.pp.neighbors(source_concat_adata, use_rep="X", n_neighbors=leiden_neighbors)
+            sc.tl.leiden(source_concat_adata, resolution=leiden_resolution)
+            target_concat_adata.obs["leiden"] = (
+                source_concat_adata.obs["leiden"]
+                .loc[target_concat_adata.obs["source_obs_names"]]
+                .values
+            )
+        elif target_leiden == "independent":
+            _leiden_on_X(source_concat_adata, leiden_neighbors, leiden_resolution)
+            _leiden_on_X(target_concat_adata, leiden_neighbors, leiden_resolution)
+            nearest_source_leiden = (
+                source_concat_adata.obs["leiden"]
+                .loc[target_concat_adata.obs["source_obs_names"]]
+                .values
+            )
+            target_concat_adata.obs["leiden_unmatched"] = target_concat_adata.obs["leiden"].astype(str).values
+            matched, mapping = _match_clusters_by_overlap(
+                target_concat_adata.obs["leiden_unmatched"], nearest_source_leiden
+            )
+            source_categories = list(source_concat_adata.obs["leiden"].cat.categories)
+            extra = sorted(set(matched) - set(source_categories))
+            target_concat_adata.obs["leiden"] = pd.Categorical(matched, categories=source_categories + extra)
+            from sklearn.metrics import adjusted_rand_score
+            print("Target Leiden -> source cluster mapping:", mapping)
+            print("ARI(target independent, nearest-source Leiden): {:.3f}; fraction in matched cluster: {:.3f}".format(
+                adjusted_rand_score(nearest_source_leiden, matched), np.mean(matched == nearest_source_leiden.astype(str))))
+        else:
+            raise ValueError("target_leiden must be 'transferred' or 'independent'.")
         target_rna_spatial, target_atac_spatial = _spatial_target_from_source_reference(
             target_concat_adata, source_rna, source_atac, mapping_col="source_obs_names"
         )
@@ -2498,6 +2557,11 @@ source_target_adata, _, _ = run_alignment_and_spatial_plot(
     source_concat_adata,
     target_concat_adata,
     deterministic_seed,
+    # Source and target clustered independently with shared Leiden parameters
+    # (chosen by BAKLAVA scripts/figures/fig4_shared_leiden_sweep.py).
+    leiden_neighbors=150,
+    leiden_resolution=0.9,
+    target_leiden="independent",
 )
 
 ## transfer UMAP, spatial coordinates and ingest-transferred variables to original datasets
@@ -2651,7 +2715,9 @@ striatal_markers = ['Pde10a', 'Rgs9', 'Gng7']
 wm_markers = ['Mobp', 'Mal']
 striatal_score_name = ','.join(striatal_markers)
 wm_score_name = ','.join(wm_markers)
-assert np.isin(striatal_markers, marker_leiden_genes).all() and np.isin(wm_markers, marker_leiden_genes).all()
+missing_markers = [g for g in striatal_markers + wm_markers if g not in marker_leiden_genes]
+if missing_markers:  # e.g. Mal ranks behind Mobp in the white-matter cluster at k=150, res=0.9
+    warnings.warn("Curated markers that are not a top gene of any Leiden cluster: {}".format(missing_markers))
 sc.tl.score_genes(source_rna, gene_list=striatal_markers, score_name=striatal_score_name)
 sc.tl.score_genes(source_rna, gene_list=wm_markers, score_name=wm_score_name)
 sc.tl.score_genes(target_rna, gene_list=striatal_markers, score_name=striatal_score_name)
@@ -2907,6 +2973,9 @@ model_metrics_df.drop(columns=['run_id', 'run_name', 'timestamp', 'logged_at', '
 ## defaults here must match the argparse defaults, so that an interactive
 ## `args` namespace predating these flags still produces error bars
 n_bootstrap = max(int(getattr(args, "n_bootstrap", 20) or 0), 0)
+## FOSCTTM has its own, larger replicate count: 2.5/97.5 percentiles need many
+## replicates (with 20 they fall near the extreme values), and 1000 is cheap here
+foscttm_n_bootstrap = max(int(getattr(args, "foscttm_n_bootstrap", 1000) or 0), 0)
 bootstrap_frac = float(getattr(args, "bootstrap_frac", 0.8))
 bootstrap_seed = int(getattr(args, "bootstrap_seed", 0))
 bootstrap_n_jobs = int(getattr(args, "bootstrap_n_jobs", 1))
@@ -2932,26 +3001,35 @@ def _spread_ci(point_value, replicate_values, z=1.96):
     shifts every kNN/Leiden-based metric -- so a percentile interval of the
     replicates can sit entirely to one side of the point estimate. Take only
     the replicate spread as the uncertainty and centre it on the point
-    estimate; sqrt(bootstrap_frac) rescales an m-out-of-n subsample spread
-    back to the full sample size.
+    estimate.
+
+    The spread is rescaled by sqrt(f / (1 - f)), f = bootstrap_frac: the
+    delete-d jackknife factor (Shao & Wu 1989) for subsamples drawn without
+    replacement. It replaces an earlier sqrt(f) factor, which assumes near-
+    independent subsamples (m << n or drawing with replacement): at f = 0.8
+    the subsamples share most cells, so sqrt(f) gave intervals ~2.2x too
+    narrow. Same rule as metrics_bootstrap.spread_ci.
     """
+    if not 0.0 < bootstrap_frac < 1.0:
+        raise ValueError("_spread_ci needs 0 < bootstrap_frac < 1, got {}.".format(bootstrap_frac))
     replicate_values = np.asarray(
         [v for v in replicate_values if np.isfinite(v)], dtype=float
     )
     if replicate_values.size < 2:
         return np.nan, np.nan
-    half_width = z * float(replicate_values.std(ddof=1)) * float(np.sqrt(bootstrap_frac))
+    scale = float(np.sqrt(bootstrap_frac / (1.0 - bootstrap_frac)))
+    half_width = z * float(replicate_values.std(ddof=1)) * scale
     return float(point_value - half_width), float(point_value + half_width)
 
 def _bootstrap_mean_ci(per_cell_values, seed):
     """Nonparametric bootstrap of the mean of per-cell scores."""
     per_cell_values = np.asarray(per_cell_values, dtype=float)
-    if not bootstrap_enabled or per_cell_values.size < 2:
+    if foscttm_n_bootstrap < 2 or per_cell_values.size < 2:
         return np.nan, np.nan
     rng = np.random.default_rng(seed)
     n = per_cell_values.size
-    boot_means = np.empty(n_bootstrap, dtype=float)
-    for b in range(n_bootstrap):
+    boot_means = np.empty(foscttm_n_bootstrap, dtype=float)
+    for b in range(foscttm_n_bootstrap):
         boot_means[b] = per_cell_values[rng.integers(0, n, size=n)].mean()
     return _percentile_ci(boot_means)
 
@@ -3116,6 +3194,7 @@ if metrics_mode == "background":
         bootstrap_frac=bootstrap_frac,
         bootstrap_seed=bootstrap_seed,
         n_jobs=max(bootstrap_n_jobs, 1),
+        foscttm_n_bootstrap=foscttm_n_bootstrap,
     )
     model_metrics_df = None
 

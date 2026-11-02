@@ -15,7 +15,7 @@ models or the raw counts, so the expensive part can be split off from
          nohup python metrics_bootstrap.py \
              --input-dir /path/to/metric_inputs \
              --output-csv /path/to/metrics_with_ci.csv \
-             --n-bootstrap 20 --n-jobs 4 > bootstrap.log 2>&1 &
+             --n-bootstrap 20 --foscttm-n-bootstrap 1000 --n-jobs 4 > bootstrap.log 2>&1 &
 
   3. Back in ``multigate_co_embed.py``, plot without recomputing::
 
@@ -166,6 +166,7 @@ def launch_background_bootstrap(
     bootstrap_frac=0.8,
     bootstrap_seed=0,
     n_jobs=4,
+    foscttm_n_bootstrap=1000,
     resume=False,
     python_exe=None,
     notify=True,
@@ -191,6 +192,7 @@ def launch_background_bootstrap(
         "--input-dir", paths["input_dir"],
         "--output-csv", paths["output_csv"],
         "--n-bootstrap", str(n_bootstrap),
+        "--foscttm-n-bootstrap", str(foscttm_n_bootstrap),
         "--bootstrap-frac", str(bootstrap_frac),
         "--bootstrap-seed", str(bootstrap_seed),
         "--n-jobs", str(n_jobs),
@@ -218,6 +220,7 @@ def launch_background_bootstrap(
         "cmd": cmd,
         "n_domains": len(scib_metric_specs),
         "n_bootstrap": n_bootstrap,
+        "foscttm_n_bootstrap": foscttm_n_bootstrap,
         "n_jobs": n_jobs,
         "started_at": pd.Timestamp.now().isoformat(),
         **{k: v for k, v in paths.items()},
@@ -432,16 +435,24 @@ def spread_ci(point_value, replicate_values, frac, z=1.96):
     Subsample replicates are *biased* relative to the full data -- fewer cells
     shifts every kNN/Leiden-based metric -- so a percentile interval of the
     replicates can sit entirely to one side of the point estimate. Take only the
-    replicate spread as the uncertainty and centre it on the point estimate. The
-    sqrt(frac) factor rescales the spread of an m-out-of-n subsample back to the
-    full sample size.
+    replicate spread as the uncertainty and centre it on the point estimate.
+
+    The spread is rescaled by sqrt(frac / (1 - frac)), the delete-d jackknife
+    factor (Shao & Wu 1989) for subsamples of m = frac * n drawn without
+    replacement. It replaces an earlier sqrt(frac) factor, which assumes near-
+    independent subsamples (m << n or drawing with replacement): at frac = 0.8
+    the subsamples share most cells, so their spread understates full-sample
+    variability and sqrt(frac) gave intervals ~2.2x too narrow.
     """
+    if not 0.0 < frac < 1.0:
+        raise ValueError("spread_ci needs 0 < frac < 1, got {}.".format(frac))
     replicate_values = np.asarray(
         [v for v in replicate_values if v is not None and np.isfinite(v)], dtype=float
     )
     if replicate_values.size < 2:
         return np.nan, np.nan
-    half_width = z * float(replicate_values.std(ddof=1)) * float(np.sqrt(frac))
+    scale = float(np.sqrt(frac / (1.0 - frac)))
+    half_width = z * float(replicate_values.std(ddof=1)) * scale
     return float(point_value - half_width), float(point_value + half_width)
 
 
@@ -466,8 +477,14 @@ def subsample_adata(adata, rng, frac):
     return adata[idx].copy()
 
 
-def compute_domain_rows(spec, input_dir, n_bootstrap, frac, seed, n_jobs, ci=(2.5, 97.5)):
-    """Point estimates + bootstrap CIs for one (domain, embedding) pair."""
+def compute_domain_rows(
+    spec, input_dir, n_bootstrap, frac, seed, n_jobs, ci=(2.5, 97.5), foscttm_n_bootstrap=1000
+):
+    """Point estimates + bootstrap CIs for one (domain, embedding) pair.
+
+    ``n_bootstrap`` counts the scib subsample replicates (each re-runs the full
+    benchmark); ``foscttm_n_bootstrap`` counts the cheap FOSCTTM resamples.
+    """
     from joblib import Parallel, delayed
 
     from mouse_brain_spatial_rna_atac import compute_scib_metrics_for_domain
@@ -486,7 +503,9 @@ def compute_domain_rows(spec, input_dir, n_bootstrap, frac, seed, n_jobs, ci=(2.
 
     ## FOSCTTM: bootstrap the mean of the per-cell scores (resampling with
     ## replacement). Subsampling cells would shrink the pool of competing cells
-    ## and bias the statistic itself.
+    ## and bias the statistic itself. Uses its own replicate count: 2.5/97.5
+    ## percentiles need many replicates (with 20 they fall near the extreme
+    ## values), and resampling precomputed per-cell scores makes 1000 cheap.
     if spec["foscttm"]:
         from evals_utils import foscttm_moscot
 
@@ -497,7 +516,7 @@ def compute_domain_rows(spec, input_dir, n_bootstrap, frac, seed, n_jobs, ci=(2.
             ),
             dtype=float,
         ).ravel()
-        lo, hi = bootstrap_mean_ci(per_cell, seed=seed, n_bootstrap=n_bootstrap, ci=ci)
+        lo, hi = bootstrap_mean_ci(per_cell, seed=seed, n_bootstrap=foscttm_n_bootstrap, ci=ci)
         # reported as 1 - FOSCTTM (higher is better), which flips the interval
         rows.append(
             {
@@ -506,7 +525,7 @@ def compute_domain_rows(spec, input_dir, n_bootstrap, frac, seed, n_jobs, ci=(2.
                 "value": 1.0 - float(per_cell.mean()),
                 "ci_low": 1.0 - hi,
                 "ci_high": 1.0 - lo,
-                "n_replicates": n_bootstrap if n_bootstrap >= 2 else 0,
+                "n_replicates": foscttm_n_bootstrap if foscttm_n_bootstrap >= 2 else 0,
             }
         )
 
@@ -572,7 +591,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", required=True, help="Directory written by dump_metric_inputs.")
     parser.add_argument("--output-csv", required=True, help="Where to write the metrics + CIs.")
-    parser.add_argument("--n-bootstrap", type=int, default=20)
+    parser.add_argument(
+        "--n-bootstrap", type=int, default=20,
+        help="scib subsample replicates per domain (each re-runs the full benchmark).",
+    )
+    parser.add_argument(
+        "--foscttm-n-bootstrap", type=int, default=1000,
+        help="FOSCTTM bootstrap replicates (cheap: resamples precomputed per-cell scores).",
+    )
     parser.add_argument("--bootstrap-frac", type=float, default=0.8)
     parser.add_argument("--bootstrap-seed", type=int, default=0)
     parser.add_argument("--n-jobs", type=int, default=1, help="Parallel replicates per domain.")
@@ -676,6 +702,7 @@ def _run_all_domains(args, work_dir):
             # distinct seed block per domain, matching the in-script convention
             seed=args.bootstrap_seed + 1000 * (spec_idx + 1),
             n_jobs=args.n_jobs,
+            foscttm_n_bootstrap=args.foscttm_n_bootstrap,
         )
         # append after each domain so a killed run keeps its finished work
         pd.DataFrame(rows, columns=CSV_COLUMNS).to_csv(
