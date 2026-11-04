@@ -3,7 +3,7 @@
 SpatialJEPA carries tissue context from spatial multiomics into molecular representations that need no
 spatial coordinates. A **teacher** encoder receives spatial multiomic profiles with their tissue-neighbourhood
 graph. A **student** encoder predicts the teacher's latent representation from the same profiles with the
-graph masked to self-loops. The trained student can then be applied, without retraining, to dissociated
+graph masked to self-loops (i.e. an identity graph). The trained student can then be applied, without retraining, to dissociated
 single-cell data.
 
 The framework is backbone-agnostic. This repository contains two backbones:
@@ -14,7 +14,7 @@ The framework is backbone-agnostic. This repository contains two backbones:
 It also contains every script behind the results of the manuscript:
 
 > Mann-Krzisnik D, Li Y. *SpatialJEPA transfers tissue and metabolic context from spatial multiomics to
-> non-spatial single-cell data.* Genome Research (submitted, 2026).
+> non-spatial single-cell data.* (submitted, 2026).
 
 <img src="docs/figures/methodology.png" alt="SpatialJEPA overview" width="900">
 
