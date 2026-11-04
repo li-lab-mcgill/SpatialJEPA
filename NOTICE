@@ -1,0 +1,20 @@
+SpatialJEPA
+Copyright (c) 2026 Dylan Mann-Krzisnik and Yue Li
+Licensed under the MIT License (LICENSE), except as noted below.
+
+This repository includes software developed by third parties:
+
+1. MultiGATE (https://github.com/aqlkzf/MultiGATE)
+   Copyright the MultiGATE authors (Jishuai Miao, Jinzhao Li and colleagues).
+   Licensed under the Apache License, Version 2.0 (MultiGATE/LICENSE).
+   The package in MultiGATE/ is a modified version of upstream commit 7e846af. Modified files:
+   MultiGATE/MultiGATE.py, MultiGATE/Train_MultiGATE.py, MultiGATE/__init__.py,
+   MultiGATE/model_MultiGATE.py and MultiGATE/utils.py (graph-context distillation: a teacher encoder
+   with the tissue graph and a student encoder with a self-only graph, the distillation objective and
+   the alternating training schedule). MultiGATE/genomics.py is unmodified.
+   Miao J. et al. MultiGATE: integrative analysis and regulatory inference in spatial multi-omics data
+   via graph representation learning. Nature Communications 16, 9403 (2025).
+
+2. SpatialMETA (https://github.com/WanluLiuLab/SpatialMETA), BSD 3-Clause License.
+   Not bundled: installed as a pinned dependency (commit 909844e, envs/spatialjepa-msi.yml).
+   spatialjepa/spatialmeta_backbone.py builds on its classes.

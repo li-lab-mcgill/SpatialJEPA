@@ -1,0 +1,42 @@
+cff-version: 1.2.0
+message: "If you use SpatialJEPA, please cite the article below and, where appropriate, MultiGATE."
+title: "SpatialJEPA"
+type: software
+authors:
+  - family-names: Mann-Krzisnik
+    given-names: Dylan
+  - family-names: Li
+    given-names: Yue
+repository-code: "https://github.com/li-lab-mcgill/SpatialJEPA"
+license: MIT
+preferred-citation:
+  type: article
+  title: "SpatialJEPA transfers tissue and metabolic context from spatial multiomics to non-spatial single-cell data"
+  authors:
+    - family-names: Mann-Krzisnik
+      given-names: Dylan
+    - family-names: Li
+      given-names: Yue
+  journal: "Genome Research"
+  status: submitted
+  year: 2026
+references:
+  - type: conference-paper
+    title: "SpatialJEPA: JEPA-inspired graph-context distillation for spatially aware multiomics integration"
+    authors:
+      - family-names: Mann-Krzisnik
+        given-names: Dylan
+      - family-names: Li
+        given-names: Yue
+    conference:
+      name: "21st International Conference on Computational Intelligence Methods for Bioinformatics and Biostatistics (CIBB 2026)"
+    year: 2026
+  - type: article
+    title: "MultiGATE: integrative analysis and regulatory inference in spatial multi-omics data via graph representation learning"
+    authors:
+      - family-names: Miao
+        given-names: Jishuai
+    journal: "Nature Communications"
+    volume: 16
+    start: 9403
+    year: 2025

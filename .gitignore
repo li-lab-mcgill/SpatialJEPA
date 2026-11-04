@@ -168,3 +168,8 @@ mlruns/
 # Configuration directories
 .cursor/
 .vscode/
+
+# local settings (copy configs/spatialjepa.env.example)
+configs/spatialjepa.env
+# temporary pip requirements that `conda env create` writes next to the YAML
+envs/condaenv.*.requirements.txt

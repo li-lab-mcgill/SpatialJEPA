@@ -1,0 +1,29 @@
+# This file may be used to create an environment using:
+# $ conda create --name <env> --file <this file>
+# platform: linux-64
+# created-by: conda 25.1.1
+@EXPLICIT
+https://repo.anaconda.com/pkgs/main/linux-64/_libgcc_mutex-0.1-main.conda
+https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.5.20-hbd8a1cb_0.conda
+https://repo.anaconda.com/pkgs/main/linux-64/ld_impl_linux-64-2.40-h12ee557_0.conda
+https://repo.anaconda.com/pkgs/main/linux-64/libstdcxx-ng-11.2.0-h1234567_1.conda
+https://repo.anaconda.com/pkgs/main/noarch/tzdata-2024b-h04d1e81_0.conda
+https://repo.anaconda.com/pkgs/main/linux-64/libgomp-11.2.0-h1234567_1.conda
+https://repo.anaconda.com/pkgs/main/linux-64/_openmp_mutex-5.1-1_gnu.conda
+https://repo.anaconda.com/pkgs/main/linux-64/libgcc-ng-11.2.0-h1234567_1.conda
+https://repo.anaconda.com/pkgs/main/linux-64/bzip2-1.0.8-h5eee18b_6.conda
+https://repo.anaconda.com/pkgs/main/linux-64/libffi-3.4.4-h6a678d5_1.conda
+https://repo.anaconda.com/pkgs/main/linux-64/libuuid-1.41.5-h5eee18b_0.conda
+https://repo.anaconda.com/pkgs/main/linux-64/ncurses-6.4-h6a678d5_0.conda
+https://repo.anaconda.com/pkgs/main/linux-64/openssl-1.1.1w-h7f8727e_0.conda
+https://repo.anaconda.com/pkgs/main/linux-64/xz-5.2.10-h5eee18b_1.conda
+https://repo.anaconda.com/pkgs/main/linux-64/zlib-1.2.13-h5eee18b_1.conda
+https://conda.anaconda.org/bioconda/linux-64/bedtools-2.29.2-hc088bd4_0.tar.bz2
+https://repo.anaconda.com/pkgs/main/linux-64/readline-8.2-h5eee18b_0.conda
+https://repo.anaconda.com/pkgs/main/linux-64/tk-8.6.14-h39e8969_0.conda
+https://repo.anaconda.com/pkgs/main/linux-64/sqlite-3.45.3-h5eee18b_0.conda
+https://repo.anaconda.com/pkgs/main/linux-64/python-3.10.11-h7a1cb2a_2.conda
+https://conda.anaconda.org/conda-forge/noarch/python-dotenv-1.2.2-pyhcf101f3_0.conda
+https://repo.anaconda.com/pkgs/main/linux-64/setuptools-75.1.0-py310h06a4308_0.conda
+https://repo.anaconda.com/pkgs/main/linux-64/wheel-0.44.0-py310h06a4308_0.conda
+https://repo.anaconda.com/pkgs/main/linux-64/pip-24.2-py310h06a4308_0.conda

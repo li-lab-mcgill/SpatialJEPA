@@ -1,0 +1,11 @@
+--- a/scvi/_compat.py	2026-11-03 12:35:28.985667780 -0500
++++ b/scvi/_compat.py	2026-11-03 12:35:29.011335074 -0500
+@@ -1,4 +1,4 @@
+-class Literal:
+-    """Shim Literal."""
+-
+-    raise DeprecationWarning("This class is deprecated, please import from typing")
++try:
++    from typing import Literal
++except ImportError:
++    from typing_extensions import Literal

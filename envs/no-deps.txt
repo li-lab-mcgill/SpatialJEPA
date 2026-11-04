@@ -1,0 +1,10 @@
+# Installed by envs/install.sh after `conda env create`, with pip install --no-deps --no-build-isolation:
+# these versions ran together with versions that their metadata excludes, or their setup.py needs the
+# environment's own packages. <environment> <requirement>
+# SpatialMETA: the environment that ran had commit 909844e with one local change, in
+# spatialmeta/data/_dataloader.py (where its tutorial datasets are downloaded), which the analyses do not call.
+spatialjepa-msi --editable=git+https://github.com/WanluLiuLab/SpatialMETA@909844e#egg=spatialMETA
+spatialjepa-analysis chex==0.1.90
+spatialjepa-analysis leidenalg==0.10.1
+spatialjepa-analysis mvlearn==0.5.0
+spatialjepa-motifs pybedtools==0.9.1

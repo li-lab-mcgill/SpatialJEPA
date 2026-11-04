@@ -1,0 +1,15 @@
+--- a/nichecompass/utils/gene_programs.py	2026-11-03 12:35:29.034894216 -0500
++++ b/nichecompass/utils/gene_programs.py	2026-11-03 12:35:29.058652334 -0500
+@@ -700,6 +700,12 @@
+                 return x.removeprefix("COMPLEX:").split("_")
+         else:
+             return []
++
++    # Remove nan from lists in rows of grouped_lr_interaction_df["genesymbol_intercell_target"]
++    grouped_lr_interaction_df["genesymbol_intercell_target"] = grouped_lr_interaction_df["genesymbol_intercell_target"].apply(
++        lambda x: list(set([i for i in x if pd.notna(i)])) if isinstance(x, list)
++        else [x] if isinstance(x, str) and pd.notna(x)
++        else [])
+         
+     grouped_lr_interaction_df["sources"] = grouped_lr_interaction_df[
+         "genesymbol_intercell_source"].apply(
