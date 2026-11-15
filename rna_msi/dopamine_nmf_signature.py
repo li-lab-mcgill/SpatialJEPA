@@ -7,7 +7,7 @@ except ModuleNotFoundError:
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
 #%% Load data
-# conda env: nichecompass_liana
+# Environment: spatialjepa-analysis ($PY_ANALYSIS)
 
 import os
 for thread_env_var in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS"):
@@ -46,10 +46,10 @@ def save_figure_svg(fig, output_file, **savefig_kwargs):
 #   OUTPUT_DIR / "spatialjepa_models" / RUN_ID / "joint_adata.h5ad"
 # RUN_ID is the shared section prefix for multi-section runs (e.g. "V11T17-102")
 # or the single sample ID for single-section runs.
-RUN_ID = "V11L12-109_B1"           # <-- set to match the run in script 3
-SECTION_KEY = "section"         # obs column written by script 3
-# Optional env overrides, matching scripts 3/4/6 (none are in .env, so the override=True
-# load above leaves them alone): SPATIALJEPA_RUN_TAG selects a rerun's model/projection
+RUN_ID = "V11L12-109_B1"           # <-- set to match the run trained by train_rna_msi.py
+SECTION_KEY = "section"         # obs column written by train_rna_msi.py
+# Optional env overrides, as in train_rna_msi.py, encode_targets.py and
+# dopamine_embedding_benchmark.py: SPATIALJEPA_RUN_TAG selects a rerun's model/projection
 # dirs; SPATIALJEPA_NMF_CACHE_DIR reuses another run's NMF fit (it depends only on the
 # no-panel source data, not on the trained models); SPATIALJEPA_FIG_DIR redirects figures.
 RUN_ID = RUN_ID + os.getenv("SPATIALJEPA_RUN_TAG", "")
@@ -124,10 +124,6 @@ if USE_NO_PANEL_JOINT_ADATA:
     # SCT_data-derived (already log-normalized) rather than raw-count-derived. Use
     # SCT_counts (SCT-corrected, non-negative counts) instead, since KL-NMF expects
     # non-negative, non-log inputs.
-    # NOTE: the best-performing solution found so far (max bivariate Moran's I ~0.50)
-    # was still the raw-counts + total-counts-normalization feature ('normalized'),
-    # built before SCT was introduced into assemble_section(). SCT_counts is the closest
-    # available substitute now that 'normalized' is SCT-contaminated for this run.
     x_visium = as_dense(joint_adata[:, st_features].layers['SCT_counts'])
 else:
     x_visium = as_dense(joint_adata[:, st_features].layers['normalized'])
@@ -564,8 +560,7 @@ def run_trimodal_mofa(
                     f"MOFA {target_label}: {modality} kept top {int(initial_mask.sum())} "
                     f"spatially-variable HVG features (Moran's I)."
                 )
-            # Alternative: restrict ATAC to peaks overlapping supplied cCRE regions (e.g.
-            # MXD cCREs). NOTE this makes any 'ATAC loads on those cCREs' claim circular.
+            # Alternative: restrict ATAC to peaks overlapping supplied cCRE regions.
             elif modality == "atac" and atac_ccre_regions is not None:
                 overlap = atac_peaks_overlapping_regions(
                     trimodal_mudata.mod["atac"].var_names, atac_ccre_regions
@@ -731,10 +726,9 @@ spatial_trimodal_mudata, spatial_mofa_outfile = run_trimodal_mofa(
 )
 
 # multiome target
-# Recipe validated to yield a factor with bivariate Moran's I ~ -0.49 vs dopamine
-# (matching the ST NMF ~0.48) whose top ATAC loadings are ~2.6x enriched for MXD
-# cCREs -- a *non-circular* ATAC link, since peaks are selected for spatial coherence
-# (Moran's I), not for cCRE overlap. Requires multiome_trimodal_mudata.obsm['spatial'].
+# Peaks are selected for spatial coherence (Moran's I), not for cCRE overlap, so a cCRE
+# enrichment of the factor's ATAC loadings is not circular. Requires
+# multiome_trimodal_mudata.obsm['spatial'].
 multiome_trimodal_mudata, multiome_mofa_outfile = run_trimodal_mofa(
     multiome_trimodal_mudata,
     mudata_source_path=multiome_target_trimodal_mudata_path,
@@ -1203,9 +1197,9 @@ C12_factor = multiome_dopamine_factor_n   # Moran-selected dopamine factor (e.g.
 top_C12_features = multiome_mofa.get_top_features(
     factors=C12_factor, n_features=25, views=["rna", "atac", "msi_student"]
 )
-# Informative checks (feature set now spatial-selected, so these are diagnostics, not asserts).
+# Diagnostics (the feature set is spatially selected, so these are not asserts).
 print(f"msi:Dopamine in top features: {np.isin('msi:Dopamine', top_C12_features).item()}")
-triplet = {'Pde10a', 'Rgs9', 'Gng7'}  # Fig. 2b gene triplet
+triplet = {'Pde10a', 'Rgs9', 'Gng7'}  # striatal MSN marker triplet
 print(f"Fig-2b triplet present: {triplet & set(top_C12_features)} (of {triplet})")
 
 chr17_features = top_C12_features[pd.Series(top_C12_features).str.contains('chr17')]
@@ -1315,7 +1309,7 @@ def _fig_draw_gsea(host_ax, pre, ccre_label):
     return g
 
 
-# Save GSEA plots to cibb overleaf figures directory
+# Save GSEA plots to the figures directory
 overleaf_figures_dir = os.getenv("SPATIALJEPA_FIG_DIR",
                                  f"{__import__('os').environ['SPATIALJEPA_MANUSCRIPT']}/figures")
 os.makedirs(overleaf_figures_dir, exist_ok=True)
@@ -1367,12 +1361,10 @@ def gsea_matched_ccre_peaks(pre, ccre_label):
 
 #%% TF motif enrichment hand-off (conda env: scenicplus)
 # This env lacks MOODS/pyjaspar, so the actual PWM scan + Fisher's-exact test
-# runs out-of-process via motif_enrichment_worker.py in the `scenicplus` conda env
-# (see that script's docstring for the MOODS+pyjaspar design rationale). Unlike
-# the spatialMETA hand-off in 0__sea_ad_celltype_tangram_minimal.py, this is a
-# one-shot call on an already-small ranked peak list (not a per-donor loop over
-# large arrays), so no staging/manifest/caching infrastructure is needed -- just
-# write two BEDs, invoke the worker, read back its output TSV.
+# runs out-of-process via motif_enrichment_worker.py in spatialjepa-motifs ($PY_MOTIF)
+# (see that script's docstring for the MOODS+pyjaspar design rationale). It is a
+# one-shot call on an already-small ranked peak list, so no staging, manifest or
+# caching is needed -- just write two BEDs, invoke the worker, read back its output TSV.
 #
 # Foreground = the GSEA leading-edge cCRE peaks for each cell type (the cCRE-
 # overlapping peaks ranked up to the running-ES inflection on the dopamine factor);
@@ -1402,7 +1394,7 @@ def run_tf_motif_enrichment(
     fasta_path=MM10_FASTA_PATH if MM10_FASTA_PATH.exists() else None,
     out_dir=MOTIF_ENRICHMENT_OUT_DIR,
 ):
-    """Hand off a foreground-vs-background motif enrichment test to `scenicplus`.
+    """Hand off a foreground-vs-background motif enrichment test to spatialjepa-motifs ($PY_MOTIF).
 
     foreground = `foreground_names` if given (e.g. the GSEA leading-edge cCRE peaks,
     which differ by cell type), else the top-N peaks by |loading|. background =
@@ -1975,11 +1967,9 @@ print(
 
 
 # %% figure functions
-# Manuscript figures for the SMA dopamine story. These were first produced by
-# standalone scripts that re-loaded everything from disk; here they are rebuilt on
-# the objects already in scope, so they always reflect the current run (e.g. the
-# no-panel joint_adata / SCT_counts NMF input and the retrained target MOFA models)
-# rather than the inputs that happened to be on disk when the figures were first made.
+# Figures for the dopamine analysis, built on the objects already in scope so that
+# they reflect the current run (e.g. the no-panel joint_adata / SCT_counts NMF input
+# and the target MOFA models).
 #
 # Convention matches plot_atac_ccre_gsea / plot_top_motifs above: pass output_file to
 # save, leave it None to show. Each returns the Figure.
@@ -2778,11 +2768,9 @@ def _fig_draw_enrichment_convergence(ax, results, top_k, *, title=None):
     beside the overlap it actually tests rather than over the boxes, where it read
     as though it belonged to the AUROC.
 
-    Every string here is set a step or two above the drawer defaults, because this is
-    the one panel of the composite figure that is read rather than looked at: at the
-    old 8 pt the overlap counts and the legend were the first things to go when the
-    18-inch board is scaled into a manuscript column. The p-value is printed bare and
-    the y-label drops "MOFA+" to buy that size; both are named in Methods.
+    Every string here is set a step or two above the drawer defaults, because this
+    panel carries numbers that must stay legible when the board is scaled down. The
+    p-value is printed bare and the y-label drops "MOFA+" to buy that size.
 
     The y-limit is opened downward first: the annotation then sits in a band that no
     box or whisker can reach, instead of being squeezed against the lowest whisker.
@@ -3166,7 +3154,7 @@ def FIG_dopamine_overview(
             _fig_rasterize_scatters(ax)
         row1_axes += [ax_dopa, ax_nmf]
         # sc.pl.embedding leaves the axes aspect free (unlike sc.pl.spatial), so the
-        # map boxes take whatever shape the cell has -- previously a tall rectangle.
+        # map boxes take whatever shape the cell has.
         # set_box_aspect pins the plot area to a square; the row height above is then
         # only there to stop constrained_layout solving the square by shrinking the
         # panels sideways and leaving gutters between the columns.
@@ -3367,9 +3355,7 @@ FIG_nmf_mofa_enrichment(
 )
 
 # %% manuscript figures
-# Run this only once the preview above looks right -- it overwrites the figure that
-# main.tex includes. Both formats: main.tex takes the PNG (pdflatex cannot take SVG
-# without the svg package + inkscape), the SVG is the editable copy for revisions.
+# Writes the overview figure as PNG and SVG.
 for _overview_suffix in ("png", "svg"):
     FIG_dopamine_overview(
         output_file=os.path.join(overleaf_figures_dir,

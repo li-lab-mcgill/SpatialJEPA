@@ -158,7 +158,7 @@ def Cal_gene_peak_Net_new(rna, atac, range=2000,
     loaded.columns = COLUMNS[:loaded.shape[1]]
     loaded = loaded.query("feature == 'gene'")
 
-    # ?????????
+    # parse the GTF attribute column into one column per key
     pattern = re.compile(r'([^\s]+) "([^"]+)";')
     splitted = pd.DataFrame.from_records(np.vectorize(lambda x: {
         key: val for key, val in pattern.findall(x)
@@ -166,26 +166,26 @@ def Cal_gene_peak_Net_new(rna, atac, range=2000,
     loaded = loaded.assign(**splitted)
     loaded = loaded.sort_values("seqname").drop_duplicates(subset=[gtf_by], keep="last")
 
-    # ????? BED ?? DataFrame
+    # BED-style DataFrame
     bed_df = pd.DataFrame(loaded, copy=True).loc[:, ("seqname", "start", "end", "score", "strand")]
     bed_df.insert(3, "name", np.repeat(".", len(bed_df)) if gtf_by is None else loaded[gtf_by])
-    bed_df["start"] -= 1  # ??? 0-based
+    bed_df["start"] -= 1  # to 0-based
     bed_df.columns = ("chrom", "chromStart", "chromEnd", "name", "score", "strand")
 
-    # ??????
+    # column dtypes
     for item in bed_df.columns:
         if item in ("chromStart", "chromEnd"):
             bed_df[item] = bed_df[item].astype(int)
         else:
             bed_df[item] = bed_df[item].astype(str)
 
-    # ??????? strand ??
+    # BED columns with the attributes, indexed by gene
     gene_df = pd.concat([
         pd.DataFrame(bed_df),
-        pd.DataFrame(loaded).drop(columns=COLUMNS)  # ?????????
+        pd.DataFrame(loaded).drop(columns=COLUMNS)  # the attribute columns
     ], axis=1).set_index(gtf_by).reindex(var_by)
 
-    # ???? strand ?
+    # keep the location and strand columns
     gene_df = gene_df[['chrom', 'chromStart', 'chromEnd', 'strand']]
     gene_df.dropna(inplace=True)
     rna=rna[:,gene_df.index]
@@ -193,22 +193,22 @@ def Cal_gene_peak_Net_new(rna, atac, range=2000,
     rna.var['chromStart'] = gene_df.loc[rna.var_names, 'chromStart']
     rna.var['chromEnd'] = gene_df.loc[rna.var_names, 'chromEnd']
     rna.var['strand'] = gene_df.loc[rna.var_names, 'strand']
-    # ?????????????????,????DataFrame
+    # split the peak names (chrom:start-end) into a DataFrame
     chrom_info = atac.var_names.str.split(r"[:\-]", expand=True).to_frame(index=False)
     chrom_info.columns = ['chrom', 'chromStart', 'chromEnd']
 
-    # ???????????????????
+    # integer start and end
     chrom_info['chromStart'] = chrom_info['chromStart'].astype(int)
     chrom_info['chromEnd'] = chrom_info['chromEnd'].astype(int)
-    # ? atac.var_names ??? chrom_info ???
+    # index by atac.var_names
     chrom_info.index = atac.var_names
 
-    # ?? chrom_info ???? atac.var ?????
+    # check that the index matches atac.var
     if chrom_info.index.equals(atac.var.index):
-        # ? chrom_info ?????? atac.var ?
+        # write the peak locations into atac.var
         atac.var[['chrom', 'chromStart', 'chromEnd']] = chrom_info
     else:
-        print("?????,?????????!")
+        print("Peak index does not match atac.var; peak locations were not added.")
     rna=rna[:,rna.var['highly_variable']]
     # genes = Bed(rna.var.assign(name=rna.var_names))
     # peaks = Bed(atac.var.assign(name=atac.var_names))

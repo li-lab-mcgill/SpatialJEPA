@@ -1,13 +1,13 @@
 #%% Project Spatial RNA-ATAC target data into the SMA-trained RNA latent/MSI space.
 #
-# The SMA SpatialJEPA model (script 3) is a joint RNA("ST")+metabolomics("SM") VAE.
+# The SMA SpatialJEPA model (train_rna_msi.py) is a joint RNA("ST")+metabolomics("SM") VAE.
 # Spatial RNA-ATAC shares only the RNA modality with SMA, so we push the target RNA
 # through the trained student and teacher. The student joint latent H["q_mu"] is
 # used for the post-hoc PLS MSI decoder; the teacher RNA-only latent H["st"]["q_mu"]
 # is used for the trained neural SM decoder. The SM block is filled with zeros in
 # the model input.
 #
-# ST inputs are RAW counts: the model was trained on raw HVG counts (script 3's final
+# ST inputs are RAW counts: the model was trained on raw HVG counts (train_rna_msi.py's final
 # normalize_total uses target_sum_ST=None, which skips ST), and encode() applies
 # log(X_ST + 1) internally. So the target ST block is raw counts reindexed to the SMA
 # gene set (zero-filled for genes absent from the target).
@@ -70,7 +70,7 @@ if os.getenv("SPATIALJEPA_SAMPLE_IDS"):
     SAMPLE_ID = SAMPLE_ID[0] if len(SAMPLE_ID) == 1 else SAMPLE_ID
 SAMPLE_IDS = [SAMPLE_ID] if isinstance(SAMPLE_ID, str) else list(SAMPLE_ID)
 PREFIX = SAMPLE_IDS[0].split("_")[0]
-# same run naming as script 3: the sample for one section, the shared prefix for several
+# same run naming as train_rna_msi.py: the sample for one section, the shared prefix for several
 RUN_ID = (SAMPLE_IDS[0] if len(SAMPLE_IDS) == 1 else PREFIX) + os.getenv("SPATIALJEPA_RUN_TAG", "")
 
 species = "human" if PREFIX == "V11T17-102" else "mouse"
@@ -84,7 +84,7 @@ def env_path(name: str, default: Path | str) -> Path:
 
 # Species-specific spatial target RNA defaults (override with SPATIAL_TARGET_RNA_PATH /
 # TARGET_RNA_PATH only when needed). Human path matches the CaH Xenium panel used for
-# target-gene ranking in script 3.
+# target-gene ranking in train_rna_msi.py.
 if species == "mouse":
     SPATIAL_TARGET_RNA_PATH = ALIGNED_DATA_DIR / "source_rna_aligned_SCT.h5ad"
 elif species == "human":

@@ -11,9 +11,9 @@ The data preparation repeats analyze_rna_atac.py (SCT gene / gene-peak filtering
 graph rad 40 for the teacher, identity graph otherwise); only named function definitions
 are loaded from that script, none of its top-level code runs. Before anything is written,
 the student (P22 and Multiome), the spatial teacher and the nonspatial model on P22 must
-reproduce the embeddings saved for the manuscript (metrics_bootstrap/metric_inputs).
+reproduce the saved embeddings (metrics_bootstrap/metric_inputs).
 
-Run in the nichecompass_liana env (MultiGATE, bedtools).
+Run in the spatialjepa-analysis environment (MultiGATE, bedtools).
 Output: $SPATIALJEPA_OUT/MultiGATE/rna_atac_analysis/20260505_190037/heldout_alignment/multigate_encodings.npz
 """
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)
@@ -75,7 +75,7 @@ def original_functions():
 
 
 def prepare():
-    """analyze_rna_atac.py lines 2013-2225 with the identity target graph."""
+    """The target encoding of analyze_rna_atac.py, with the identity target graph."""
     source_rna = sc.read_h5ad(DATA / "source_rna_aligned_SCT.h5ad")
     source_atac = sc.read_h5ad(DATA / "source_atac_aligned.h5ad")
     target_rna = sc.read_h5ad(DATA / "target_rna_aligned_SCT.h5ad")

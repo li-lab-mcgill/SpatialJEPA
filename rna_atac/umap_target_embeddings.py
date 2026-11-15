@@ -1,10 +1,10 @@
-"""Target UMAPs for Supplementary Fig. S1 computed as main Fig. 2d.
+"""Target UMAPs for the integration-metrics figure, computed as for the integration figure.
 
-Fig. 2d (analyze_rna_atac.py, run 20260505_190037): concat RNA+ATAC student
+The integration figure (analyze_rna_atac.py, run 20260505_190037): concat RNA+ATAC student
 embedding, keep the target 'test' split of the run's domain_splits.json, then
 sc.pp.neighbors(n_neighbors=30) and sc.tl.umap(min_dist=0.1, spread=1.5), all
 other arguments at scanpy defaults. The zero-shot student and MultiVI use these
-settings; the OT-aligned student uses the source (Fig. 2b/c) settings on the
+settings; the OT-aligned student uses the source settings on the
 same nuclei (see SETTINGS). MultiVI's zero-shot embeddings exist only for the
 run's 'train' split (0 test nuclei), so MultiVI uses its own nuclei.
 """
@@ -32,12 +32,12 @@ OUT = f"{os.environ['SPATIALJEPA_HOME']}/outputs/MultiGATE/rna_atac_analysis/202
 specs = {s["domain"]: s for s in json.load(open(os.path.join(INPUTS, "specs.json")))}
 test = set(map(str, json.load(open(SPLITS))["domains"]["target"]["splits"]["test"]["obs_names"]))
 
-def fig2d_umap(a):  # Fig. 2d settings
+def fig2d_umap(a):  # the integration figure's target settings
     sc.pp.neighbors(a, n_neighbors=30)
     sc.tl.umap(a, min_dist=0.1, spread=1.5)
 
 
-def source_umap(a):  # Fig. 2b/c settings: compute_concat_umap(deterministic=True, n_neighbors=10)
+def source_umap(a):  # source settings: compute_concat_umap(deterministic=True, n_neighbors=10)
     sc.pp.neighbors(a, n_neighbors=10, use_rep="X", knn=True, method="umap",
                     metric="euclidean", random_state=0)
     sc.tl.umap(a, random_state=0, init_pos="spectral")
@@ -51,7 +51,7 @@ SETTINGS = {"target": (fig2d_umap, "__fig2d"),
             "target_multivi_zero_shot": (fig2d_umap, "__fig2d")}
 ONLY = os.environ.get("ONLY")  # e.g. ONLY=target_ot to recompute a single model
 # MultiVI zero-shot latents for all target nuclei (encode_multivi_zero_shot.py),
-# replacing the original 50%-split inputs; written under a distinct cache name
+# (all nuclei, not the 50% split); written under a distinct cache name
 V3_INPUTS = os.path.join(os.path.dirname(OUT), "..", "metrics_bootstrap_v3", "metric_inputs")
 if os.environ.get("MULTIVI_FULL"):
     SETTINGS["target_multivi_zero_shot"] = (fig2d_umap, "__fig2d_full_target")
@@ -59,7 +59,7 @@ if os.environ.get("MULTIVI_FULL"):
         **json.load(open(os.path.join(V3_INPUTS, "specs.json")))[0], "_dir": V3_INPUTS}
 
 # ALL_SOURCE=1: preview with every target model on the source settings
-# (writes separate "__subset_src_settings" caches; the S1 caches are untouched)
+# (writes separate "__subset_src_settings" caches; the figure caches are untouched)
 if os.environ.get("ALL_SOURCE"):
     SETTINGS = {d: (source_umap, "__subset_src_settings") for d in SETTINGS}
     if os.environ.get("MULTIVI_FULL"):

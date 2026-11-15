@@ -18,7 +18,7 @@ import os  # noqa: E402
 #   C / C30   spatial-kNN teacher (k=6 / k=30), no ST->SM loss
 #   D         identity-graph teacher, no ST->SM loss         (teacher = control F)
 #   A_perm    kNN graph with node labels permuted within section (degree-matched)
-#   A_induced A with the legacy induced-subgraph mini-batches (manuscript behaviour)
+#   A_induced A with induced-subgraph mini-batches (only within-batch edges)
 #   A_early   A with the teacher early-stopped: a first pass trains the teacher alone on
 #             8 of 10 spatial blocks and scores the other 2 after every epoch; the run
 #             then trains teacher + students on every spot for the best epoch count, and
@@ -28,7 +28,7 @@ import os  # noqa: E402
 #   G         stock SpatialMETA ConditionalVAESTSM (FC encoders, no teacher)
 #
 # Every SpatialJEPA run distils two students from the same teacher batches: `student`
-# (paired RNA+MSI input, as in the manuscript) and `student_rna` (MSI input zeroed,
+# (paired RNA+MSI input) and `student_rna` (MSI input zeroed,
 # distilling the joint and RNA-expert latents only).
 #
 # Outputs (${SPATIALJEPA_OUT}/spatialjepa_benchmark/animal_transfer/<region>/train-<animals>/
@@ -86,7 +86,7 @@ def parse_args(notebook: bool = False):
     parser.add_argument("--n-neighbors", type=int, default=None, help="override the config's teacher k")
     parser.add_argument("--neighborhood", choices=("exact", "induced"), default=None,
                         help="override the config's teacher mini-batch neighbourhood")
-    # manuscript mouse schedule (main.tex Methods; train_rna_msi.py)
+    # the mouse schedule of train_rna_msi.py
     parser.add_argument("--max-epoch", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--lr-step", type=int, default=200)

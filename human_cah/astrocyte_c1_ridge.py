@@ -1,8 +1,7 @@
-"""Carry astrocyte C1 (seed0) to Xenium through shared genes, as Fig. 7e carries dopamine.
+"""Carry astrocyte C1 (seed0) to Xenium through shared genes, as the CaH figure carries dopamine.
 
-The Fig. 7f gene-weight projection over the 241 shared genes tracks latent C1 within astrocytes
-poorly (donor-mean r 0.15) and loses the ADNC association, so here a ridge map from the shared
-genes to C1 is fitted within snRNA astrocytes, with donor-grouped CV, and checked for whether its
+A ridge map from the shared genes to C1 is fitted within snRNA astrocytes,
+with donor-grouped CV, and checked for whether its
 out-of-fold donor means reproduce the snRNA ADNC association before it is applied to Xenium.
 Genes: the 241 shared by the 1,057-gene model panel and Xenium (aligned h5mu, log-normalised), and
 all Xenium panel genes found in the full snRNA (UMIs, normalise_total + log1p). z-scored within

@@ -9,13 +9,13 @@ import os  # noqa: E402
 #%% Cross-animal SpatialJEPA ablation benchmark: PLS readouts, metrics, contrasts, figures.
 #
 # Reads every finished run written by heldout_animals_train.py (DONE marker), fits a
-# source-only PLS decoder (K=4, as in the manuscript) from each representation to the
+# source-only PLS decoder (K=4) from each representation to the
 # source MSI, predicts the held-out animals' MSI from RNA-only embeddings, and scores the
 # predictions against the measured (never model-visible) MSI.
 #
 # Readout protocols:
 #   P0  decoder fitted on source embeddings encoded WITH measured MSI, applied to targets
-#       encoded with MSI zeroed (manuscript Supp. Fig. S8)
+#       encoded with MSI zeroed
 #   P1  decoder fitted and applied on embeddings encoded with MSI zeroed (primary)
 #   P2  as P1, for the student trained with zeroed MSI input (`<config>_rna`)
 #   RNA linear RNA->MSI baselines (ridge, PLS, PCA-10 + PLS) fitted on the source

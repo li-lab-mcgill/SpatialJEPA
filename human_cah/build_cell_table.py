@@ -1,5 +1,5 @@
 """Per-nucleus table for the CaH disease re-test: donor metadata, subclass, depth, and the
-current Fig. 7 readouts (PLS C1 per seed; OT-transferred dopamine and its 241-gene ridge map)."""
+CaH readouts (PLS C1 per seed; OT-transferred dopamine and its 241-gene ridge map)."""
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)
     import spatialjepa.paths  # noqa: F401
 except ModuleNotFoundError:

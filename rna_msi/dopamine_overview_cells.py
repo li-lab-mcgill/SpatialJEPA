@@ -6,17 +6,17 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-#%% Regenerate the Fig. 5 dopamine overview from one SpatialJEPA run, headless.
+#%% Regenerate the dopamine overview figure from one SpatialJEPA run, headless.
 #
 # dopamine_nmf_signature.py is an interactive, cell-based script whose later
 # cells (cCRE GSEA, motif hand-off, regulons, CATlas) feed other figures. This driver
-# executes only the cells Fig. 5 needs -- NMF, target MOFA+, dopamine-factor selection
+# executes only the cells the overview needs -- NMF, target MOFA+, dopamine-factor selection
 # and the figure functions -- in one namespace, then draws FIG_dopamine_overview.
 #
-# Run selection follows script 5's env overrides:
-#   SPATIALJEPA_RUN_TAG        model/projection dir suffix (e.g. "__fix2000")
+# Run selection follows the env overrides of dopamine_nmf_signature.py:
+#   SPATIALJEPA_RUN_TAG        model/projection dir suffix (e.g. "_seed3")
 #   SPATIALJEPA_NMF_CACHE_DIR  reuse another run's NMF fit (source-data only)
-#   SPATIALJEPA_FIG_DIR        where figures go (never defaults to the manuscript here)
+#   SPATIALJEPA_FIG_DIR        where figures go
 #   MOFA_GPU_DEVICE            GPU index within CUDA_VISIBLE_DEVICES for MOFA+
 # Panels d-f read <SPATIALJEPA_OUT>/multigrate_mouse_sma/<RUN_ID>/dopamine_metrics.csv from
 # dopamine_embedding_benchmark.py (run with the same SPATIALJEPA_RUN_TAG); --benchmark-csv
@@ -24,7 +24,7 @@ import os  # noqa: E402
 #
 # MOFA+ runs single-threaded and is the slow step, and the two targets are independent:
 # `--mofa-only spatial|multiome` fits just that target's model (same arguments as the
-# script-5 cell) so both can run in parallel; a final plain run then finds both model
+# dopamine_nmf_signature.py cell) so both can run in parallel; a final plain run then finds both model
 # files, skips training and draws the figure.
 #
 # Env: $PY_ANALYSIS
@@ -52,7 +52,7 @@ MOFA_CELLS = (
 )
 MOFA_TARGET_VARS = {"spatial": "spatial_mofa_outfile", "multiome": "multiome_mofa_outfile"}
 
-# headers (prefix match) of the script-5 cells Fig. 5 depends on, in file order
+# headers (prefix match) of the dopamine_nmf_signature.py cells the overview depends on, in file order
 FIG5_CELLS = (
     "Load data",
     "Load joint data",
@@ -67,7 +67,7 @@ FIG5_CELLS = (
     "figure functions",
 )
 
-# cells behind Fig. 6 (regulatory chromatin of the student dopamine factor), run after
+# cells behind the regulatory board (regulatory chromatin of the student dopamine factor), run after
 # the factor selection so they use the chosen (or overridden) student factor
 FIG6_CELLS = (
     "ATAC cCRE enrichment of the dopamine-associated factor",
@@ -76,8 +76,8 @@ FIG6_CELLS = (
     "TF motif enrichment hand-off",
     "RNA-side regulon enrichment",
 )
-# Fig. 6a is a screenshot adapted from Zhang et al. (2023); it is reused from the
-# manuscript PNG (pixel box: left, top, right, bottom)
+# Panel a of the regulatory board is a screenshot adapted from Zhang et al. (2023), reused from the
+# figure PNG in $SPATIALJEPA_MANUSCRIPT/figures (pixel box: left, top, right, bottom)
 FIG6_PANEL_A_SOURCE = Path(
     f"{os.environ['SPATIALJEPA_MANUSCRIPT']}/figures/SMA_mouse_mofa_enrichment.png"
 )
@@ -115,7 +115,7 @@ def split_cells(path: Path):
     starts = [i for i, line in enumerate(lines) if re.match(r"^#\s?%%", line)] + [len(lines)]
     for a, b in zip(starts, starts[1:]):
         header = re.sub(r"^#\s?%%\s*", "", lines[a]).strip()
-        # pad with blank lines so tracebacks report script-5 line numbers
+        # pad with blank lines so tracebacks report the script's own line numbers
         yield header, "\n" * a + "".join(lines[a:b])
 
 
@@ -136,7 +136,7 @@ def orient_factor(model, factor, view, anchor="msi:Dopamine"):
     """Present `factor` of a mofax model with `anchor` loading positively.
 
     MOFA factors are defined up to a joint sign flip of Z and W, so this is a relabelling.
-    The Fig. 5 drawing functions orient factors themselves, but the Fig. 6 cells rank
+    The overview's drawing functions orient factors themselves, but the regulatory cells rank
     peaks by the raw signed ATAC loadings; without this a factor whose dopamine weight
     happens to be negative shows the cCRE enrichment at the wrong end. Applied in
     memory by wrapping the model's accessors; the model file is untouched.
@@ -166,7 +166,7 @@ def orient_factor(model, factor, view, anchor="msi:Dopamine"):
 
 
 def run_cells(cells, namespace, *, mofa_only=None, after=None):
-    """Execute the listed script-5 cells in file order; ``after`` maps a cell header
+    """Execute the listed dopamine_nmf_signature.py cells in file order; ``after`` maps a cell header
     to a callback run right after that cell."""
     wanted = list(cells)
     for header, code in split_cells(SCRIPT):
@@ -225,8 +225,8 @@ def use_gc_adjusted_motifs(namespace, spec):
     """Swap panel c-d motif tables for gc_matched_motif_enrichment.py's GC-adjusted test.
 
     `spec` is <gc_matched_motifs dir>/<run label>; the logistic test (hit ~ foreground +
-    GC + GC^2, same foreground/background peaks as 5__) supplies pvalue/padj, so the
-    significance tiers in panels c and d mean the same thing as before, net of GC.
+    GC + GC^2, same foreground/background peaks as the motif cell) supplies pvalue/padj, so the
+    significance tiers in panels c and d keep their meaning, net of GC.
     """
     import numpy as np
     import pandas as pd
@@ -245,11 +245,11 @@ def use_gc_adjusted_motifs(namespace, spec):
 
 
 def fig6_board(namespace, output_file, panel_a=FIG6_PANEL_A_SOURCE, panel_a_box=FIG6_PANEL_A_BOX):
-    """Fig. 6 in the manuscript layout: (a) cell-type cCRE maps, (b) cCRE GSEA,
+    """The regulatory board: (a) cell-type cCRE maps, (b) cCRE GSEA,
     (c) top TF motifs, (d) RNA-regulon x ATAC-motif concordance.
 
     Panels b-d are FIG_ccre_tf_overview's drawing helpers on this run's results; panel a
-    is the adapted literature screenshot, copied from the manuscript figure.
+    is the adapted literature screenshot, copied from the published figure.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -301,7 +301,7 @@ def main():
     # The automatic choice (largest |dopamine loading| / bivariate Moran's I vs imputed
     # dopamine) can land on a factor driven by other tissue structure; a factor chosen
     # instead for its dopamine-related MSI loadings is passed here. Applied right after
-    # the selection cell, so the Fig. 6 cells use it too.
+    # the selection cell, so the regulatory cells use it too.
     def apply_overrides(ns):
         for arg, var, mofa in ((args.teacher_factor, "spatial_dopamine_factor_n", "spatial_mofa"),
                                (args.student_factor, "multiome_dopamine_factor_n", "multiome_mofa")):

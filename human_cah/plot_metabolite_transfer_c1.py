@@ -1,9 +1,9 @@
-"""Draw the two supplementary figures that accompany Fig. 7 (seed0).
+"""Draw the metabolite-transfer supplementary figure of the CaH analysis (seed0).
 
 Supp A, metabolite transfer: (a) metabolite weights of C1 on each held-out source section, recovered
 by OT from the other two sections vs measured; (b) transferred metabolites by CaH subclass (mean of
-the OT-paired values, z per metabolite, over the 40,000 Fig. 7 nuclei).
-Supp B (PLS C2) moved to plot_component_c2.py (Fig. 7 layout) and plot_metabolite_transfer_c2.py (its metabolite transfer).
+the OT-paired values, z per metabolite, over the 40,000 OT-paired nuclei).
+PLS C2 is drawn by plot_component_c2.py and plot_metabolite_transfer_c2.py.
 Inputs: supp_metab.pkl (metabolite_transfer_supplement.py), c2.pkl (component_c2.py).
 """
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)
@@ -27,7 +27,7 @@ from sklearn.neighbors import NearestNeighbors
 HERE = Path(os.environ["SPATIALJEPA_HOME"]) / "outputs/human_cah_transfer/seed0/cah/supp_metabolite_transfer"
 OUT = Path(f"{os.environ['SPATIALJEPA_HOME']}/outputs/human_cah_transfer/seed0/cah/supp_metabolite_transfer")
 OUT.mkdir(parents=True, exist_ok=True)
-MSI_C, RNA_C, INK, MUTED = "#1f77b4", "#ff7f0e", "#1f1f1f", "#6b6b6b"     # Fig. 7a view colours
+MSI_C, RNA_C, INK, MUTED = "#1f77b4", "#ff7f0e", "#1f1f1f", "#6b6b6b"     # the CaH figure's panel-a colours
 SEC_C = ["#4c78a8", "#f58518", "#54a24b"]
 plt.rcParams.update({"font.size": 9, "axes.spines.top": False, "axes.spines.right": False, "svg.fonttype": "none"})
 M = pickle.load(open(HERE / "supp_metab.pkl", "rb"))

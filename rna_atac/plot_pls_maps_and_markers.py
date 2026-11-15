@@ -1,17 +1,17 @@
-"""Supplementary Fig. 4 extensions: marker-gene weights of RNA PLS_0-2 in source and
-target with the marker genes' expression maps, and the ATAC PLS_0-2 maps that main
-Fig. 4c leaves out.
+"""PLS supplementary figure: marker-gene weights of RNA PLS_0-2 in source and
+target with the marker genes' expression maps, and the ATAC PLS_0-2 maps that the
+transfer figure's panel c leaves out.
 
 Reuses plot_transfer_panels.py as a library: its nine-component PLS fits (copied
 from that run's cache, so nothing is refitted) and its sign handling (PLS_0 oriented
 by myelin markers, other models aligned and refined across the four fits), so every
-sign matches Fig. 4c,d. The gene sets are the six modules of Fig. 4d
+sign matches transfer-figure panels c and d. The gene sets are the six modules of panel d
 (plot_pls_biological_annotation in analyze_rna_atac.py). Gene weights are the
-models' y_weights_, as in Fig. 4d, scaled to unit SD across genes within each model
+models' y_weights_, as in panel d, scaled to unit SD across genes within each model
 and component so source and target share one scale. The expression maps follow
-Fig. 4e (plot_mobp_phactr1_expression): mean SCT-scaled RNA at each coordinate,
+panel e (plot_mobp_phactr1_expression): mean SCT-scaled RNA at each coordinate,
 restricted to coordinates occupied in both source and target, Gaussian-smoothed at
-sigma = 1 spot, one colour scale per gene. Mobp is left out because Fig. 4e shows it.
+sigma = 1 spot, one colour scale per gene. Mobp is left out because panel e shows it.
 
     python plot_pls_maps_and_markers.py [--output DIR]
 """
@@ -38,7 +38,7 @@ import plot_transfer_panels as F4
 
 REVISION = F4.DEFAULT_OUT
 DEFAULT_OUT = F4.BASE / "outputs/rna_atac_figures/fig4_supp_pls_markers"
-MODULES = {     # Fig. 4d modules, in its row order
+MODULES = {     # transfer-figure panel d modules, in its row order
     "Oligodendrocyte / myelin": ["Mobp", "Mal", "Mag", "Mbp", "Plp1", "Cnp"],
     "Striatal / MSN": ["Pde10a", "Rgs9", "Gng7", "Ppp1r1b", "Drd1", "Adora2a"],
     "Mural / smooth muscle": ["Cald1", "Myh11", "Mylk", "Acta2", "Tagln", "Rgs5", "Pdgfrb"],
@@ -50,7 +50,7 @@ COLORS = {"Oligodendrocyte / myelin": "#d95f02", "Striatal / MSN": "#1b9e77",
           "Mural / smooth muscle": "#7570b3", "Endothelial / BBB": "#e7298a",
           "Astrocyte": "#66a61e", "ECM / adhesion": "#a6761d"}
 N_SHOW = 3
-MAP_GENES = ["Mal", "Mag", "Pde10a", "Rgs9", "Gng7"]   # myelin and striatal markers of Fig. 4d, minus Mobp (Fig. 4e)
+MAP_GENES = ["Mal", "Mag", "Pde10a", "Rgs9", "Gng7"]   # myelin and striatal markers of panel d, minus Mobp (panel e)
 
 
 def models(out):
@@ -66,12 +66,12 @@ def models(out):
 
 def gene_weights(model, var_names, funcs):
     W = funcs["pls_loadings_df"](model, var_names).iloc[:N_SHOW].T
-    W = W.groupby(level=0, sort=False).mean()          # duplicate gene names, as in Fig. 4d
+    W = W.groupby(level=0, sort=False).mean()          # duplicate gene names, as in panel d
     return W / W.std(axis=0)
 
 
 def marker_maps(data):
-    """Fig. 4e's expression maps for MAP_GENES: coordinate means on the shared lattice, smoothed."""
+    """Panel e's expression maps for MAP_GENES: coordinate means on the shared lattice, smoothed."""
     import scanpy as sc
 
     means = {}
@@ -102,7 +102,7 @@ def draw(Ws, Wt, maps, out):
     fig = plt.figure(figsize=(W, H))                    # spans the heatmap's full height
     inch = lambda x, y, w, h: fig.add_axes([x / W, y / H, w / W, h / H])
     side, top = 1.42, 3.35                              # map side; top edge shared by heatmap and maps
-    # (a) per-gene weights of the Fig. 4d gene sets
+    # (a) per-gene weights of the panel-d gene sets
     ax = inch(0.75, 0.62, 1.75, top - 0.62)
     M = np.column_stack([v for k in range(N_SHOW) for v in (Ws.loc[[g for _, g in genes], f"PLS_{k}"],
                                                            Wt.loc[[g for _, g in genes], f"PLS_{k}"])])
@@ -123,7 +123,7 @@ def draw(Ws, Wt, maps, out):
     cb = fig.colorbar(art, cax=inch(0.75, 0.3, 1.75, 0.09), orientation="horizontal")
     cb.set_label("gene weight (SD units)", fontsize=7); cb.ax.tick_params(labelsize=6)
     fig.text(0.0, (top + 0.12) / H, "a", fontsize=13, fontweight="bold")
-    # (b) expression maps of the marker genes, as Fig. 4e
+    # (b) expression maps of the marker genes, as panel e
     xy = maps[["x", "y"]].to_numpy()
     fig.text(2.68 / W, (top + 0.12) / H, "b", fontsize=13, fontweight="bold")
     module_of = {g: m for m, gs in MODULES.items() for g in gs}
@@ -176,7 +176,7 @@ def main():
     Ws = gene_weights(fits["source_rna"], data["source_rna"]["var"].index, funcs)
     Wt = gene_weights(fits["target_rna"], data["target_rna"]["var"].index, funcs)
     draw(Ws, Wt, marker_maps(data), a.output)
-    # ATAC PLS_0-2 maps: the separate panel the Fig. 4 revision already drew on the RNA maps' scale
+    # ATAC PLS_0-2 maps, drawn on the RNA maps' scale
     for ext in ("png", "svg", "pdf"):
         shutil.copy2(REVISION / f"supplementary_atac_pls.{ext}", a.output / f"S_Fig4_atac_pls_maps.{ext}")
 

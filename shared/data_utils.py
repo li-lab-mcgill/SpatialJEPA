@@ -334,7 +334,7 @@ def load_10x_mouse_brain_ad_data(
     """
 
     if data_dir is None:
-        # data/ folder is one level above the repo folder (BAKLAVA/)
+        # data/ folder is one level above the repository folder
         repo_dir = os.path.abspath(os.path.dirname(__file__))
         data_dir = os.path.join(repo_dir, "..", "data", "10x_mouse_brain_AD")
     data_dir = os.path.abspath(data_dir)
@@ -459,7 +459,7 @@ def load_10x_mouse_brain_data(
     """
 
     if data_dir is None:
-        # data/ folder is one level above the repo folder (BAKLAVA/)
+        # data/ folder is one level above the repository folder
         repo_dir = os.path.abspath(os.path.dirname(__file__))
         data_dir = os.path.join(repo_dir, "..", "data", "10x_mouse_brain")
     data_dir = os.path.abspath(data_dir)
@@ -938,8 +938,6 @@ def rebuild_nichecompass_multimodal_masks(
     filter_peaks_based_on_genes: bool = True,
 ) -> Tuple[ad.AnnData, ad.AnnData, ad.AnnData, ad.AnnData]:
     """Rebuild GP + chromatin-accessibility masks after alignment.
-
-    This mirrors the previously inlined tutorial block that was commented out.
     """
 
     from nichecompass.utils import (

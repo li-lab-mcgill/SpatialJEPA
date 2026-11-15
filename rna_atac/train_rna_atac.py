@@ -104,9 +104,9 @@ def load_nichecompass_combined_gp_dict_mouse(
     load_from_disk: bool = False,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """Load the same combined_gp_dict as BAKLAVA `mouse_brain_multimodal.py` / `data_utils.build_combined_gp_dict_mouse_brain`.
+    """Load the combined_gp_dict of `data_utils.build_combined_gp_dict_mouse_brain`.
 
-    Expects `SPATIALJEPA_DATA` and `SPATIALJEPA_HOME` (and BAKLAVA repo on sys.path from `bootstrap_runtime`).
+    Expects `SPATIALJEPA_DATA` and `SPATIALJEPA_HOME` (and shared/ on sys.path from `bootstrap_runtime`).
     Gene-program CSVs live under ``{SPATIALJEPA_DATA}/gene_programs/``; orthologs under ``{SPATIALJEPA_DATA}/gene_annotations/``.
     """
     datapath = os.getenv("SPATIALJEPA_DATA")
@@ -1024,8 +1024,7 @@ def infer_source_and_zero_shot_target_embeddings(
     return source_embeddings, target_embeddings, target_trainer
 
 
-# Legacy helper kept for compatibility with older co-embed runs that do not
-# have split artifacts.
+# Fallback for runs without split artifacts.
 def pair_and_subsample_target(target_rna, target_atac, subsample_n, seed):
     shared_obs = target_rna.obs_names.intersection(target_atac.obs_names)
     if len(shared_obs) == 0:

@@ -6,7 +6,7 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-#%% Fig. 6: per-nucleus TF-motif accessibility (chromVAR-style) vs the shared PLS components.
+#%% Per-nucleus TF-motif accessibility (chromVAR-style) vs the shared PLS components.
 #
 # The peak-level route (C1 peak weights -> cCRE GSEA -> leading-edge motif test) works on 66,520
 # sparse peaks (median detected in 2% of nuclei). Here each nucleus instead gets one deviation
@@ -24,19 +24,19 @@ import os  # noqa: E402
 #               also partial on a D1-vs-D2 score; calibrated against random latent directions
 #               (oriented towards MSN identity) and the ported axes of the other metabolites
 #
-# Stages (separate envs):
-#   --stage scan   scenicplus env      motif hits for every multiome peak
-#   --stage dev    nichecompass_liana  deviation z-scores, own implementation (GPU if available)
-#   --stage prep        nichecompass_liana  counts + cCRE flags -> <out>/atac_counts.h5ad (for pychromvar)
-#   --stage pychromvar  pychromvar          the same deviations with pychromvar (its own motif matching,
-#                                           GC bias and background peaks); --engine pychromvar for assoc
-#   --stage assoc  nichecompass_liana  association tables (pychromvar deviations by default;
+# Stages (separate environments):
+#   --stage scan        spatialjepa-motifs    motif hits for every multiome peak
+#   --stage dev         spatialjepa-analysis  deviation z-scores, own implementation (GPU if available)
+#   --stage prep        spatialjepa-analysis  counts + cCRE flags -> <out>/atac_counts.h5ad (for pychromvar)
+#   --stage pychromvar  spatialjepa-analysis  the same deviations with pychromvar (its own motif matching,
+#                                             GC bias and background peaks); --engine pychromvar for assoc
+#   --stage assoc       spatialjepa-analysis  association tables (pychromvar deviations by default;
 #                                       --engine custom for the own implementation) for the dopamine component of
-#                                       --components msi_intact (default; fig567 defaults, written
+#                                       --components msi_intact (default; shared_msi_components.py defaults, written
 #                                       to <out>/msi_svd_intact/), msi (all source spots) or
 #                                       dopamine (anchored C1, <out>/)
 #
-# Env: $CONDA_ENVS/{scenicplus,nichecompass_liana,pychromvar}/bin/python
+# Python: $PY_MOTIF for --stage scan, $PY_ANALYSIS for the other stages
 
 import argparse
 import sys

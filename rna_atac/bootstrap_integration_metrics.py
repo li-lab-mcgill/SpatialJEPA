@@ -62,7 +62,7 @@ from anndata import AnnData
 
 
 def _bootstrap_sys_path():
-    """Put the MultiGATE and BAKLAVA repos on sys.path, as the main scripts do."""
+    """Put the repository folders on sys.path, as the main scripts do."""
     base_dir = os.getenv("SPATIALJEPA_HOME")
     if base_dir is None:
         from dotenv import load_dotenv
@@ -447,10 +447,10 @@ def spread_ci(point_value, replicate_values, frac, z=1.96):
 
     The spread is rescaled by sqrt(frac / (1 - frac)), the delete-d jackknife
     factor (Shao & Wu 1989) for subsamples of m = frac * n drawn without
-    replacement. It replaces an earlier sqrt(frac) factor, which assumes near-
-    independent subsamples (m << n or drawing with replacement): at frac = 0.8
-    the subsamples share most cells, so their spread understates full-sample
-    variability and sqrt(frac) gave intervals ~2.2x too narrow.
+    replacement. A plain sqrt(frac) factor assumes near-independent subsamples
+    (m << n, or drawing with replacement); at frac = 0.8 the subsamples share most
+    cells, so their spread understates full-sample variability and sqrt(frac) would
+    give intervals ~2.2x too narrow.
     """
     if not 0.0 < frac < 1.0:
         raise ValueError("spread_ci needs 0 < frac < 1, got {}.".format(frac))

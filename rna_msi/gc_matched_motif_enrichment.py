@@ -6,9 +6,9 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-#%% GC-controlled re-test of the Fig. 6c TF-motif enrichments.
+#%% GC-controlled re-test of the regulatory board's TF-motif enrichments.
 #
-# 5__'s motif test (motif_enrichment_worker.py) contrasts the GSEA leading-edge cCRE peaks
+# The motif test of dopamine_nmf_signature.py (motif_enrichment_worker.py) contrasts the GSEA leading-edge cCRE peaks
 # (foreground) against the remaining cCRE peaks of the same cell type among the 2,000
 # MOFA-selected ATAC peaks (background), scanning with a flat 0.25 base background. A
 # foreground that is more AT-rich than its background then enriches AT-rich motifs for

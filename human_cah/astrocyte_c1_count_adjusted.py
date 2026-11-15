@@ -1,4 +1,4 @@
-"""Follow-up to astro_c1_checks.py: Xenium location in microns, and transcript-count dependence.
+"""Follow-up to astrocyte_c1_checks.py: Xenium location in microns, and transcript-count dependence.
 
 Xenium obsm['spatial'] is in morphology-image pixels (0.2125 um; median nearest-cell spacing 45 px).
 1  snRNA: within-astrocyte correlation of latent C1 with log UMIs, and donor level.
@@ -6,8 +6,8 @@ Xenium obsm['spatial'] is in morphology-image pixels (0.2125 um; median nearest-
    per-section regression on log counts); location effects (tissue edge < 100 um, ventricle wall =
    < 200 um from an ependymal cell, oligodendrocyte density) before and after count adjustment;
    donor means vs snRNA.
-3  Fig. 7 section: does the panel-g pattern survive count adjustment (smoothed maps compared)?
-Adds the count-adjusted value to astro_c1_checks2.pkl for an alternative panel g.
+3  CaH figure section: does the astrocyte-map pattern survive count adjustment (smoothed maps compared)?
+Adds the count-adjusted value to astro_c1_checks2.pkl.
 """
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)
     import spatialjepa.paths  # noqa: F401
@@ -84,7 +84,7 @@ for y, m, lab in (("c1", slice(None), "all"), ("c1_adj", slice(None), "count-adj
     print(f"  donor means ({lab}): rho vs snRNA {spearmanr(dm, snr.reindex(dm.index))[0]:+.2f} (p {spearmanr(dm, snr.reindex(dm.index))[1]:.3f}), "
           f"vs ADNC {spearmanr(dm, adnc.reindex(dm.index).map({l: i for i, l in enumerate(ADNC)}))[0]:+.2f}, vs mean log counts {spearmanr(dm, cnt.reindex(dm.index))[0]:+.2f}")
 
-# 3. Fig. 7 section
+# 3. CaH figure section
 s = xa[xa["Specimen_ID"] == SEC7]
 xy = X.loc[s.index, ["x", "y"]].to_numpy()
 _, nb = NearestNeighbors(n_neighbors=31).fit(xy).kneighbors(xy)

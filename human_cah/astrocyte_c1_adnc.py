@@ -1,13 +1,13 @@
 """Astrocyte C1 vs ADNC with the early-stopped teacher (seed0): data for the boxplot and the
 Xenium spatial contrast map. Writes astro_c1_cache.pkl next to this script.
 
-snRNA  donor-mean astrocyte C1 (>= 50 nuclei) for seed0 and the fixed seeds; ordinal-logit ORs
+snRNA  donor-mean astrocyte C1 (>= 50 nuclei) for seed0 and the runs fix_s0-2; ordinal-logit ORs
        per SD (age, sex, PMI) for all astrocytes, the Astro_2 supertype alone, and all astrocytes
        + donor share of the low-C1 supertypes; check that the 241-gene projection used on Xenium
-       (Fig. 7f) tracks the latent C1 within astrocytes.
-Xenium the snRNA C1 gene weights applied to z-scored expression (Fig. 7f recipe, but z-scored over
+       (the CaH figure's projection) tracks the latent C1 within astrocytes.
+Xenium the snRNA C1 gene weights applied to z-scored expression (the CaH projection, but z-scored over
        all 25 sections so donors stay comparable; per-section z-scoring kept as a sensitivity),
-       local oligodendrocyte density per section (Fig. 7d KDE), astrocyte kNN-smoothed C1.
+       local oligodendrocyte density per section (the CaH density KDE), astrocyte kNN-smoothed C1.
 
 Env: $PY_ANALYSIS
 """

@@ -1,4 +1,4 @@
-#%% Held-out cluster agreement and spatial smoothness: a simpler companion to Fig. 5d-f.
+#%% Held-out cluster agreement and spatial smoothness: a simpler companion to the dopamine embedding metrics.
 #
 # For every evaluation unit of the benchmark (a training section in-sample, the unseen half
 # of a training section, another animal's section), each representation is clustered
@@ -10,9 +10,9 @@
 # the symmetric 6-NN tissue graph, and cluster coherence (fraction of a spot's tissue
 # neighbours in its cluster, K = 10; chance = sum_k p_k^2).
 #
-# Representations (RNA+MSI input, joint latent; Fig. 5d-f condition): teachers with the
+# Representations (RNA+MSI input, joint latent; the dopamine-benchmark condition): teachers with the
 # scored section's own graph and graph-free students of A / A_early / A_wd, the ridge
-# re-distillation (A_ridge, 10__), the identity teacher E and its student B, stock
+# re-distillation (A_ridge, student_teacher_diagnostics.py), the identity teacher E and its student B, stock
 # SpatialMETA G, untrained input_pca10 / smoothed_input_pca10 (graph-averaged input),
 # spatial_xy (KMeans on coordinates) and, as a noise floor, the teacher of another seed
 # (A_teacher_seed / A_early_teacher_seed).
@@ -256,7 +256,7 @@ def evaluate_fold(runs_dir: Path, unit_name: str, ev8, ev9) -> list[dict]:
 
 #%% external RNA-only targets: P22 spatial RNA-ATAC and the 10x Multiome
 #
-# The whole-section (pairwise) benchmark models are encoded on both manuscript targets with
+# The whole-section (pairwise) benchmark models are encoded on both transfer targets with
 # the MSI block zeroed. Latents compared: the RNA-expert latent (st) for teachers, paired
 # students, E, B and G (it only ever sees RNA), the joint latent for the RNA-only students
 # (*_rna). Spatial teachers run on P22 with its own 6-NN graph; they cannot run on the
@@ -266,12 +266,12 @@ def evaluate_fold(runs_dir: Path, unit_name: str, ev8, ev9) -> list[dict]:
 # RNA_clusters / ATAC_clusters (spatially coherent anatomical clusters); smoothness on the
 # P22 tissue graph.
 # Multiome references, through a bridge independent of every evaluated model: MultiVI
-# trained on P22 RNA+ATAC (scripts/baseline_multivi.py) embeds P22
+# trained on P22 RNA+ATAC (rna_atac/baseline_multivi.py) embeds P22
 # spots (X_multivi) and Multiome nuclei (X_multivi_zero_shot) in one frame. Each nucleus
 # takes the majority label of its BRIDGE_K nearest P22 spots (RNA/ATAC clusters, and the
 # P22 teacher's KMeans clusters for that run and seed) and the mean coordinates of its
 # BRIDGE_COORD_K nearest spots (pseudo-coordinates for Moran's I / coherence). Non-spatial
-# references: CellTypist (manuscript recipe, multiome_celltypist_labels.py) and the 10x
+# references: CellTypist (the recipe of rna_atac/analyze_rna_atac.py) and the 10x
 # graph clusters. Bridge fidelity is measured leave-one-out on P22.
 
 EXTERNAL_TARGETS = ("p22", "multiome")

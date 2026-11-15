@@ -4,7 +4,7 @@ The Multiome has no coordinates, so spatial information can only be read through
 For each model, Multiome nuclei are coupled to P22 spots in that model's own embedding
 (models trained on P22, applied zero-shot to the Multiome):
   knn  spot-side 15-NN vote (back-projection) / nucleus-side 15-NN rows (placement)
-  ot   balanced entropic OT, Euclidean cost / mean, eps 0.01 (the manuscript's OT step)
+  ot   balanced entropic OT, Euclidean cost / mean, eps 0.01 (the OT step of analyze_rna_atac.py)
   uot  unbalanced entropic OT (KL marginals, rho 1.0, ~80% of mass kept): composition can differ
 per view: rna (RNA-view embeddings), atac (ATAC-view), joint (both views, each scaled to
 unit mean-square norm on P22).
@@ -27,8 +27,9 @@ Models: teacher_nograph (teacher weights, identity graph), student (distilled, g
 student_in_teacher (student Multiome vs teacher P22), nonspatial (graph-free, no teacher),
 multivi (P22-trained), pca (untrained RNA PCA / ATAC LSI fitted on P22).
 
-Run in the nichecompass_liana env after encode_heldout_controls.py.
---clustering leiden: Leiden (scanpy, 150-NN umap graph, seed 0, as for main-text Fig. 4a) in place of
+Run in spatialjepa-analysis after encode_heldout_controls.py.
+--clustering leiden: Leiden (scanpy, 150-NN umap graph, seed 0, as for the transfer figure's target
+clusters) in place of
 KMeans, with the resolution bisected to give exactly K clusters; teacher reference cached once;
 outputs in heldout_alignment_leiden/ (W1 placement is clustering-independent and is skipped).
 Outputs in $SPATIALJEPA_OUT/MultiGATE/rna_atac_analysis/20260505_190037/heldout_alignment/.
@@ -66,11 +67,11 @@ MULTIVI_FULL = RUN / "metrics_bootstrap_v3" / "multivi_zero_shot_full_target_lat
 OUT = RUN / "heldout_alignment"
 KS = (5, 10, 20)
 CLUSTERING = "kmeans"
-LEIDEN_NEIGHBORS = 150  # main-text Fig. 4a target Leiden graph
+LEIDEN_NEIGHBORS = 150  # the transfer figure's target Leiden graph
 
 
 def leiden_k(X, ks, seed=0):
-    """Leiden on a 150-NN umap graph (Fig. 4a settings); resolution bisected to hit each K exactly."""
+    """Leiden on a 150-NN umap graph (the transfer figure's settings); resolution bisected to hit each K exactly."""
     import scanpy as sc
     a = ad.AnnData(np.asarray(X, dtype=np.float32))
     sc.pp.neighbors(a, n_neighbors=LEIDEN_NEIGHBORS, use_rep="X", knn=True, method="umap",

@@ -184,12 +184,11 @@ SPATIALMETA_MODEL_SAMPLE = os.environ.get(
     os.environ.get("GCP_VM_MODEL_SAMPLE", "V11T17-102"),
 )
 # encode_nuclei.py imports spatialmeta_backbone.py and spatialmeta.util._classes
-# from this directory. Default to the local BAKLAVA checkout's SMA scripts dir instead
-# of the GCP VM path (a remote checkout) baked into that worker.
+# from this directory (BAKLAVAS_SMA_DIR).
 BAKLAVAS_SMA_DIR = Path(
     os.environ.get(
         "BAKLAVAS_SMA_DIR",
-        _BAKLAVA_BASE_DIR / "BAKLAVA" / "scripts" / "SMA",
+        Path(os.environ["SPATIALJEPA_REPO"]) / "spatialjepa",
     )
 ).expanduser().resolve()
 SPATIALMETA_OUTPATH = Path(
@@ -223,9 +222,7 @@ def assert_spatialmeta_model_bundle(model_dir: Path) -> None:
             "Incomplete SpatialJEPA model bundle at "
             f"{model_dir}. Missing: {missing}. "
             "Train with rna_msi/train_rna_msi.py or copy "
-            "an existing bundle into $SPATIALJEPA_OUT/spatialjepa_models/<RUN_ID>/ . "
-            "To push a local bundle to the GCP VM: "
-            "bash gcs_scripts/gcp_connect.sh scp-models <RUN_ID>"
+            "an existing bundle into $SPATIALJEPA_OUT/spatialjepa_models/<RUN_ID>/ ."
         )
 
 
@@ -236,8 +233,8 @@ def assert_baklavas_sma_dir(sma_dir: Path) -> None:
     if missing or not sma_dir.is_dir():
         raise FileNotFoundError(
             f"BAKLAVAS_SMA_DIR={sma_dir} is missing or incomplete (missing: {missing}). "
-            "Set BAKLAVAS_SMA_DIR to the local BAKLAVA/scripts/SMA checkout, e.g. "
-            f"{_BAKLAVA_BASE_DIR / 'BAKLAVA' / 'scripts' / 'SMA'}."
+            "Set BAKLAVAS_SMA_DIR to the repository's spatialjepa/ folder, e.g. "
+            f"{Path(os.environ['SPATIALJEPA_REPO']) / 'spatialjepa'}."
         )
 
 

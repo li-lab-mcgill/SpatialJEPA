@@ -1,26 +1,22 @@
-"""Joint-latent replacements for the elements of the 28 October Fig. 3 layout.
+"""Spatial-structure figure on the joint latents, drawn onto the published layout.
 
-The Fig. 3 uploaded to Overleaf on 28 October (f22d6cd) keeps the schematic (a)
-and was assembled from RNA-side elements:
-  - panel b from fig3_panel_b_wide.py (wide ECDF axes, 21 October);
-  - the four c maps, the c colour bar, the student d map and the d colour bar from
-    the August export of plot_spatial_structure_figure (analyze_rna_atac.py;
-    figures/3_spatial_ecdf_analysis.svg in the Overleaf clone);
-  - a teacher d map from fig3_student_minus_teacher.py, which ran on the joint latents.
-This script redraws those elements on the joint latents (fig3_supp_ecdf_by_latent
-build("joint"), the latents of fig3_joint_latents.py) with the geometry and styles of
-the elements they replace:
+The layout PNG (--overleaf-figure; $SPATIALJEPA_MANUSCRIPT/figures/3_spatial_ecdf_analysis.png) holds
+the schematic (a) and RNA-side elements: panel b (wide ECDF axes), the four c maps and their colour
+bar, and the d maps and their colour bar, as drawn by plot_spatial_structure_figure
+(analyze_rna_atac.py); the layout SVG gives the axes size and x range of panel b.
+This script redraws those elements on the joint latents (plot_position_recovery_by_latent
+build("joint")) with the geometry and styles of the elements they replace:
   panel_b_wide_joint.{svg,pdf,png}  page and axes height of panel_b_ecdf_wide.svg; the axes are widened so
                                     their right edge lines up with the panel a explainer boxes above, and the
                                     legend (with the short arm names of panel c) sits in the bottom-right corner
   maps_cd_joint.{svg,pdf,png}       the c and d rows of plot_spatial_structure_figure;
                                     d shows teacher - MultiVI and student - MultiVI on
                                     one colour scale (98th percentile of |student - MultiVI|)
-It then pastes them over the RNA-side elements of the Overleaf PNG, element by element,
+It then pastes them over the RNA-side elements of the layout PNG, element by element,
 giving 3_spatial_ecdf_analysis_joint.png. The schematic, the panel letters, the d titles
 and the colour-bar labels are left as they are; the c colour bar is unchanged (0-1 with
 the random floor, which is the same on every latent). The same pasting is first done
-with RNA-side renders, which must reproduce the Overleaf PNG; the residual is reported.
+with RNA-side renders, which must reproduce the layout PNG; the residual is reported.
 
     python plot_spatial_structure.py [--output DIR] [--overleaf-figure PNG]
 """
@@ -57,7 +53,7 @@ AUGUST_SVG = CLONE / "figures/3_spatial_ecdf_analysis.svg"
 ARMS = ["teacher", "student", "non-spatial", "MultiVI"]
 SVG = "{http://www.w3.org/2000/svg}"
 DPI = 600
-# panel b, as in fig3_panel_b_wide.py
+# panel b styles (those of the layout's panel b)
 B_STYLES = [("teacher", "SpatialJEPA teacher", "#00441b", "--", 1.4),
             ("student", "SpatialJEPA student", "#1b7837", "-", 2.4),
             ("non-spatial", "MultiGATE non-spatial", "#5aae61", "-", 1.4),
@@ -76,7 +72,7 @@ def load_stats(modality, out):
 
 
 def wide_geometry():
-    """Axes size (pt) and x range of panel_b_ecdf_wide, recovered from the August SVG as that script does."""
+    """Axes size (pt) and x range of panel_b_ecdf_wide, recovered from the layout SVG."""
     axes = ET.fromstring(AUGUST_SVG.read_bytes()).find('.//*[@id="axes_1"]')
 
     def vertices(group_id):
@@ -125,7 +121,7 @@ def draw_panel_b(stats, out, tag, legend, width=None, short_labels=False):
     leg = ax.legend(fontsize=6.5, **{"labelspacing": .32, "handlelength": 1.9, "borderpad": .4, **legend})
     fig.canvas.draw()
     # in the bottom-right corner, no curve may pass through the legend box (the RNA-side rebuild keeps the
-    # Overleaf legend, which touches the teacher curve, as it is)
+    # layout legend, which touches the teacher curve, as it is)
     if short_labels:
         bb = leg.get_window_extent().transformed(ax.transData.inverted())
         inside = (grid >= bb.x0) & (grid <= bb.x1)
@@ -173,7 +169,7 @@ def draw_maps(stats, out, tag):
                          vmin=-vlim, vmax=vlim, rasterized=True)
         ax.set_title(f"Δ ({a} - MultiVI)", fontsize=9, pad=5)
     cb = fig.colorbar(sca, cax=fig.add_subplot(gs[3, 4]), extend="both")
-    cb.set_ticks(np.round(np.arange(-0.6, 0.61, 0.2), 1))   # the Overleaf bar's ticks, for any limit above 0.6
+    cb.set_ticks(np.round(np.arange(-0.6, 0.61, 0.2), 1))   # the layout bar's ticks, for any limit above 0.6
     cb.ax.tick_params(labelsize=7)
     cb.ax.axhline(0.0, color="0.35", lw=0.8)
     for ext in ("svg", "pdf", "png"):
@@ -245,7 +241,7 @@ def bar_box(img):
 
 
 def locate(target, b_png, maps_png):
-    """Matching element boxes in the Overleaf PNG (T) and in the renders (S)."""
+    """Matching element boxes in the layout PNG (T) and in the renders (S)."""
     T, S = {}, {}
     tf = [shift(r, 2900, 0) for r in boxes(sub(target, 2900, 0, target.shape[1], target.shape[0]), gray_frame, 0.35)]
     T["c"], T["d"] = tf[:4], tf[4:6]
@@ -255,7 +251,7 @@ def locate(target, b_png, maps_png):
     S["c"], S["d"] = sf[:4], sf[4:6]
     T["b"] = shift(boxes(sub(target, 0, 3100, 2950, target.shape[0]), black_spine, 0.3)[0], 0, 3100)
     S["b"] = boxes(b_png, black_spine, 0.3)[0]
-    # d colour bar: right of the d maps in the render, between panel b and the d maps in the Overleaf PNG
+    # d colour bar: right of the d maps in the render, between panel b and the d maps in the layout PNG
     x0, y0 = S["d"][1][2] + 20, S["c"][0][3] + 40
     S["dbar"] = shift(bar_box(maps_png[y0:, x0:]), x0, y0)
     T["dbar"] = shift(bar_box(sub(target, 2550, 3300, 2950, 4750)), 2550, 3300)
@@ -286,7 +282,7 @@ def compose(target, b_png, maps_png, T, S, b_right=None):
     region = {}
     pt = DPI / 72
     # c maps, then their titles (two 9-pt lines above the frame); the title band skips the frame's outer
-    # 15% on each side, where the Overleaf PNG has the panel letter
+    # 15% on each side, where the layout PNG has the panel letter
     for i in range(4):
         sb, tb = S["c"][i], T["c"][i]
         region[f"c{i}"] = paste(canvas, maps_png, sb, tb, [round(v * pt) for v in (2, 2, 2, 2)])
@@ -295,10 +291,10 @@ def compose(target, b_png, maps_png, T, S, b_right=None):
         region[f"c{i}_title"] = paste(canvas, maps_png, (sb[0] + inset, sb[1] - round(28 * pt), sb[2] - inset, sb[1] - 4),
                                       (round(tb[0] + inset * sx), round(tb[1] - (28 * pt - 0) * sx),
                                        round(tb[2] - inset * sx), round(tb[1] - 4 * sx)), (0, 0, 0, 0))
-    # d maps without titles (the Overleaf titles are kept)
+    # d maps without titles (the layout titles are kept)
     for i in range(2):
         tb = T["d"][i]
-        # the teacher map in the Overleaf PNG came from another script and has another aspect: white it out
+        # the teacher map in the layout PNG has another aspect: white it out
         # and paste the new frame at the student map's aspect, centred on the old one
         sb = S["d"][i]
         aspect = (sb[3] - sb[1]) / (sb[2] - sb[0])
@@ -307,7 +303,7 @@ def compose(target, b_png, maps_png, T, S, b_right=None):
         canvas.paste((255, 255, 255), (tb[0] - 8, tb[1] - 8, tb[2] + 8, tb[3] + 8))
         region[f"d{i}"] = paste(canvas, maps_png, sb, (tb[0], round(cy - hgt / 2), tb[2], round(cy - hgt / 2) + hgt),
                                 [round(v * pt) for v in (2, 2, 2, 2)])
-    # d colour bar, then its tick labels (the side labels are kept). The Overleaf bar is widened, but its
+    # d colour bar, then its tick labels (the side labels are kept). The layout bar is widened, but its
     # labels aren't, so the labels are scaled by the bar's height only and placed against its right edge
     tb, sb = T["dbar"], S["dbar"]
     canvas.paste((255, 255, 255), (tb[0] - 4, tb[1] - 4, T["d"][0][0] - 30, tb[3] + 4))
@@ -316,7 +312,7 @@ def compose(target, b_png, maps_png, T, S, b_right=None):
     w = round(28 * pt)
     region["dbar_ticks"] = paste(canvas, maps_png, (sb[2] + 2, sb[1], sb[2] + 2 + w, sb[3]),
                                  (tb[2] + 2, tb[1], tb[2] + 2 + round(w * sy), tb[3]), (0, 0, 0, 0))
-    # panel b, from just above the axes to the bottom of the page; the Overleaf panel letter sits elsewhere,
+    # panel b, from just above the axes to the bottom of the page; the layout's panel letter sits elsewhere,
     # so the top-left corner, which holds only the letter, is restored afterwards. A widened panel b ends at
     # b_right, and the panel d letter beside its top-right corner moves right to clear it
     tb, sb = T["b"], S["b"]
@@ -363,7 +359,7 @@ def main():
               "joint": dict(frameon=True, loc="lower right", bbox_to_anchor=(.995, .012), labelspacing=.2,
                             borderpad=.3, handlelength=1.6, handletextpad=.5)}
     summary = {}
-    # the RNA-side pass rebuilds the Overleaf panel b as it is (the check); the joint pass widens it to panel a
+    # the RNA-side pass rebuilds the layout's panel b as it is (the check); the joint pass widens it to panel a
     tb = shift(boxes(sub(target, 0, 3100, 2950, target.shape[0]), black_spine, 0.3)[0], 0, 3100)
     b_right = panel_a_right(target, tb)
     joint_width = wide_geometry()[1] * (b_right - tb[0]) / (tb[3] - tb[1])

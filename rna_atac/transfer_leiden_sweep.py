@@ -1,9 +1,9 @@
-"""Search Leiden parameters shared by source and OT-aligned target for Fig. 4a/c.
+"""Search Leiden parameters shared by source and OT-aligned target for the transfer-figure cluster panels.
 
 Source and target (after OT) are clustered independently with the same (k, resolution).
 Overlap is the ARI between each target profile's label and the label of its assigned source
 profile (source_obs_names, the nearest-source mapping used in the published figure). The best
-setting with equal cluster counts is then run through the Fig. 4a/c analysis, with the source
+setting with equal cluster counts is then run through the cluster-panel analysis, with the source
 row showing the re-clustered (not published) source labels.
 """
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)

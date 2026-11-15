@@ -1,6 +1,6 @@
-"""Supplementary Fig. 3: position recovery on the RNA-side, ATAC-side and joint latents.
+"""Position-recovery figure: position recovery on the RNA-side, ATAC-side and joint latents.
 
-Main Fig. 3 scores every model on its RNA-side latent (MultiGATE RNA encoder,
+The spatial-structure figure scores every model on its RNA-side latent (MultiGATE RNA encoder,
 MultiVI X_multivi_rna; analyze_rna_atac.py passes source_rna and the MultiVI
 RNA modality). This repeats the same estimator on the ATAC-side latents
 (MultiGATE ATAC encoder, MultiVI X_multivi_atac) and averages the per-spot ECDF
@@ -9,12 +9,12 @@ RNA_clusters, ATAC latents within ATAC_clusters. It also scores the joint
 latents: MultiGATE's own joint embedding (the "_clip_all" of Train_MultiGATE.py,
 the mean of the L2-normalised RNA and ATAC embeddings), computed here for the
 teacher, student and non-spatial ablation, and MultiVI's joint X_multivi; these
-are averaged within RNA_clusters. The contiguity scatter (former Supplementary
-Fig. S3b) is redrawn from the same statistics.
+are averaged within RNA_clusters. The contiguity scatter is redrawn from the same
+statistics.
 
 compute_spatial_structure_stats is loaded from analyze_rna_atac.py without
 running that script. The teacher is the full-graph teacher latent saved with
-the 2026-05-05 co-embed run's metric inputs (obsm MultiGATE_full_teacher).
+the RNA-ATAC run's metric inputs (rna_atac_analysis/20260505_190037; obsm MultiGATE_full_teacher).
 obsm MultiGATE_teacher in data/aligned_data is not the teacher: analyze_rna_atac.py
 sets it by running the student weights (source_mgate) with the full spatial graph
 (RNA area 0.86). The RNA row reproduces the published areas, which the run
@@ -198,7 +198,7 @@ def compute(out):
 
 
 def draw(out):
-    """Maps for the RNA-side and ATAC-side latents (main Fig. 3 shows the joint latents); contiguity
+    """Maps for the RNA-side and ATAC-side latents (the spatial-structure figure shows the joint latents); contiguity
     scatters by RNA_clusters (RNA-side and joint latents) and by ATAC_clusters (ATAC-side and joint)."""
     S = pickle.load(open(out / "stats.pkl", "rb"))
     res, xy = S["res"], S["xy"]
@@ -234,7 +234,7 @@ def draw(out):
         ax.set_aspect("equal"); ax.axis("off")
         cb = fig.colorbar(sd, cax=fig.add_subplot(gs[row, 7])); cb.ax.tick_params(labelsize=6)
         cb.set_label("$\\Delta$ ECDF area", fontsize=7)
-    # (c) the two cluster annotations on the section, as in main Fig. 2a (scanpy's default palette,
+    # (c) the two cluster annotations on the section, as in the integration figure (scanpy's default palette,
     # stored with the MultiVI data, in natural cluster order)
     # c: two stacked maps (with legends) as tall as the d and e squares beside them
     with h5py.File(DATA / "multivi_mdata.h5mu", "r") as h:

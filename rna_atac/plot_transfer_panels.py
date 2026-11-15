@@ -1,8 +1,8 @@
-"""Regenerate screenshot panels a/c/d/e and separate ATAC/Phactr1 RNA maps.
+"""Transfer-figure panels a/c/d/e and separate ATAC/Phactr1 RNA maps.
 
-The screenshot lettering differs from main.tex and older script names.
+Panel letters are those of the scripted assembly (assemble_transfer_figure.py).
 Only named function definitions are loaded from analyze_rna_atac.py: its
-training, inference and manuscript-writing top-level code is never executed.
+training, inference and figure-writing top-level code is never executed.
 PLS fitting, sign alignment, enrichment, and Scanpy marker scores follow that
 source. Outputs and cached fits are local to --output.
 """
@@ -44,7 +44,7 @@ LABELS = BASE / "outputs/rna_atac_transfer_clusters/shared_params"
 DEFAULT_OUT = BASE / "outputs/rna_atac_figures/fig4_revision_20261020"
 DOMAINS = ("source_rna", "target_rna", "source_atac", "target_atac")
 MYELIN = ["Mbp", "Plp1", "Mobp", "Mal", "Cnp", "Mog", "Mag", "Cldn11", "Ermn", "Sox10"]
-# Panel f's original shortlist_peaks_two_row_smooth1_no_mal uses 10.5 pt
+# Panel f (shortlist_peaks_two_row_smooth1_no_mal) uses 10.5 pt
 # titles, 6 pt colorbar ticks and a 5.1 x 5.25 inch canvas.
 RC = {
     "font.size": 10.5, "axes.titlesize": 10.5, "axes.labelsize": 10.5,

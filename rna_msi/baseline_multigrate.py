@@ -19,7 +19,8 @@ Moran's-I spatially-variable feature selection, normalization layers, var typing
 RNA_clusters/MSI_clusters) already applied. We split it into RNA + MSI modalities,
 organize them into a multigrate multiome AnnData, train, embed, and save.
 
-Env: ``conda activate scvi_env`` (multigrate 0.0.2, scvi-tools 1.3.3).
+Environment: spatialjepa-multigrate ($PY_MULTIGRATE; multigrate 0.0.2, scvi-tools 1.0.4), run with
+PYTHONNOUSERSITE=1.
 """
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)
     import spatialjepa.paths  # noqa: F401

@@ -1,10 +1,10 @@
-"""CPU part of the supplementary figure on PLS C2 (seed0; Fig. 7 recipe, nothing in Fig. 7 changes).
+"""CPU part of the supplementary figure on PLS C2 (seed0; the CaH recipe, which it leaves unchanged).
 
 1  Seed robustness: in seed1/s2 and fix_s0, the component matching seed0's C2 (largest |r| of the
    OT metabolite weights), its RNA/MSI weight agreement, OT-vs-source recovery and rotation null.
 2  snRNA: C2 by subclass (mean, median, IQR), AUROC astrocyte + ependymal vs all other nuclei.
 3  Xenium: the snRNA C2 gene weights applied to every section's expression, z-scored per section
-   (the Fig. 7f recipe); subclass means vs snRNA; local oligodendrocyte density kept for the map.
+   (the CaH figure's projection); subclass means vs snRNA; local oligodendrocyte density kept for the map.
 4  Donor level: donor-mean C2 within each subclass (>= 50 nuclei) vs ADNC (cumulative logit; age, sex,
    PMI), BH over subclasses; the same for C1 for reference.
 Writes c2.pkl next to this script.
@@ -77,7 +77,7 @@ print("\n2. C2 by subclass\n", out["by_subclass"].round(2).to_string(),
       f"\nAUROC low C2 for astrocyte+ependymal {out['auroc_astro_epend_low']:.3f}, astrocyte {out['auroc_astro_low']:.3f}; "
       f"r(C1, C2) over nuclei {out['r_c1_c2']:+.3f}", flush=True)
 
-# 3 Xenium projection (per-section z, as Fig. 7f)
+# 3 Xenium projection (per-section z, as in the CaH figure)
 x = ad.read_h5ad(BASE / "data/SEA_AD/sea_ad_cah/CaH_Xenium_final.2026-01-07.h5ad")
 genes = pd.Index(x.var_names.astype(str)).str.upper()
 w = out["W_rna"][~out["W_rna"].index.duplicated()]; w = w.groupby(w.index.str.upper()).first()

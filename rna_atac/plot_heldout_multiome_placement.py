@@ -1,6 +1,6 @@
-"""Main-text Fig. 2f row (Leiden version of former Supplemental Fig. S5a,d-f).
+"""Held-out Multiome placement row of the integration figure (panels f-g; Leiden clusters).
 
-draw_supp() (reduced supplementary figure) is retained but not called: that figure was dropped.
+draw_supp() draws an alternative, reduced supplementary figure and is not called.
 
 Fig2f_heldout_multiome_row
   (i)   ARI between Multiome Leiden clusters placed on P22 and the spatial teacher's Leiden domains
@@ -19,7 +19,7 @@ S_heldout_multiome_p22
 
 Inputs: heldout_alignment_leiden/ (heldout_multiome_alignment.py --clustering leiden, then
 --summarize) and heldout_alignment/placement_w1_summary.csv (W1 placement does not depend on the
-clustering). Env: nichecompass_liana. Usage: python plot_heldout_multiome_placement.py <out_dir>
+clustering). Environment: spatialjepa-analysis. Usage: python plot_heldout_multiome_placement.py <out_dir>
 """
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)
     import spatialjepa.paths  # noqa: F401
@@ -45,7 +45,7 @@ LEIDEN = RUN / "heldout_alignment_leiden"
 KMEANS = RUN / "heldout_alignment"
 PITCH = 23.0  # P22 coordinate units per spot width
 
-# main-text Fig. 2e colours (Set2): teacher, student, non-spatial, MultiVI
+# the integration figure's colours (Set2): teacher, student, non-spatial, MultiVI
 MODELS = {"student": ("student", "#fc8d62"),
           "teacher_nograph": ("teacher, no graph", "#b3e2cd"),
           "nonspatial": ("non-spatial", "#8da0cb"),
@@ -83,7 +83,7 @@ FIG4A_LABELS = Path(f"{os.environ['SPATIALJEPA_HOME']}/outputs/rna_atac_transfer
 
 
 def fig4a_colour_index(teacher, p22_obs):
-    """Map each teacher cluster to the Fig. 4a source Leiden cluster it overlaps most (one-to-one, RNA rows),
+    """Map each teacher cluster to the transfer figure's source Leiden cluster it overlaps most (one-to-one, RNA rows),
     so teacher clusters take that cluster's tab10 colour."""
     lab = pd.read_csv(FIG4A_LABELS, dtype=str)
     rna = lab[lab.source_obs.str.endswith("_rna")]
@@ -137,7 +137,7 @@ def draw_row(out, src=None, name="Fig2f_heldout_multiome_row", ref_label="teache
 
         cmap = plt.get_cmap("tab10")
         dom, ud = pd.factorize(teacher)
-        cidx = fig4a_colour_index(teacher, maps["p22_obs"].astype(str))  # teacher cluster -> Fig. 4a colour
+        cidx = fig4a_colour_index(teacher, maps["p22_obs"].astype(str))  # teacher cluster -> transfer-figure colour
         ax = fig.add_subplot(gs[0, 1])
         ax.scatter(xy[:, 0], xy[:, 1], c=[cmap(cidx[ud[i]] % 10) for i in dom], s=2.2, lw=0, rasterized=True)
         ax.set_aspect("equal"); ax.axis("off")
@@ -161,7 +161,7 @@ def draw_row(out, src=None, name="Fig2f_heldout_multiome_row", ref_label="teache
 
 
 def draw_f(out, src, name, ref_label):
-    """Panel f only, as laid out in main-text Fig. 2: no PCA/LSI baseline, labels rotated like panel e."""
+    """Panel f only, as laid out in the integration figure: no PCA/LSI baseline, labels rotated like panel e."""
     t = pd.read_csv(src / "alignment_summary.csv", index_col=[0, 1])
     models = [m for m in ("student", "teacher_nograph", "nonspatial", "multivi") if (m, "knn") in t.index]
     rc = {**RC, "font.size": 9.5, "axes.labelsize": 9.5, "xtick.labelsize": 8.5, "ytick.labelsize": 8.5}  # +1.5 pt
@@ -185,7 +185,7 @@ def draw_f(out, src, name, ref_label):
 
 
 def draw_maps(out, src, name, ref_label):
-    """Panel g only: teacher reference and agreement maps, coloured as main-text Fig. 4a."""
+    """Panel g only: teacher reference and agreement maps, coloured as the transfer figure's clusters."""
     maps = load_maps(src)
     xy = maps["coords"][:, :2]
     teacher = np.asarray(maps["teacher_K10"]).astype(str)

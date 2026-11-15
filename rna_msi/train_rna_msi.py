@@ -150,7 +150,7 @@ sample_ids = ["V11T17-102_A1", "V11T17-102_C1", "V11T17-102_D1"]
 # Optional env overrides for scripted reruns (unset = the values in this file):
 #   SPATIALJEPA_SAMPLE_IDS            comma-separated sample IDs
 #   SPATIALJEPA_RUN_TAG               suffix for RUN_ID, so model/figure dirs don't clobber
-#   SPATIALJEPA_N_TARGET_TOP          target-panel size (442 reproduces the Fig. 5 model)
+#   SPATIALJEPA_N_TARGET_TOP          target-panel size (reproduce.sh uses 2000)
 #   SPATIALJEPA_TEACHER_NEIGHBORHOOD  "exact" | "induced"
 #   SPATIALJEPA_SEED                  seed torch/numpy/random before model construction
 if os.getenv("SPATIALJEPA_SAMPLE_IDS"):
@@ -358,9 +358,7 @@ def prepare_hvf_joint_adata(joint_adata, *, target_panel_path=None, variant_labe
     else:
         print(f"[{variant_label}] keeping all ST genes before Moran's-I selection")
 
-    # When integrating multiple sections, the batch_key branch also removes features whose abundance differs strongly *between* sections (assumed technical batch effects). That
-    # filter cannot tell a batch effect from genuine cross-section biology: e.g. Dopamine
-    # (and anything co-depleted with it) varies across sections by lesion extent (log2FC ~= 19.7 between A1 and C1) and gets dropped at the default min_logfc=3. Use a very lenient threshold so only the most extreme present/absent artifacts (log2FC > 25) are removed, retaining the dopamine-correlated biological axis.
+    # For multiple sections, apply between-section feature filtering with min_logfc=25.
     smt.pp.spatial_variable_joint_adata_sm_st(
         joint_adata,
         n_top_genes=2000,
@@ -410,16 +408,11 @@ def prepare_hvf_joint_adata(joint_adata, *, target_panel_path=None, variant_labe
 
 
 # Build a no-panel artifact from the same canonical pre-panel object used for training.
-# This replaces the self-contained rebuild previously kept in dopamine_nmf_signature.py.
 #
-# NOTE on the 'normalized' layer carried into this artifact: when assemble_section()
-# above picks up an *_SCT.h5mu file (SCT preprocessing applied), 'normalized' is built
-# from SCT_data (already log-normalized), not from raw counts + total-count
-# normalization. The best-performing NMF/dopamine bivariate Moran's I run found so far
-# (max ~0.50) used raw-counts + total-counts normalization -> 'normalized', from before
-# SCT was introduced into assemble_section(). That exact feature is no longer
-# reproducible from this SCT-based artifact; dopamine_nmf_signature.py uses
-# 'SCT_counts' (SCT-corrected, non-negative counts) as the closest available substitute
+# When assemble_section() above picks up an *_SCT.h5mu file, the 'normalized' layer is
+# built from SCT_data (already log-normalized), not from raw counts with total-count
+# normalization, so dopamine_nmf_signature.py uses 'SCT_counts' (SCT-corrected,
+# non-negative counts) for the no-panel KL-NMF analysis.
 # for the no-panel KL-NMF analysis.
 joint_adata_no_panel = prepare_hvf_joint_adata(
     joint_adata.copy(),
@@ -544,14 +537,12 @@ for sample_id in SAMPLE_IDS:
 
 # set training hyperparameters. disable LR scheduler for human (i.e. non-mouse)
 max_epoch = 1000 if species == "mouse" else 200
-# the human checkpoints behind the manuscript (Jul 1, Jul 28) were trained for 1000 epochs
 max_epoch = int(os.getenv("SPATIALJEPA_MAX_EPOCH", max_epoch))
 learning_rate           = 1e-3  if species == "mouse" else 1e-5
 lr_scheduler_step_size  = 200   if species == "mouse" else max_epoch
 lr_scheduler_gamma      = 0.1   if species == "mouse" else 1.0
 # Teacher mini-batch message passing: "exact" gives every batch spot its full spatial
-# neighbourhood; "induced" (keep only within-batch edges, ~0.3 neighbours/spot at k=6)
-# reproduces the checkpoints behind the submitted manuscript.
+# neighbourhood; "induced" keeps only within-batch edges.
 TEACHER_NEIGHBORHOOD = os.getenv("SPATIALJEPA_TEACHER_NEIGHBORHOOD", "exact")
 # Distillation timing (see SpatialJEPA_trainer): "batch" steps the student on every
 # teacher mini-batch; "epoch" runs one student epoch after each teacher epoch.
@@ -609,7 +600,6 @@ if SEED is not None:
     seed_everything(SEED)
 teacher_model = spatialJEPA_model(joint_adata, graph_conv=True, full_graph=True, batch_keys=batch_keys, section_key=section_key, neighborhood=TEACHER_NEIGHBORHOOD)
 student_model = spatialJEPA_model(joint_adata, graph_conv=True, full_graph=False, batch_keys=batch_keys, section_key=section_key)
-# TODO: ablation -- train an identity-graph ConditionalVAESTSM_STtoSM with .fit() to separate the ST->SM term from spatial context in the dopamine benchmark; this nonspatial baseline is the stock class and so lacks ST->SM, confounding the teacher/student vs nonspatial gap.
 nonspatial_model = smt.model.ConditionalVAESTSM(
     joint_adata,
     device="cuda:0",

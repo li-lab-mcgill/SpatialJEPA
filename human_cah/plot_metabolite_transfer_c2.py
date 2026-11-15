@@ -4,7 +4,7 @@
     vs measured (held-out component matched to the full-data C2 by |cos|, signs aligned to it);
     norepinephrine ringed.
 (b) Metabolites transferred to CaH nuclei by subclass (mean of OT-paired values, z per metabolite, over
-    the 40,000 Fig. 7 nuclei), subclasses ordered by mean C2, C2 weight in brackets.
+    the 40,000 OT-paired nuclei), subclasses ordered by mean C2, C2 weight in brackets.
 Inputs: supp_metab.pkl (metabolite_transfer_supplement.py), c2.pkl (component_c2.py). Writes supp_metabolite_transfer_c2.{png,svg}.
 """
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)

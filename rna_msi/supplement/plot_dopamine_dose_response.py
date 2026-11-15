@@ -6,7 +6,7 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-# Draft panel: source dopamine weight of a latent direction vs NMF-22 convergence of its target gene
+# Dose-response panel: source dopamine weight of a latent direction vs NMF-22 convergence of its target gene
 # weights. Grey: 5,000 random latent directions (oriented dopamine >= 0); dots: the six MSI components.
 import pickle
 import sys
@@ -19,7 +19,7 @@ import numpy as np
 
 D = Path(sys.argv[1])
 OUT = Path(sys.argv[2])
-RUN = (sys.argv[3] if len(sys.argv) > 3 else "fixed s3").replace(" ", "_")   # as dopamine_direction_null*.py
+RUN = (sys.argv[3] if len(sys.argv) > 3 else "fixed s3").replace(" ", "_")   # as null_random_latent_directions.py
 INK, MUTED, CLOUD, DA_RED = "#222222", "#6b6b6b", "#c9c9c9", "#b2182b"
 plt.rcParams.update({"font.size": 8, "axes.edgecolor": INK, "axes.labelcolor": INK, "xtick.color": INK,
                      "ytick.color": INK, "font.family": "DejaVu Sans"})
@@ -72,7 +72,7 @@ def facet(ax, res, model, title, show_x=True, show_y=True):
         ax.tick_params(labelleft=False)
 
 
-# main-figure draft: two facets stacked (fits the panel-i slot of Fig. 5)
+# two facets stacked (sized for the overview's panel-i slot)
 fig, axes = plt.subplots(2, 1, figsize=(3.4, 4.8), sharex=True)
 facet(axes[0], sj, "teacher @ P22", "Teacher (P22 spatial target)", show_x=False)
 facet(axes[1], sj, "student @ multiome", "Student (dissociated multiome target)")
@@ -81,7 +81,7 @@ for ext in ("png", "svg"):
     fig.savefig(OUT / f"draft_dopamine_dose_panel.{ext}", dpi=300)
 plt.close(fig)
 
-# supplement draft: SpatialJEPA (top) vs the RNA-PCA control (bottom), P22 and multiome
+# supplementary figure: SpatialJEPA (top) vs the RNA-PCA control (bottom), P22 and multiome
 fig, axes = plt.subplots(2, 2, figsize=(6.4, 5.2), sharex=True, sharey=True)
 facet(axes[0, 0], sj, "teacher @ P22", "Teacher latent, P22", show_x=False)
 facet(axes[0, 1], sj, "student @ multiome", "Student latent, multiome", show_x=False, show_y=False)

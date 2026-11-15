@@ -1,14 +1,13 @@
-"""Manuscript Fig. 4a,c from independent source/target Leiden clusters (shared k=150, res=0.9).
+"""Transfer-figure cluster panels from independent source/target Leiden clusters (shared k=150, res=0.9).
 
 Panel a uses shared row/column titles and the colours from run_alignment_and_spatial_plot
-in MultiGATE scripts/analyze_rna_atac.py; panel c ports its DE-concordance block (scanpy t-test vs rest,
+in rna_atac/analyze_rna_atac.py; panel c ports its DE-concordance block (scanpy t-test vs rest,
 genes significant in both domains, hexbin of pooled -log p ranks, LOWESS per cluster, per-cluster
 Spearman). Target clusters are renamed to the source cluster they overlap most (Hungarian
 matching on target vs assigned-source labels), so both domains share one legend; see
 transfer_leiden_sweep.py for the clustering.
 
-Each panel is drawn at the physical size of its slot in the assembled figure
-(overleaf-cibb-2026/figures/2_source_target_aligned.svg), so it drops in at 100% scale. Type
+Each panel is drawn at its final physical size, so it needs no rescaling. Type
 sizes follow PANEL_RC in analyze_rna_atac.py; dense scatter layers are rasterized, while text,
 axes, hexbins and lines stay vector.
 """
@@ -40,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from transfer_target_leiden import load, match_clusters  # noqa: E402
 
 MM = 1 / 25.4
-## slot sizes in the assembled Fig. 4 (panel c = rank plot over Spearman stem plot)
+## slot sizes in the transfer figure (panel c = rank plot over Spearman stem plot)
 PANEL_SIZE_IN = {"a": (74.5 * MM, 59.3 * MM), "c": (53.2 * MM, 60.6 * MM)}
 ## point sizes as they read in the assembled figure (analyze_rna_atac.py PANEL_FS/PANEL_RC)
 FS = {"tick": 5.5, "label": 6.5, "legend": 5.5}
@@ -78,8 +77,8 @@ def points_per_unit(ax, fig):
 def plot_a(domains, categories, out, figsize=None, rc=None):
     """domains: [(labels, spatial, umap, side, title_suffix), ...].
 
-    Domain names label rows; spatial/UMAP titles label columns. The legacy
-    suffix is accepted for callers but no longer repeated on each target plot.
+    Domain names label rows; spatial/UMAP titles label columns. The suffix argument
+    is accepted for callers but not repeated on each target plot.
     """
     with plt.rc_context(RC_A if rc is None else rc):
         fig = plt.figure(figsize=PANEL_SIZE_IN["a"] if figsize is None else figsize)
@@ -166,7 +165,7 @@ def plot_c(source_rna, target_rna, source_labels, target_labels, categories, out
         ax.set_position([pos.x0, pos.y0, right - pos.x0, pos.height])
         save(fig, out)
 
-    # analyze_rna_atac.py checks these markers are top genes of some Leiden cluster (Fig. 4b).
+    # analyze_rna_atac.py checks these markers are top genes of some Leiden cluster.
     merged["combined_pvals"] = merged.apply(lambda r: combine_pvalues(
         [r["pvals_adj_source"], r["pvals_adj_target"]], method="pearson")[1], axis=1)
     top = merged.groupby("group").apply(lambda df: df.nsmallest(1, "combined_pvals", keep="all"))["names"].unique()

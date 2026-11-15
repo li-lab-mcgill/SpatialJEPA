@@ -6,20 +6,20 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-#%% MOFA-free versions of the Fig. 5 / Fig. 6 dopamine analyses, from PLS decoders.
+#%% MOFA-free versions of the dopamine-program analyses, from PLS decoders.
 #
-# All post-hoc PLS decoders in the manuscript share one input space, the student latent:
+# All post-hoc PLS decoders share one input space, the student latent:
 #   MSI decoder   latent -> 779 metabolites, fitted on the source section's MEASURED MSI
 #                 (student_pls_decoder.joblib; it imputes the targets' MSI)
-#   RNA decoder   latent -> target genes, fitted here in each target (as in Fig. 2)
-#   ATAC decoder  latent -> target peaks, fitted here in each target (as in Fig. 2)
+#   RNA decoder   latent -> target genes, fitted here in each target
+#   ATAC decoder  latent -> target peaks, fitted here in each target
 # A direction in the latent therefore has metabolite, gene and peak loadings at once,
 # with no MOFA factor to choose or orient:
 #
 #   dopamine axis   the MSI decoder's dopamine direction (imputed dopamine = z . beta_DA).
 #                   Recovered exactly by regressing the stored imputed dopamine on the
-#                   stored target latent, so it is available for the manuscript's June model
-#                   too, whose decoder file was overwritten.
+#                   stored target latent, so it is also available for runs whose decoder file
+#                   no longer reproduces the stored imputation (the reference run).
 #   MSI-PLS C1-C4   the decoder's own components (runs whose decoder file reproduces the
 #                   stored imputation), oriented so dopamine loads positively. Their
 #                   metabolite loadings come from measured source MSI (non-circular).
@@ -29,15 +29,15 @@ import os  # noqa: E402
 # 2014): g = Q R^T Sigma b / sd(score). With K = latent dim this equals corr(feature,
 # score); the structure correlation is reported alongside as a check.
 #
-# Analyses (Fig. 5 / Fig. 6 counterparts):
+# Analyses (counterparts of the MOFA+ versions):
 #   metabolites   per decoder component: dopamine share, ranks of the catecholamine-pathway
 #                 metabolites (Dopamine, Dopamine (single), 3-MT, Norepinephrine), and a
 #                 permutation p for their mean rank
-#   genes (5j)    AUROC of dopamine-axis gene loadings vs the NMF program's top-50, in both
+#   genes (j)     AUROC of dopamine-axis gene loadings vs the NMF program's top-50, in both
 #                 targets; MSN-identity baseline; identity-adjusted partial correlations
-#   ATAC (6b)     weighted GSEA of D2-MSN / MXD cCRE peaks over Fig. 6's 2,000 peaks ranked
+#   ATAC (b)      weighted GSEA of D2-MSN / MXD cCRE peaks over the board's 2,000 peaks ranked
 #                 by dopamine-axis peak loading (permutation NES, sign-specific null), and
-#                 over all 66,520 peaks by AUROC; leading-edge BEDs for the motif test (6c)
+#                 over all 66,520 peaks by AUROC; leading-edge BEDs for the motif test (c)
 #   RNA vs ATAC   peaks linked to genes (10x annotation): concordance of peak and gene
 #                 loadings (promoter / distal, gene-shuffle null), and whether peaks linked
 #                 to the NMF top-50 genes sit at the top of the ATAC ranking
@@ -63,13 +63,13 @@ MODELS = OUT / "spatialjepa_models"
 DATA = Path(f"{os.environ['SPATIALJEPA_HOME']}/data")
 BASE = "V11L12-109_B1"
 RUNS = {
-    "manuscript": "",
+    "manuscript": "",   # the reference run V11L12-109_B1 (NMF signature, target containers)
     "old-behaviour retrain": "__induced2000",
     "fixed s0": "__fix2000",
     "fixed s1": "__fix2000_s1",
     "fixed s2": "__fix2000_s2",
     "fixed s3": "__fix2000_s3",
-    "seed3": "_seed3",   # fixed s3 with the early-stopped teacher (SPATIALJEPA_TEACHER_EARLY_STOP=1)
+    "seed3": "_seed3",   # the released mouse model: "fixed s3" with the early-stopped teacher (SPATIALJEPA_TEACHER_EARLY_STOP=1)
 }
 TARGETS = {
     "multiome": dict(h5mu="multiome_target_rna_atac_msi.h5mu", emb="multiome_target_rna_embedded.h5ad",
@@ -81,7 +81,7 @@ TARGETS = {
 }
 DA = "msi:Dopamine"
 CATECHOLAMINES = ["msi:Dopamine", "msi:Dopamine (single)", "msi:3-MT", "msi:Norepinephrine"]
-K_FEATURE = 9          # latent -> RNA / ATAC decoders, as in the manuscript's Fig. 2
+K_FEATURE = 9          # latent -> RNA / ATAC decoders
 TOP_K = 50
 N_PERM = 1000
 MARKERS = {
@@ -490,7 +490,7 @@ def main():
                         args.out_dir / f"gene_loadings_{run.replace(' ', '_')}.csv", index=False)
                     pd.DataFrame({"peak": peaks, "decoded": p_dec, "corr": p_cor}).to_csv(
                         args.out_dir / f"peak_loadings_{run.replace(' ', '_')}.csv", index=False)
-                # ATAC: cCRE enrichment (Fig. 6b), leading edge for motifs (Fig. 6c)
+                # ATAC: cCRE enrichment (board panel b), leading edge for motifs (panel c)
                 for label, member in ccre.items():
                     res, leading = weighted_gsea(p_dec[fig_mask], member[fig_mask])
                     gsea_rows.append(dict(target=target, run=run, axis=ax["name"], ccre=label,

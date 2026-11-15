@@ -1,6 +1,7 @@
 """Supplemental figure: held-out Multiome placement scored against the published P22 annotations.
 
-Same pipeline and models as main-text Fig. 2f, but the reference labels change to the published RNA and
+Same pipeline and models as the held-out placement panels of the integration figure, but the reference
+labels change to the published RNA and
 ATAC clusters of Zhang et al. (2023). Placed clusters
 are each model's own Leiden clusters of its Multiome embedding at K=10, the resolution scored against
 the published labels by heldout_multiome_alignment.py. Dashes are in-sample references: each
@@ -37,9 +38,9 @@ from plot_heldout_multiome_placement import MODELS, COUPLINGS, DARK, RC, LEIDEN 
 
 PANEL_MODELS = ("student", "teacher_nograph", "nonspatial", "multivi")
 REFS = {"RNA_clusters": "published RNA clusters", "ATAC_clusters": "published ATAC clusters"}
-# The teacher-domain reference is main-text Fig. 2f; it is not repeated here.
+# The teacher-domain reference is shown in the integration figure; it is not repeated here.
 CACHE = LEIDEN / "in_sample_vs_published_K10.csv"
-TEACHER_COLOUR = "#66c2a5"  # main-text Fig. 2e (Set2): teacher
+TEACHER_COLOUR = "#66c2a5"  # the integration figure's teacher colour (Set2)
 SOURCE_H5AD = Path(f"{os.environ['SPATIALJEPA_HOME']}/data/aligned_data/source_rna_aligned_with_latents.h5ad")
 
 

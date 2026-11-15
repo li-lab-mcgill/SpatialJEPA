@@ -6,22 +6,23 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-# Fig. 5 candidate panels (2026-10-24): a compact panel i and a teacher-imputed dopamine map for row 3.
+# Imputed-dopamine panels: a compact panel i and a teacher-imputed dopamine map.
 #
 #   panel i      Student PLS C2 on the multiome nuclei, top-10 genes and top-10 metabolites by |weight|,
 #                as one two-sided lollipop chart: genes extend left, metabolites right, rank on the shared
 #                vertical axis (1 at the top). Stem length = |weight|; stem and marker colour = sign;
 #                marker shape = feature type (gene circle, annotated metabolite diamond, unannotated m/z
-#                square). Weights are those of the current panel i: corr(nucleus gene, student C2 score)
+#                square). Weights are those of panel i: corr(nucleus gene, student C2 score)
 #                and the OT-recovered metabolite weights (msi_svd_intact/multiome/weights_target_*.csv.gz).
-#   maps         teacher- (and student-) imputed msi:Dopamine on the P22 spatial target (the supplementary teacher map),
-#                drawn like panels g and h: same map and colour-bar boxes as panel g of the top-10 layout
+#   maps         teacher- (and student-) imputed msi:Dopamine on the P22 spatial target,
+#                drawn like panels g and h: same map and colour-bar boxes as panel g of the overview
 #                (264.0 x 258.8 pt map; 12.4 x 248.0 pt bar, 5.4 pt to its right), viridis on the
-#                98th-percentile clip with gamma 2 (5__ FIG_dopamine_overview's factor_map_clip / _gamma),
-#                markers s=10 on the #ededed backdrop, y mirrored as for g, 5__'s font sizes.
-#   S5           the teacher map and the same map from the student's decoder side by side (Supplementary Fig. S5),
+#                98th-percentile clip with gamma 2 (dopamine_nmf_signature.py FIG_dopamine_overview's
+#                factor_map_clip / _gamma), markers s=10 on the #ededed backdrop, y mirrored as for g, the
+#                overview's font sizes.
+#   pair         the teacher map and the same map from the student's decoder side by side,
 #                each on its own 2-98th percentile clip, as the two decoders' outputs are on different scales.
-# Usage: plot_imputed_dopamine_teacher_student.py <out_dir> [<S5 path stem>]
+# Usage: plot_imputed_dopamine_teacher_student.py <out_dir> [<pair path stem>]
 #   env FIG567_RUN: model run of msi_components_common.RUNS (default "fixed s3")
 import os
 import sys
@@ -112,7 +113,8 @@ def lollipop():
 
 
 def colorbar_ticks(norm, nbins=5):
-    """5__ _fig_spatial_scatter's tick thinning: round values spaced by position along the bar."""
+    """The tick thinning of dopamine_nmf_signature.py's _fig_spatial_scatter: round values spaced by
+    position along the bar."""
     cand = MaxNLocator(nbins=nbins * 2).tick_values(norm.vmin, norm.vmax)
     cand = cand[(cand >= norm.vmin) & (cand <= norm.vmax)]
     ticks, last = [], -np.inf
@@ -175,7 +177,7 @@ def single_maps():
 
 
 def supplementary_s5(path):
-    """Supplementary Fig. S5: (a) teacher- and (b) student-imputed dopamine side by side, each with its own bar."""
+    """Teacher- (a) and student-imputed (b) dopamine side by side, each with its own bar."""
     W, H, step = 700.0, 300.0, 345.0
     with plt.rc_context(RC):
         fig = plt.figure(figsize=(W * PT, H * PT))
@@ -190,7 +192,7 @@ def supplementary_s5(path):
 
 
 def s5_numbers(path):
-    """The numbers in the S5 text: per-spot teacher-student correlation and per-cluster means of the z-scored maps."""
+    """Per-spot teacher-student correlation and per-cluster means of the z-scored maps."""
     from scipy.stats import pearsonr, spearmanr
     obs = pd.Index([str(o) for o in np.load(PROJ / "spatial_target_teacher_msi_imputed.npz", allow_pickle=True)["obs_names"]])
     v = pd.DataFrame({w: imputed_dopamine(w)[0] for w in ("teacher", "student")}, index=obs)

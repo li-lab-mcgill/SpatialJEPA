@@ -168,7 +168,7 @@ def topic_betas_hallmark_gsea_mouse(
         Base data directory (defaults to ``os.environ["SPATIALJEPA_DATA"]``).
     ortholog_filename
         CSV under ``<datapath>/gene_annotations/`` with columns
-        ``Gene name`` and ``Mouse gene name`` (as in multigate_co_embed).
+        ``Gene name`` and ``Mouse gene name`` (as in analyze_rna_atac.py).
 
     Returns
     -------
