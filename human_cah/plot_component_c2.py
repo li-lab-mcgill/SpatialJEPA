@@ -1,16 +1,16 @@
-"""Supplementary figure on PLS C2 in the layout of Fig. 7 (cah_cell_runner.fig7_board), seed0.
+"""Supplementary figure on PLS C2 in the layout of the CaH figure (cah_cell_runner.fig7_board), seed0.
 
     python plot_component_c2.py
 
-a  top C2 RNA and OT-recovered MSI weights (Fig. 7a function)
-b  RNA UMAPs coloured by C2 and by subclass (Fig. 7b; labels for C2's poles instead of MSN/oligodendrocyte)
-c  C2 by subclass, ordered by mean (Fig. 7c violin function)
+a  top C2 RNA and OT-recovered MSI weights (the CaH figure's panel a function)
+b  RNA UMAPs coloured by C2 and by subclass (labels for C2's poles instead of MSN/oligodendrocyte)
+c  C2 by subclass, ordered by mean (the CaH figure's violin function)
 d-f  one row per Xenium section (SECTIONS), each with
-   local ependymal density (Fig. 7d recipe: KDE of ependymal cells, bw 0.25 x Scott, min-max)
-   C2 projected onto every cell with the snRNA gene weights (Fig. 7f recipe), 30-NN mean
+   local ependymal density (the CaH density recipe: KDE of ependymal cells, bw 0.25 x Scott, min-max)
+   C2 projected onto every cell with the snRNA gene weights (the CaH projection), 30-NN mean
    astrocyte C2: ridge on the 464 Xenium genes fitted within snRNA astrocytes, count-adjusted per section,
-   30-NN astrocyte mean (astrocyte_c2_xenium.py; the recipe of Fig. 7 astrocyte panel g)
-The MOFA file is opened only for its feature and nucleus index (as fig7_early_figure.py), from fix_s0.
+   30-NN astrocyte mean (astrocyte_c2_xenium.py; the recipe of the CaH astrocyte panel)
+The MOFA file is opened only for its feature and nucleus index, from fix_s0.
 Writes supp_pls_c2.{png,svg}.
 """
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)
@@ -76,7 +76,7 @@ w_rna = w_rna.groupby(w_rna.index.str.upper()).first()
 
 
 def project_spatial_onto_factor(spatial, *_, key="mofa_factor1", **__):
-    """Fig. 7f recipe (cah_components.stage_figure) for C2: snRNA gene weights on per-section z-scored expression."""
+    """The CaH projection (cah_components.stage_figure) for C2: snRNA gene weights on per-section z-scored expression."""
     X = spatial.X.toarray() if sp.issparse(spatial.X) else np.asarray(spatial.X, dtype=float)
     Z = (X - X.mean(0)) / X.std(0).clip(1e-6)
     genes = pd.Index(spatial.var_names.astype(str)).str.upper()

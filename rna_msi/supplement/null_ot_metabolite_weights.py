@@ -6,7 +6,7 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-# Supplementary (replaces the metabolite-weight recovery and held-out-animal figures): the main-text
+# Supplementary figure: the
 # recipe for metabolite weights in RNA-only targets, applied to random latent directions, with the
 # target latent randomly rotated before pairing as the control. Laid out like the dose-response figure.
 # Usage: null_ot_metabolite_weights.py <out_dir> [--draw-only]
@@ -15,7 +15,7 @@ import os  # noqa: E402
 #   x           dopamine weight of the direction in the source (measured MSI, intact hemisphere)
 #   y           dopamine weight recovered in the target: entropic OT pairing of target cells with
 #               source spots (reg 0.01), PLS decoder fitted on the target, R_m x corr(decoded, score)
-#               (fig567 ot_msi_weights; ot_msi_recovery.py `recovered`)
+#               (shared_msi_components.ot_msi_weights)
 #   control     the same with the target latent randomly rotated before pairing only (alignment to
 #               the source broken, target distribution kept); 20 rotations, each scoring 250 of the
 #               random directions and all six components

@@ -6,22 +6,23 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-#%% Supplementary to Fig. 6d: the Fig. 6b motifs placed on the source tissue through the student latent.
-# (Column and stats labels still say "6c", the panel's letter when this was written; the figure says 6b.)
+#%% Supplementary to the regulatory board: its top motifs placed on the source tissue through the student latent.
+# (Column and stats labels call the motif panel "6c".)
 #
 # Only RNA is aligned: the student latent of the multiome nuclei (from their RNA) is paired with
-# the source Visium spots (RNA + MSI, V11L12-109_B1, both hemispheres) by the entropic OT of Fig. 5i
-# (fig567 ot_barycentre, reg OT_REG, standardised latents, uniform marginals). The coupling places
+# the source Visium spots (RNA + MSI, V11L12-109_B1, both hemispheres) by the entropic OT of the
+# overview's panel i (shared_msi_components.ot_barycentre, reg OT_REG, standardised latents, uniform
+# marginals). The coupling places
 # each nucleus on the source tissue, and its ATAC follows because RNA and ATAC come from the same
 # nucleus: every spot gets the coupling-weighted mean motif accessibility of its nuclei, as pychromVAR
-# deviation z-scores (all peaks; fig6_chromvar_multiome) residualised on log ATAC depth. The same recipe
-# carries the source MSI to the nuclei in 5i (there on the intact hemisphere's spots), so the
+# deviation z-scores (all peaks; multiome_motif_deviations.py) residualised on log ATAC depth. The same recipe
+# carries the source MSI to the nuclei in panel i (there on the intact hemisphere's spots), so the
 # measured dopamine map and the motif maps share one spatial reference.
 #
-#   motifs     the top 15 of the GC-adjusted motif panel (Fig. 6b) by odds ratio (--ranking, fig56's
+#   motifs     the top 15 of the GC-adjusted motif panel (board panel b) by odds ratio (--ranking, plot_dopamine_program.py's
 #              motifs_gc/pls_C2_gmm_d2msn_motif_ranking.csv;
 #              JASPAR versions of one motif averaged), their mean, EGR1 (RNA-ATAC concordant at FDR on
-#              both sides; Fig. 6d of fig56_pls_manuscript draws ZEB1, PBX3, MEIS1, EGR1), and
+#              both sides; board panel d of plot_dopamine_program.py draws ZEB1, PBX3, MEIS1, EGR1), and
 #              SOX10 / NEUROD2 as controls
 #   stats      per motif map: AUROC striatum vs other spots (all, and within each hemisphere), Moran's I
 #              (6-NN spot graph); null: the nuclei latent randomly rotated before OT (N_ROT);
@@ -50,7 +51,7 @@ RANKING = P.OUT / "figure_bundle_fig567_2026-10-20" / "work" / "fig56" / "motifs
 N_TOP, N_ROT, K_NN = 15, 20, 50
 CONCORDANT = ["EGR1"]
 CONTROLS = {"SOX10": "oligodendrocyte", "Neurod2": "excitatory neuron"}
-SHOW = ["MEIS3", "JUNB"]          # leading 6b motifs not already mapped in main Fig. 6d (ZEB1, PBX3, MEIS1, EGR1)
+SHOW = ["MEIS3", "JUNB"]          # leading panel-b motifs not already mapped on the board (ZEB1, PBX3, MEIS1, EGR1)
 SET = f"6c top {N_TOP} (mean)"
 INK, MUTED, GREY = "#222222", "#6b6b6b", "#b5b5b5"
 
@@ -122,7 +123,7 @@ def compute(out, ranking_csv, run="fixed s3"):
     print(f"[data] {len(Z0t):,} nuclei -> {len(Z0s):,} spots; {len(motifs)} motifs; 6c top {N_TOP}: {', '.join(top)}",
           flush=True)
 
-    # spot maps: OT (Fig. 5i plan, spots x nuclei), rotated-latent OT, kNN
+    # spot maps: OT (the panel-i plan, spots x nuclei), rotated-latent OT, kNN
     maps = SC.ot_barycentre(Z0t, V, Z0s, reg=SC.OT_REG)
     rng = np.random.default_rng(0)
     rot_auc, rot_moran = [], []
@@ -173,7 +174,7 @@ def _clean(ax):
 
 
 def _map(ax, D, v, title, cmap="viridis", colors=None):
-    """Spots as overlapping discs (1.7x the 24-unit pitch, as Fig. 5a's large markers), which also
+    """Spots as overlapping discs (1.7x the 24-unit pitch, as the overview's large markers), which also
     covers the runs of spots missing from the source section."""
     w, h = (np.ptp(D[c]) * 1.04 for c in ("x", "y"))
     box = ax.get_position()
@@ -215,7 +216,7 @@ def draw(out, ranking_csv=None, run=None):
          f"striatum AUROC {st.loc['MSN-cluster share', 'auroc_striatum']:.2f}", cmap="magma")
     _map(r1[3], D, D[SET], f"Fig. 6b top-{N_TOP} motifs (mean)\n{lab(SET)}")
 
-    # row 2: (b) the leading 6b motifs not mapped in main Fig. 6d, beside (c) the control motifs
+    # row 2: (b) the leading panel-b motifs not mapped on the board, beside (c) the control motifs
     r2 = gs[1].subgridspec(1, 4, wspace=0.05).subplots()
     for ax, m in zip(r2[:2], SHOW):
         _map(ax, D, D[m], f"{m}\nstriatum AUROC {st.loc[m, 'auroc_striatum']:.2f}")

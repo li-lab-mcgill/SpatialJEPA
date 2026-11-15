@@ -13,7 +13,7 @@
 #   heldout_animals_run.sh reset-failed  # make failed runs claimable again
 #   heldout_animals_run.sh reset-stale   # release claims older than $STALE_HOURS
 #   heldout_animals_run.sh evaluate      # heldout_animals_evaluate.py on finished runs
-#   heldout_animals_run.sh structure     # 9__: manuscript Fig. 5 dopamine metrics (2 envs)
+#   heldout_animals_run.sh structure     # heldout_animals_dopamine_structure.py: dopamine embedding metrics (2 envs)
 #
 # Settings (environment variables):
 #   REGION=striatum|sn|both        DESIGN=pairwise|loao|both|split
@@ -32,7 +32,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY=${PY:-${PY_MSI}}
-# dopamine_embedding_benchmark.py (imported by 9__ --stage evaluate) needs scib_metrics/jax
+# dopamine_embedding_benchmark.py (imported by heldout_animals_dopamine_structure.py --stage evaluate) needs scib_metrics/jax
 PY_METRICS=${PY_METRICS:-${PY_ANALYSIS}}
 SPATIALJEPA_OUT=${SPATIALJEPA_OUT:-${SPATIALJEPA_HOME}/outputs}
 BENCH_DIR=${ANIMAL_TRANSFER_BENCH_DIR:-${SPATIALJEPA_OUT}/spatialjepa_benchmark/animal_transfer}

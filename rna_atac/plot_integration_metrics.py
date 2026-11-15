@@ -1,4 +1,4 @@
-"""Supplementary Fig. S1: integration metrics (a-b) + per-model UMAPs (c-f).
+"""Integration-metrics figure: integration metrics (a-b) + per-model UMAPs (c-f).
 
 a/b: bars drawn as in plot_scib_barplot (analyze_rna_atac.py): Set2 colour per
      model in the same order, hatching for in-sample scores, 95% intervals, and
@@ -43,7 +43,7 @@ IN_SAMPLE = {"teacher_source", "source", "source_nonspatial", "source_multivi"}
 METRICS = [("foscttm", "1-FOSCTTM"), ("ilisi", "iLISI"), ("bio_conservation", "bio_cons.")]
 MODEL_COLORS = dict(zip(SRC + TGT, sns.color_palette("Set2", n_colors=7)))
 
-# scanpy default_20, assigned in the label orders used by main Fig. 2
+# scanpy default_20, assigned in the label orders used by the integration figure
 DEFAULT_20 = ['#1f77b4', '#ff7f0e', '#279e68', '#d62728', '#aa40fc', '#8c564b', '#e377c2',
               '#b5bd61', '#17becf', '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5',
               '#c49c94', '#f7b6d2', '#dbdb8d', '#9edae5', '#ad494a', '#8c6d31']
@@ -52,16 +52,16 @@ MODALITY_COLORS = {"atac": DEFAULT_20[0], "rna": DEFAULT_20[1]}
 FS_TICK, FS_TITLE, FS_LEGEND, FS_LETTER = 5.5, 6.5, 5.5, 9
 mpl.rcParams.update({"font.size": FS_TICK, "axes.linewidth": 0.4, "hatch.linewidth": 0.6})
 
-# v2 metrics, with MultiVI zero-shot re-scored on all target nuclei (metrics_bootstrap_v3)
+# metrics with MultiVI zero-shot scored on all target nuclei (metrics_bootstrap_v3)
 metrics = pd.read_csv(os.path.join(os.path.dirname(WORK), "metrics_bootstrap_v3", "metrics_with_ci.csv"))
 # UMAP settings for panels c-f (S1_UMAP_SETTINGS):
-#   "target" (manuscript): every UMAP uses the Fig. 2d settings (n_neighbors=30,
-#       min_dist=0.1, spread=1.5); target panels on the Fig. 2d nuclei.
+#   "target" (default): every UMAP uses the integration figure's target settings
+#       (n_neighbors=30, min_dist=0.1, spread=1.5); target panels on the same nuclei.
 #       Source caches: umap_source_embeddings.py; target caches:
 #       umap_target_embeddings.py.
-#   "source" / "mixed": alternatives explored before choosing "target" (Fig. 2b/c
-#       settings everywhere / Fig. 2b/c for source and OT panels, Fig. 2d for the
-#       zero-shot student and MultiVI); written to previews/ only.
+#   "source" / "mixed": alternatives (source settings everywhere / source settings for
+#       the source and OT panels, target settings for the zero-shot student and MultiVI);
+#       written to previews/ only.
 UMAP_MODE = os.environ.get("S1_UMAP_SETTINGS", "target")
 UMAP_FILES = {
     "target": {**{d: d + "__fig2d_settings" for d in SRC},
@@ -85,7 +85,7 @@ umaps = {d: pd.read_csv(os.path.join(UMAPS, UMAP_FILES.get(d, d) + ".csv.gz"), i
 #   faces the student_source panel
 umaps["target_ot"]["umap1"] *= -1
 # - zero-shot student: this recomputation came out with both axes inverted
-#   relative to Fig. 2d (same nuclei and settings), so flip both to match it
+#   relative to the integration figure (same nuclei and settings), so flip both to match it
 if UMAP_MODE != "source":
     umaps["target"][["umap1", "umap2"]] *= -1
 
@@ -95,7 +95,7 @@ def natural(labels):
 
 
 def label_palette(domains, order=sorted):
-    """Colours in the order main Fig. 2 uses: R0..R10 naturally, CellTypist alphabetically."""
+    """Colours in the order the integration figure uses: R0..R10 naturally, CellTypist alphabetically."""
     cats = order({l for d in domains for l in umaps[d]["label"].unique()})
     return dict(zip(cats, DEFAULT_20))
 

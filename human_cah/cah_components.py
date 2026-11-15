@@ -6,7 +6,7 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-#%% Manuscript Fig. 7 (SEA-AD CaH transfer) from shared PLS components instead of MOFA+.
+#%% The CaH transfer figure (SEA-AD caudate head) from shared PLS components instead of MOFA+.
 #
 # Same recipe as the mouse analysis (rna_msi/shared_msi_components.py):
 #   latent   the student's RNA-expert latent H["st"]["q_mu"] for every source spot
@@ -17,8 +17,8 @@ import os  # noqa: E402
 #            metabolites, log1p), CaH snRNA RNA (the aligned view MOFA used)
 #   U        `--anchor msi` (default): SVD of the source MSI block, C_srcMSI/|C_srcMSI| (no
 #            dopamine label, no CaH data); the dopamine component is the one with the largest
-#            |dopamine weight| (C1 in every fixed run). Outputs pls_msi/, figures_pls_msi/.
-#            `--anchor dopamine`: the earlier C1 = Sigma_src^-1 corr(Z, dopamine), C2..C5 the
+#            |dopamine weight| (C1 for seed0). Outputs pls_msi/, figures_pls_msi/.
+#            `--anchor dopamine`: C1 = Sigma_src^-1 corr(Z, dopamine), C2..C5 the
 #            stacked SVD after removing it (pls/, figures_pls/)
 #   weights  corr(feature, component score) in the feature's own dataset; panel a's metabolites
 #            `--msi-weights ot` (default): recovered in the CaH nuclei by OT pairing with the source
@@ -33,7 +33,7 @@ import os  # noqa: E402
 #            per section (latent and MSI standardised within it) and is averaged over sections
 #            (shared_msi_components.ot_barycentre_batched). Pooled, section C1's ~4x dopamine offset
 #            and the latent's section signature (85% section accuracy) turned section membership into
-#            apparent cell-type differences in the nuclei. Tag _sec. `none`: pooled, as before
+#            apparent cell-type differences in the nuclei. Tag _sec. `none`: pooled.
 #   validate `--stage validate`: each source section held out in turn, its metabolite weights
 #            from measured MSI vs copied from / ported from / OT-recovered from the other two
 #   Xenium   panel f: the CaH snRNA C1 gene weights applied to the section's z-scored
@@ -43,9 +43,9 @@ import os  # noqa: E402
 #            fitted on the nuclei (z-scored genes, 5-fold CV R reported) and applied to the
 #            section's z-scored expression; replaces the student decoder on the Xenium latent
 #
-# `--stage components` writes <cah>/pls<tags>/results.pkl; `--stage figure` draws the manuscript
-# layout with cah_fig7_driver's board and 2__'s panel functions, the MOFA model replaced
-# by a mofax-like view of the PLS components, into <cah>/figures_pls<tags>/.
+# `--stage components` writes <cah>/pls<tags>/results.pkl; `--stage figure` draws the figure layout
+# with cah_cell_runner.py's board and downstream_analyses.py's panel functions, the MOFA model
+# replaced by a mofax-like view of the PLS components, into <cah>/figures_pls<tags>/.
 #
 # Env: $PY_ANALYSIS
 
@@ -389,9 +389,7 @@ def stage_figure(run, anchor, msi_weights="ot", ot_reg=0.01, source_batches="non
     def project_spatial_onto_factor(spatial, mofa_model=None, factor_index=k_da, key="mofa_factor1", **_):
         """PLS stand-in for MOFA's RNA projection: the snRNA C-k gene weights applied to the
         section's expression, z-scored per gene within the section (|w|-normalised weighted
-        sum over the panel genes the weights cover). The Xenium RNA-expert latent, built from
-        the 464-gene panel, tracked cell identity poorly and varied across seeds (r 0.67-0.80);
-        this projection agrees across fixed seeds at r 0.93-0.99 and ranks MSNs top."""
+        sum over the panel genes the weights cover)."""
         X = spatial.X.toarray() if sp.issparse(spatial.X) else np.asarray(spatial.X, dtype=float)
         Z = (X - X.mean(0)) / X.std(0).clip(1e-6)
         genes = pd.Index(spatial.var_names.astype(str)).str.upper()

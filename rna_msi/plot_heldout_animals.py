@@ -1,18 +1,19 @@
 """Supplementary figures for held-out evaluation (RNA-MSI held-out animals; RNA-ATAC held-out Multiome).
 
-  S_heldout_rnamsi_agreement   (a) validation loss of the Fig. 5 teacher's early-stopping pass;
+  S_heldout_rnamsi_agreement   (a) validation loss of the mouse model teacher's early-stopping pass;
                                (b) teacher self-consistency and (c) student-teacher agreement, full
                                schedule vs early-stopped teacher; (d-f) cluster agreement on held-out
                                striatum (cluster_agreement.py), early-stopped student vs controls.
-  S_heldout_rnamsi_fig5def     the Fig. 5d-f metrics (9__) in-sample, on the held-out half of the
+  S_heldout_rnamsi_fig5def     the dopamine embedding metrics (heldout_animals_dopamine_structure.py) in-sample,
+                               on the held-out half of the
                                training section and on held-out animals.
   S_heldout_multiome_p22       10x Multiome nuclei placed on the P22 section through each model's
                                embedding (heldout_multiome_alignment.py): teacher-cluster recovery,
                                placed cell types, known-pairing W1, and agreement maps.
 
 Reads the benchmark tables under $SPATIALJEPA_OUT/spatialjepa_benchmark/animal_transfer_p2000{,_split}/evaluation,
-the Fig. 5 model's early_stopping.json and $SPATIALJEPA_OUT/MultiGATE/rna_atac_analysis/20260505_190037/heldout_alignment.
-Writes <out_dir>/<name>.{png,svg} and <out_dir>/<name>_values.csv. Env: nichecompass_liana.
+the mouse model's early_stopping.json and $SPATIALJEPA_OUT/MultiGATE/rna_atac_analysis/20260505_190037/heldout_alignment.
+Writes <out_dir>/<name>.{png,svg} and <out_dir>/<name>_values.csv. Env: spatialjepa-analysis.
 """
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)
     import spatialjepa.paths  # noqa: F401
@@ -39,7 +40,7 @@ BENCH = [OUT / "spatialjepa_benchmark" / r / "evaluation" for r in ("animal_tran
 ES_JSON = OUT / "spatialjepa_models" / "V11L12-109_B1_seed3" / "early_stopping.json"
 ALIGN = OUT / "MultiGATE" / "rna_atac_analysis" / "20260505_190037" / "heldout_alignment"
 
-# main-text Fig. 5d-f colours for teacher / student / non-spatial; controls in greys
+# the dopamine-program figure's colours for teacher / student / non-spatial; controls in greys
 TEACHER, STUDENT, NONSPATIAL = "#66c2a5", "#fc8d62", "#8da0cb"
 GREY, DARK = "#9a9a9a", "#4d4d4d"
 RC = {"font.size": 8, "axes.titlesize": 8.5, "axes.labelsize": 8, "xtick.labelsize": 7, "ytick.labelsize": 7,

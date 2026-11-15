@@ -1,11 +1,11 @@
-"""Recreate SpatialJEPA Fig. 4a,c with target Leiden clusters fitted on target embeddings.
+"""The transfer-figure cluster panels with target Leiden clusters fitted on target embeddings.
 
-Published Fig. 4a/c (MultiGATE scripts/analyze_rna_atac.py, run_alignment_and_spatial_plot
+The published cluster panels (rna_atac/analyze_rna_atac.py, run_alignment_and_spatial_plot
 with model = source_mgate) clusters the source and overwrites each target label with the label
 of the target profile's nearest source profile. Here the target is clustered on its own
 embeddings, and those clusters are compared with the transferred partition.
 
-Inputs are the May 7 *_aligned_with_latents.h5ad files. Source labels are not stored there, so
+Inputs are the *_aligned_with_latents.h5ad files. Source labels are not stored there, so
 they are recovered from the target files: every target profile stores its assigned source
 profile (source_obs_names) and the label it inherited from it. Source profiles that were never
 assigned (1.5%) take the majority label of their 15 nearest assigned source profiles.
@@ -118,7 +118,7 @@ def rank_genes(x, labels, genes):
 
 
 def concordance(source_de, target_de, pairs):
-    """Published Fig. 4c statistics; target groups are renamed to their matched source IDs."""
+    """DE-concordance statistics of the published panel; target groups are renamed to their matched source IDs."""
     t = target_de[target_de.group.astype(str).isin(pairs)].copy()
     t["target_group"] = t.group.astype(str)
     t["group"] = t.target_group.map(pairs)

@@ -6,36 +6,36 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-#%% Cross-animal SpatialJEPA ablation benchmark: the manuscript's Fig. 5 dopamine metrics.
+#%% Cross-animal SpatialJEPA ablation benchmark: the dopamine embedding metrics.
 #
 # Scores every benchmark representation with the three latent-structure metrics used for
-# SpatialMETA in the manuscript (Fig. 5d-f; dopamine_embedding_benchmark.py), using that
+# the dopamine embedding benchmark (dopamine_embedding_benchmark.py), using that
 # script's own functions:
 #   structural gain        ΔAUROC = AUROC(latent-kNN-smoothed dopamine) - AUROC(raw),
 #                          intact vs lesioned, region spots only
 #   latent-graph smoothness Moran's I of dopamine on the latent kNN graph, per lesion x
-#                          region group (headline: intact region, as in the manuscript)
+#                          region group (headline: intact region)
 #   intact-region specificity log-odds that the top-10% smoothed-dopamine spots are
 #                          intact-region spots (full section graph)
 # with k=15 on the per-section standardized 10-D latent and dopamine total-count
-# normalized to 1e4 over all MSI peaks (the manuscript's `normalized` layer).
+# normalized to 1e4 over all MSI peaks (train_rna_msi.py's `normalized` layer).
 #
 # Settings:
-#   in_sample_full    source section, paired RNA+MSI input (the manuscript's setting)
+#   in_sample_full    source section, paired RNA+MSI input (the benchmark's setting)
 #   in_sample_masked  source section, MSI input zeroed (dopamine is not an input)
 #   transfer          held-out animals' sections, MSI input zeroed (graph-free models)
 #   transfer_paired   held-out animals' sections with their *measured* MSI as input: the
-#                     Fig. 5d-f condition on a section the model never trained on. Graph
+#                     benchmark's condition on a section the model never trained on. Graph
 #                     teachers (`<config>_teacher`) build the held-out section's own graph
 #                     at inference; in the RNA-only settings they are absent.
 # Extra metric `student_teacher_r`: mean per-dimension correlation between a run's student
 # and teacher latents on the same spots (the student is trained to match z-scored teacher
 # dimensions), i.e. how well distillation holds on spots the student never saw.
 #
-# Two stages, because dopamine_embedding_benchmark.py and spatialmeta live in different envs:
-#   --stage prepare   (spatialMETA env) teacher in-sample latents, held-out paired
+# Two stages, because dopamine_embedding_benchmark.py and spatialmeta live in different environments:
+#   --stage prepare   (spatialjepa-msi) teacher in-sample latents, held-out paired
 #                     latents (heldout_paired.npz) + dopamine vectors
-#   --stage evaluate  (nichecompass_liana env) metrics, contrasts, figures
+#   --stage evaluate  (spatialjepa-analysis) metrics, contrasts, figures
 # Outputs: <runs-dir>/evaluation/dopamine_structure_*.csv and figures/.
 
 import argparse
@@ -137,7 +137,7 @@ def finished_runs(runs_dir: Path, regions) -> list[dict]:
     return runs
 
 
-#%% stage 1: teacher latents + dopamine vectors (spatialMETA env)
+#%% stage 1: teacher latents + dopamine vectors (spatialjepa-msi)
 
 def stage_prepare(args) -> None:
     import torch
@@ -204,7 +204,7 @@ def stage_prepare(args) -> None:
         print(f"[prepare] {run['run_id']}: held-out paired latents ({', '.join(jobs)})")
 
 
-#%% stage 2: metrics (nichecompass_liana env, imports dopamine_embedding_benchmark)
+#%% stage 2: metrics (spatialjepa-analysis, imports dopamine_embedding_benchmark)
 
 def spatial_knn_overlap(b6, Z, coords, k) -> float:
     """Mean fraction of a spot's k latent neighbours that are among its k spatial ones."""
@@ -214,7 +214,7 @@ def spatial_knn_overlap(b6, Z, coords, k) -> float:
 
 
 def structure_metrics(b6, Z, dopa, obs, region, coords) -> dict:
-    """The manuscript's three dopamine metrics for one latent on one section.
+    """The three dopamine embedding metrics for one latent on one section.
 
     ``latent_spatial_overlap`` says how much the latent kNN graph is just the tissue
     kNN graph (1 for the ``spatial_xy`` reference).
@@ -491,7 +491,7 @@ SUMMARY_METRICS = (
 
 
 def fig_heldout_summary(sm: pd.DataFrame, region: str, design: str, ev8, out: Path):
-    """Fig. 5d-f metrics in-sample vs on held-out sections, per model."""
+    """Dopamine embedding metrics in-sample vs on held-out sections, per model."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt

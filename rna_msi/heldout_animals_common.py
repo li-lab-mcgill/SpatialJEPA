@@ -38,10 +38,10 @@ BENCH_DIR = Path(os.environ.get("ANIMAL_TRANSFER_BENCH_DIR",
                                 SPATIALJEPA_OUT / "spatialjepa_benchmark" / "animal_transfer"))
 # trained runs live here (fold caches always under BENCH_DIR); override for smoke tests
 RUNS_DIR = Path(os.environ.get("ANIMAL_TRANSFER_RUNS_DIR", BENCH_DIR))
-# fixed external gene ranking used by the Fig. 5 mouse model (train_rna_msi.py)
+# fixed external gene ranking used by the mouse RNA-MSI models (train_rna_msi.py)
 TARGET_PANEL_PATH = SPATIALJEPA_OUT / "target_gene_rankings" / "target_gene_ranking_p22_mouse_spatial_atac_rna.csv"
-# 442 reproduces the submitted Fig. 5 model (V11L12-109_B1: 388 ST genes after Moran's I);
-# the revised manuscript's Fig. 5 (fix2000_s3) uses 2000 (1,806 ST genes).
+# 442 gives the reference run V11L12-109_B1 (388 ST genes after Moran's I); the released mouse
+# model V11L12-109_B1_seed3 uses 2000 (1,806 ST genes).
 N_TARGET_TOP = int(os.environ.get("ANIMAL_TRANSFER_PANEL_TOP", 442))
 
 SECTION_KEY = "section"
@@ -80,11 +80,11 @@ CONFIGS = {
     "A_perm": dict(kind="jepa", graph="permuted", n_neighbors=6, sm_cross_weight=1.0, neighborhood="exact"),
     "A_induced": dict(kind="jepa", graph="spatial", n_neighbors=6, sm_cross_weight=1.0, neighborhood="induced"),
     # A with the teacher early-stopped on held-out spatial blocks of the source, then
-    # retrained on every source spot for the selected number of epochs (7__)
+    # retrained on every source spot for the selected number of epochs (heldout_animals_train.py)
     "A_early": dict(kind="jepa", graph="spatial", n_neighbors=6, sm_cross_weight=1.0, neighborhood="exact",
                     early_stop=True),
     # A with strong decoupled weight decay on the teacher (AdamW 1.0 instead of 1e-6), full
-    # schedule: the setting that kept the held-out-block loss flat in the mPD3 pilots
+    # schedule
     "A_wd": dict(kind="jepa", graph="spatial", n_neighbors=6, sm_cross_weight=1.0, neighborhood="exact",
                  teacher_weight_decay=1.0),
     "G": dict(kind="stock"),
@@ -302,7 +302,7 @@ def _read_msi_var(sample_id: str) -> pd.DataFrame:
 
 
 def assemble_section(sample_id: str, msi_names: dict[str, str]):
-    """One section as a joint ST|SM AnnData (counterpart of script 3's assemble_section).
+    """One section as a joint ST|SM AnnData (counterpart of train_rna_msi.py's assemble_section).
 
     X holds raw counts (RNA) and raw intensities (MSI). Layers ``SCT_counts`` and
     ``SCT_data`` hold the per-section SCTransform outputs in the ST columns and raw MSI
@@ -416,7 +416,7 @@ def prepare_fold(
     joint = smt.util._classes.AnnDataJointSMST(source)
     joint = smt.pp.removeHsp_mt_Rpl_Dnaj(joint)
 
-    # normalized view used for spatial-variability selection (script 3: SCT_data for ST,
+    # normalized view used for spatial-variability selection (train_rna_msi.py: SCT_data for ST,
     # total-count 1e4 for SM)
     joint.X = joint.layers["SCT_data"].copy()
     smt.pp.normalize_total_joint_adata_sm_st(joint, target_sum_SM=1e4, target_sum_ST=None)
@@ -446,7 +446,7 @@ def prepare_fold(
     st_mask = joint.var["type"].eq("ST").to_numpy()
     sm_mask = ~st_mask
 
-    # zero RNA library over the retained genes -> log(0) in the ZINB loss (script 3)
+    # zero RNA library over the retained genes -> log(0) in the ZINB loss (train_rna_msi.py)
     st_lib = np.asarray(joint[:, st_mask].X.sum(1)).ravel()
     n_empty = int((st_lib == 0).sum())
     if n_empty:
@@ -669,10 +669,10 @@ def encode_teacher_insample(run_dir: Path, source_joint, *, device: str = "cuda:
     """In-sample latents of a run's graph teacher on its own source section(s).
 
     Graph teachers cannot be applied to held-out animals (their graph would need the
-    target's coordinates), but on the source they reproduce the manuscript's Fig. 5
+    target's coordinates), but on the source they reproduce the dopamine-benchmark
     setting. Encoding uses sequential mini-batches of ``batch_size`` as in
     ``train_rna_msi.get_joint_and_modality_latents``; with
-    ``neighborhood="induced"`` this keeps the legacy within-batch subgraphs. Returns
+    ``neighborhood="induced"`` this keeps only within-batch subgraphs. Returns
     ``{"full"|"masked": {"joint"|"st": Z}}``, or None for identity-graph teachers.
     """
     import spatialmeta as smt
@@ -712,7 +712,7 @@ def _encode_sequential(model, batch_size: int = N_PER_BATCH) -> dict:
 
 
 def paired_target_joint(fold: dict, target_id: str):
-    """A held-out section with its *measured* MSI as model input (Fig. 5d-f condition).
+    """A held-out section with its *measured* MSI as model input (the dopamine-benchmark condition).
 
     The training script only ever sees targets with the MSI block zeroed; this paired
     version is for representation analyses, not prediction. The MSI block is the target's
@@ -761,9 +761,9 @@ def encode_checkpoint(ckpt_path: Path, joint, *, device: str = "cuda:0", section
 
 
 def manuscript_dopamine(sample_id: str) -> pd.Series:
-    """Dopamine as in the manuscript's Fig. 5 metrics (dopamine_embedding_benchmark.DOPA_LAYER).
+    """Dopamine as in the dopamine embedding benchmark (dopamine_embedding_benchmark.DOPA_LAYER).
 
-    Total-count normalization to 1e4 over *all* MSI peaks (script 3's ``normalized``
+    Total-count normalization to 1e4 over *all* MSI peaks (train_rna_msi.py's ``normalized``
     layer), independent of any fold's feature selection. Indexed by spot name.
     """
     import muon as mu
@@ -778,7 +778,7 @@ def manuscript_dopamine(sample_id: str) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
-# PLS readout (manuscript Supp. Fig. S8 decoder, source-fitted)
+# PLS readout (source-fitted decoder)
 # ---------------------------------------------------------------------------
 
 class PLSReadout:
@@ -851,7 +851,7 @@ def _z(v: np.ndarray) -> np.ndarray:
 
 
 def bivariate_morans_i(x: np.ndarray, y: np.ndarray, W) -> float:
-    """(n / S0) * z_x . (W z_y) / (z_x . z_x)  (dopamine_nmf_signature.py:93)."""
+    """(n / S0) * z_x . (W z_y) / (z_x . z_x)  (as in dopamine_nmf_signature.py)."""
     zx, zy = _z(x), _z(y)
     denom = zx @ zx
     if denom == 0:

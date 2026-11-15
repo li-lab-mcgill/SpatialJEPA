@@ -26,7 +26,7 @@ import os  # noqa: E402
 #     (joint/rna/msi), written by baseline_multigrate.py. Multigrate exposes per-modality
 #     latents, so (unlike the old TOTALVI baseline) it also joins the cross-modal metric.
 #
-# Env: `conda activate nichecompass_liana` (has scib_metrics + jax). FOSCTTM uses the jax
+# Environment: spatialjepa-analysis (scib_metrics + jax). FOSCTTM uses the jax
 # evals_utils.foscttm_moscot; bio-conservation / iLISI use scib_metrics' functional API.
 
 import argparse
@@ -69,7 +69,7 @@ load_dotenv(dotenv_path=ENV_FILE_PATH)
 
 SPATIALJEPA_OUT = Path(os.environ["SPATIALJEPA_OUT"])
 BAKLAVA_ROOT = os.environ["SPATIALJEPA_SHARED"]
-# evals_utils.foscttm_moscot (jax) lives at the BAKLAVA repo root.
+# evals_utils.foscttm_moscot (jax) lives in shared/.
 sys.path.insert(0, os.environ["SPATIALJEPA_SHARED"])
 from evals_utils import foscttm_moscot
 

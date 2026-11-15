@@ -31,7 +31,7 @@ OUT.mkdir(exist_ok=True)
 
 GENES = ["Mobp", "Mal", "Rgs9", "Phactr1"]
 PEAK_PLOT_GENES = ["Mobp", "Mal", "Phactr1"]
-# Mobp and Phactr1 use the Fig. 4a Leiden colours (tab10): cluster 4 and cluster 0.
+# Mobp and Phactr1 use the transfer figure's Leiden colours (tab10): cluster 4 and cluster 0.
 LEIDEN_COLORS = plt.get_cmap("tab10").colors
 COLORS = {
     "Mobp": LEIDEN_COLORS[4],
@@ -483,7 +483,7 @@ def main():
     )
     save(fig, "shortlist_individual_profiles")
 
-    # Manuscript-style two-row peak-only display, preserving individual target
+    # Two-row peak-only display, preserving individual target
     # profiles and modality-specific transferred coordinates. Each gene has one
     # pooled source/target cap and is rescaled to 0--1.
     fig, axes = plt.subplots(

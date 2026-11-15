@@ -320,10 +320,8 @@ for view, group in plot_df.groupby('View'):
         zorder=2
     )
 
-# --- THE FIX ---
 # Invert the y-axis so the top of the dataframe appears at the top of the plot
 ax.invert_yaxis()
-# ---------------
 
 # Clean-up details
 ax.axvline(0, color='black', linestyle='-', linewidth=0.8, alpha=0.5, zorder=0)
@@ -872,8 +870,8 @@ plt.show()
 
 
 # %% Reusable Factor 1 multi-panel figure
-#: Typography for the manuscript figures. Applied via plt.rc_context inside the
-#: FIG_* helpers so it never leaks into an interactive session's other plots.
+#: Typography for the figures. Applied via plt.rc_context inside the
+#: FIG_* helpers so it never leaks into other plots.
 FIG_RC = {
     "font.size": 13,
     "axes.titlesize": 15,
@@ -1326,8 +1324,7 @@ def annotate_gm_wm(section, neighborhood_key="Neighborhood", subclass_key="Subcl
 
     ``mode="neighborhood"`` (default) defines both compartments from the spatial
     neighbourhood annotation, so the downstream separation test asks whether the
-    factor tracks tissue context. ``mode="mixed"`` reproduces
-    3__sea_ad_cah_spatial_snrna_dopamine.py, which takes grey matter from the
+    factor tracks tissue context. ``mode="mixed"`` takes grey matter from the
     neighbourhood label and white matter from the oligodendrocyte subclass; that
     version is partly circular here, because the factor is already known to
     separate MSN from oligodendrocyte identity.
@@ -1492,7 +1489,7 @@ def FIG_cah_transfer_main(
     smooth=30,
     output_file=None,
 ):
-    """Main manuscript figure: the transferred axis, then the same signal in tissue.
+    """The CaH figure: the transferred axis, then the same signal in tissue.
 
     Top row  (a) multi-omic Factor 1 loadings, metabolites alongside genes
              (b) RNA UMAPs coloured by Factor 1 and by subclass
@@ -1682,7 +1679,7 @@ def load_xenium_factor_section(section_id=CAH_XENIUM_SECTION_ID, xenium=None,
 
     Subsets before projecting on purpose: mofax marshals the whole expression
     matrix, and the 25 sections together hold ~963k cells for a panel that needs
-    one. Reuses ``cah_xenium`` from the session if it is already loaded.
+    one. Reuses ``cah_xenium`` if it is already loaded.
     """
     if xenium is None:
         xenium = globals().get("cah_xenium")
@@ -2269,10 +2266,8 @@ def fit_cell_ordinal_adnc(latent, dims=None, levels=None, n_fit=200_000, seed=0,
     cell and the model is fitted at cell resolution. The deliverable is the per-cell
     linear predictor (a supervised pseudotime), not the coefficient table.
 
-    What this buys: a continuous per-cell ADNC axis that can be mapped back onto
-    tissue. What it costs: the standard errors, p-values and pseudo-R2 of the fit
-    are meaningless, because ~17,000 cells share each donor's label. Judge the model
-    by donor-held-out prediction (crossval_cell_ordinal), never by its summary().
+    The continuous per-cell ADNC axis can be mapped back onto tissue. Evaluate
+    prediction with donor-held-out cross-validation (crossval_cell_ordinal).
     """
     matrix = np.asarray(latent.X, dtype=np.float64)
     dims = dims or [f"dim{i}" for i in range(matrix.shape[1])]
@@ -2583,7 +2578,7 @@ def FIG_cah_spatial_row(section, output_file=None, smooth=30):
     """Tissue -> imputed metabolite -> multi-omic axis, in one Xenium section.
 
     Complementary illustration that the transferred signal can be placed in tissue;
-    no spatial association is claimed (see the session's negative controls).
+    no spatial association is claimed.
     """
     if "X_spatial" not in section.obsm:
         section.obsm["X_spatial"] = section.obsm["spatial"]
@@ -2646,8 +2641,7 @@ def spatial_weights(coords, n_neighbors=6):
 def bivariate_morans_i(x, y, W):
     """Bivariate Moran's I of x against the spatial lag of y.
 
-    Same estimator as ``3__sea_ad_cah_spatial_snrna_dopamine.py`` and
-    ``rna_msi/dopamine_nmf_signature.py``:
+    Same estimator as ``rna_msi/dopamine_nmf_signature.py``:
     I = (n / S0) * (z_x . W z_y) / (z_x . z_x). Both arguments are z-scored, so the
     denominator is n and the statistic reduces to (z_x . W z_y) / S0, which is
     symmetric in x and y whenever W is; only one orientation is reported.
@@ -2658,13 +2652,7 @@ def bivariate_morans_i(x, y, W):
 
 
 def bivariate_moran_permutation(x, y, W, n_permutations=999, seed=0):
-    """Permutation p-value for bivariate Moran's I, shuffling y only.
-
-    Free permutation destroys the autocorrelation of y as well as its pairing with
-    x, so this null is liberal: it tests "no spatial cross-correlation" against a
-    spatially structureless alternative, and cannot separate genuine coupling from
-    two independently smooth fields. Read it alongside the residualised variant.
-    """
+    """Permutation p-value for bivariate Moran's I, shuffling y only."""
     rng = np.random.default_rng(seed)
     observed = bivariate_morans_i(x, y, W)
     y = np.asarray(y, dtype=float)
@@ -2688,7 +2676,7 @@ def cah_xenium_spatial_crosscorrelation(section, n_neighbors=6, smooth=30,
                                         output_file=None):
     """Bivariate Moran's I among the three fields plotted in the Xenium row.
 
-    Quantifies what Fig. 7d-f only shows qualitatively: how strongly local
+    Quantifies what panels d-f of the CaH figure only show qualitatively: how strongly local
     oligodendrocyte density (d) co-varies in space with SpatialMETA-imputed
     dopamine (e) and with the projected Factor 1 score (f). The fields are taken
     exactly as plotted -- density unsmoothed, the other two averaged over the same

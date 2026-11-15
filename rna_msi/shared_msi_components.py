@@ -8,7 +8,7 @@ except ModuleNotFoundError:
 import os  # noqa: E402
 #%% Shared PLS components across the source (RNA + MSI) and ONE target (RNA + ATAC).
 #
-# MOFA-free replacement for the Fig. 5 / Fig. 6 factor analyses. One latent, one SVD:
+# MOFA-free replacement for the MOFA+ factor analyses of the dopamine program. One latent, one SVD:
 #
 #   latent    the student's RNA-expert latent (H["st"]["q_mu"], obsm "student_X_emb_st"),
 #             computed from RNA alone for every source spot and target cell, z-scored per
@@ -26,7 +26,7 @@ import os  # noqa: E402
 #             (the latent directions carrying most latent-metabolite covariance). No dopamine
 #             label and no target data enter U, so it is identical in every single-target
 #             analysis; the dopamine component is the one with the largest |dopamine weight|
-#             (C3 in the mouse run). `--anchor dopamine` (the earlier default): C1 fixed to
+#             (C3 in the mouse run). `--anchor dopamine`: C1 fixed to
 #             the OLS dopamine direction (u ~ Sigma_src^-1 corr(Z, dopamine)), C2..CK the SVD
 #             of the stacked matrix after removing C1. `--anchor none`: plain stacked SVD.
 #   source    `--source-spots intact` (default): source spots of the intact hemisphere only. The
@@ -518,7 +518,7 @@ def analyse(args, ns):
                                      **{f"R2 {b}": r2[b][1] for b in BLOCKS})
     print(summary.drop(columns=[c for c in summary if c.startswith("top_")]).round(3).to_string(index=False), flush=True)
 
-    # Fig. 5 panels
+    # overview panels
     msn = P.module_scores(T["rna"], T["genes"])["MSN"].to_numpy()
     universe = T["fig_genes"]
     xy_t = F.coordinates(tag, args.target, T["cells"])
@@ -534,7 +534,7 @@ def analyse(args, ns):
                                          universe)],
     )
 
-    # Fig. 6 panels: the dopamine component's peak weights
+    # regulatory-board panels: the dopamine component's peak weights
     out = out_dir(args)
     peaks = W["target ATAC"][c_da]
     ccre = P.ccre_membership(T["peaks"])

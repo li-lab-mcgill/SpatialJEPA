@@ -6,12 +6,12 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-#%% Manuscript Figs. 5 and 6 drawn from the shared PLS components instead of MOFA+.
+#%% Dopamine-program figures (overview and regulatory board) from the shared PLS components.
 #
-# The figures are produced by the manuscript's own code (5__'s FIG_dopamine_overview and
-# dopamine_overview_cells.fig6_board, with the Fig. 6 cells of 5__ computing the cCRE GSEA,
-# leading edges and TF-regulon enrichment). Only the two MOFA+ models are replaced, by
-# PLSModel: a mofax-like view of shared_msi_components.py's results for one run.
+# The figures are drawn by dopamine_nmf_signature.py's FIG_dopamine_overview and
+# dopamine_overview_cells.fig6_board, with dopamine_nmf_signature.py's regulatory cells computing
+# the cCRE GSEA, leading edges and TF-regulon enrichment. In place of the two MOFA+ models they
+# read PLSModel: a mofax-like view of shared_msi_components.py's results for one run.
 #
 #   teacher model (P22 spatial target, "msi_teacher")
 #       factors   teacher RNA-expert latent on P22 (z-scored) x the P22 analysis' U
@@ -22,24 +22,24 @@ import os  # noqa: E402
 #       factors   student RNA-expert latent on the nuclei (z-scored) x the multiome U
 #       weights   rna/atac: corr(nucleus feature, student score); msi_student: OT-recovered
 #                 (default) or ported weights on the nuclei
-#
-# `--anchor msi --source-spots intact` (defaults): U is the SVD of the source MSI block (intact hemisphere) (no dopamine label, no target
-# data; identical latent directions in both analyses) and the figures follow the component
-# with the largest |dopamine weight| (FACTOR, read from the results; C3 in the mouse run).
-# Ported weights: shared_msi_components.ported_msi_weights. `--anchor dopamine` redraws
-# the earlier dopamine-anchored C1 version (source-measured metabolite weights).
-# Each view carries the PLS analysis' own feature set (all 17,069 target genes, all
-# 66,520 target peaks, the 779 decoder metabolites), not the MOFA models' HVG subsets, so
-# panel j and every Fig. 6 test (cCRE GSEA, leading edges, motifs, regulons) rank all
-# features. Main Fig. 6 shows D2-MSN on its full cCRE set; MXD, whose cCRE peaks are ~90%
-# shared with D2-MSN, moves to a supplementary figure on MXD-only cCREs. Fig. 6 is a GSEA,
-# b motifs, c concordance, d ZEB1 / PBX3 / MEIS1 / EGR1 accessibility of the multiome nuclei
-# placed on the source section through the student latent (--motif-maps, from
-# fig567_supplement/plot_spatial_motif_maps.py); a-c sit in one row and the board is drawn at
-# print width (fig6_d2msn_board), from fig6_panels.pkl when `--redraw-fig6`. Panel j's NMF reference is ranked by component-22 specificity rather than raw
-# loading (nmf_specificity). Panel 6b shows the FDR-robust motifs ordered by GC-adjusted odds ratio
-# (draw_top_motifs_by_effect; both orderings in motifs_gc/*_motif_ranking.csv). Motif panels use the GC-adjusted test
-# (gc_matched_motif_enrichment.py) on the GMM-significant part of 5__'s leading edges. Labels "Factor Ck" become "PLS Ck".
+# `--anchor msi --source-spots intact` (defaults): U is the SVD of the source MSI block (intact
+# hemisphere; no dopamine label, no target data; identical latent directions in both analyses), and
+# the figures follow the component with the largest |dopamine weight| (FACTOR, read from the
+# results; C3 in the mouse run). Ported weights: shared_msi_components.ported_msi_weights.
+# `--anchor dopamine` uses a dopamine-anchored C1 (source-measured metabolite weights).
+# Each view carries the PLS analysis' own feature set (all 17,069 target genes, all 66,520 target
+# peaks, the 779 decoder metabolites), not the MOFA models' HVG subsets, so panel j and every
+# regulatory test (cCRE GSEA, leading edges, motifs, regulons) rank all features. The regulatory
+# board shows D2-MSN on its full cCRE set (MXD, whose cCRE peaks are ~90% shared with D2-MSN, is
+# tested on MXD-only cCREs): a GSEA, b motifs, c concordance, d ZEB1 / PBX3 / MEIS1 / EGR1
+# accessibility of the multiome nuclei placed on the source section through the student latent
+# (--motif-maps, from supplement/plot_spatial_motif_maps.py); a-c sit in one row and the board is
+# drawn at print width (fig6_d2msn_board), from fig6_panels.pkl with `--redraw-fig6`. Panel j's NMF
+# reference is ranked by component-22 specificity rather than raw loading (nmf_specificity). Panel b
+# shows the FDR-robust motifs ordered by GC-adjusted odds ratio (draw_top_motifs_by_effect; both
+# orderings in motifs_gc/*_motif_ranking.csv). Motif panels use the GC-adjusted test
+# (gc_matched_motif_enrichment.py) on the GMM-significant part of the GSEA leading edges. Labels
+# "Factor Ck" become "PLS Ck".
 #
 # Env: $PY_ANALYSIS
 
@@ -109,7 +109,7 @@ def parse_args():
 
 
 class PLSModel:
-    """The slice of mofax.mofa_model that 5__'s figure and Fig. 6 cells use."""
+    """The slice of mofax.mofa_model that the dopamine_nmf_signature.py figure and regulatory cells use."""
 
     def __init__(self, scores, weights, samples_metadata=None):
         self.scores = scores                      # samples x components
@@ -195,7 +195,7 @@ def ccre_partition(ns):
 
 FIG6_MAPS = (("ZEB1", "top motif"), ("PBX3", "top motif"), ("MEIS1", "top motif"), ("EGR1", "RNA-ATAC concordant"))
 FIG6_N_MOTIFS, FIG6_N_REGULONS = 8, 18
-# Fig. 6 is drawn at the manuscript's \linewidth (16 cm) with every axes placed in inches, so
+# The regulatory board is drawn at a 16 cm text width with every axes placed in inches, so
 # these are the printed font sizes and nothing is rescaled after drawing.
 FIG6_WIDTH = 6.3
 FIG6_RC = {"font.size": 8, "axes.titlesize": 9, "axes.labelsize": 8.5, "xtick.labelsize": 8,
@@ -217,7 +217,7 @@ def thin(n, keep=(), points=4000):
 
 
 def draw_gsea(fig, box, p, title):
-    """Fig. 6a in `box` (x, y, w, h inches): running enrichment score, the fraction of peaks
+    """Board panel a in `box` (x, y, w, h inches): running enrichment score, the fraction of peaks
     that are cCREs along the ranking (Gaussian-kernel hit rate; at ~38,000 hits the usual
     one-tick-per-hit strip is a solid slab), the rank-metric strip and the ranked weights."""
     from matplotlib.colors import TwoSlopeNorm
@@ -281,7 +281,7 @@ def draw_gsea(fig, box, p, title):
 
 
 def draw_top_motifs_by_effect(ax, enr, n_top=FIG6_N_MOTIFS):
-    """Fig. 6b: the motifs robust at FDR < 0.05 (robust_motif_tier), ordered and drawn by their
+    """Board panel b: the motifs robust at FDR < 0.05 (robust_motif_tier), ordered and drawn by their
     GC-adjusted odds ratio (foreground vs the cell type's other cCRE peaks). q-value order mixes
     enrichment with motif frequency: a common motif reaches a small q at a modest odds ratio."""
     robust = enr[enr["padj"] < 0.05].sort_values("odds_ratio", ascending=False)
@@ -297,7 +297,8 @@ def draw_top_motifs_by_effect(ax, enr, n_top=FIG6_N_MOTIFS):
 
 
 def draw_regulon_concordance(ax, regulons, tiers, n_top=FIG6_N_REGULONS):
-    """Fig. 6c: 5__'s RNA-regulon x ATAC-motif concordance dotplot (_fig_draw_regulon_concordance)
+    """Board panel c: the RNA-regulon x ATAC-motif concordance dotplot of dopamine_nmf_signature.py
+    (_fig_draw_regulon_concordance)
     redrawn at print size from fig6_panels' table; the colour key lists only the tiers shown."""
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
@@ -357,8 +358,8 @@ def map_limits(D, pad=0.02):
 
 
 def draw_motif_maps(fig, D, st, x0, y0, map_w, gap):
-    """Fig. 6d: motif accessibility of the multiome nuclei placed on the source section by the
-    student latent (fig567_supplement/plot_spatial_motif_maps.py), striatum outlined; one
+    """Board panel d: motif accessibility of the multiome nuclei placed on the source section by the
+    student latent (supplement/plot_spatial_motif_maps.py), striatum outlined; one
     map_w-inch map per FIG6_MAPS entry from (x0, y0) inches, then the colour bar."""
     import matplotlib.pyplot as plt
 
@@ -371,7 +372,7 @@ def draw_motif_maps(fig, D, st, x0, y0, map_w, gap):
         v = D[motif].to_numpy()
         lo, hi = np.nanpercentile(v, [2, 98])
         sc = ax.scatter(x, y, c=np.clip(v, lo, hi), s=disc ** 2, cmap="viridis", lw=0,
-                        rasterized=True)          # discs over the runs of missing spots, as in Fig. 5a
+                        rasterized=True)          # discs over the runs of missing spots
         spot_outline(ax, x, y, D["striatum"].to_numpy(), colors="white", linewidths=0.8)
         ax.set_xlim(xl)
         ax.set_ylim(yl)
@@ -389,7 +390,7 @@ def draw_motif_maps(fig, D, st, x0, y0, map_w, gap):
 
 
 def fig6_panels(ns, term="D2MSN_cCRE", n_regulons=20):
-    """Everything Fig. 6a-c draw, as plain arrays and tables. main() caches it as
+    """Everything board panels a-c draw, as plain arrays and tables. main() caches it as
     fig6_panels.pkl, so `--redraw-fig6` redraws the board without rerunning the pipeline."""
     pre, reg, enr = ns["d2msn_multiome_gsea"], ns["regulon_res"], ns["d2msn_motif_enrichment"]
     r = pre.results[term]
@@ -407,7 +408,7 @@ def fig6_panels(ns, term="D2MSN_cCRE", n_regulons=20):
 
 
 def fig6_d2msn_board(p, output_file, maps_dir):
-    """Main Fig. 6, D2-MSN only, at print width: (a) cCRE GSEA on all peaks, (b) top TF motifs
+    """Regulatory board, D2-MSN only, at print width: (a) cCRE GSEA on all peaks, (b) top TF motifs
     of the GMM-significant leading edge and (c) RNA-regulon x ATAC-motif concordance in one row,
     over (d) motif accessibility of the multiome nuclei mapped onto the source section.
     `p` is fig6_panels' output."""
@@ -443,7 +444,7 @@ def fig_mxd_supplement(ns, results, parts, output_file):
     """Supplementary MXD figure: GC-stratified AUROC of FACTOR peak weights for D2-MSN-only,
     shared and MXD-only cCRE peaks against non-cCRE peaks, for the teacher on P22, the
     student on P22 and the student on multiome. Asks whether the MXD node of the teacher's
-    P22 map (Fig. 5g) has MXD-specific chromatin behind it, and whether that is a teacher
+    P22 map has MXD-specific chromatin behind it, and whether that is a teacher
     or a target-dataset property."""
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
@@ -499,7 +500,8 @@ def latent_frame(tag, target, key):
 
 
 def run_handoff_defs(ns):
-    """5__'s motif hand-off cell without the scenicplus runs: its defs, the leading edges
+    """The motif hand-off cell of dopamine_nmf_signature.py without the motif scans: its defs,
+    the leading edges
     and the cell-type cCRE backgrounds (the GC-adjusted test replaces the scan)."""
     for header, code in FD.split_cells(FD.SCRIPT):
         if header.startswith("TF motif enrichment hand-off"):
@@ -516,7 +518,7 @@ def run_handoff_defs(ns):
 
 def gmm_slab(weights, seed=0):
     """Peaks whose |weight| falls in the higher-mean component of a 2-component Gaussian
-    mixture (slab posterior >= 0.5): 5__'s fit_weight_gmm rule, here on peaks."""
+    mixture (slab posterior >= 0.5): dopamine_nmf_signature.py's fit_weight_gmm rule, here on peaks."""
     from sklearn.mixture import GaussianMixture
 
     X = np.abs(weights.to_numpy(dtype=float)).reshape(-1, 1)
@@ -525,7 +527,7 @@ def gmm_slab(weights, seed=0):
 
 
 def gc_motifs(ns, out):
-    """GC-adjusted motif test. Foreground: the GMM-significant part of 5__'s GSEA leading
+    """GC-adjusted motif test. Foreground: the GMM-significant part of the GSEA leading
     edge (the slab of |FACTOR weight| fitted within the leading edge); background: the cell
     type's other cCRE peaks. On all 66,520 peaks the leading edge is ~half of each cCRE
     set, so testing it whole contrasts the upper vs lower half of the cCREs."""
@@ -610,10 +612,10 @@ def gc_stratified_auroc(w, member, background, gc, width=0.02):
 
 
 def manuscript_row_order(ns):
-    """Redefine FIG_dopamine_overview with the manuscript's row order: the embedding
-    benchmark as row 2 (panels d-f) and the transferred program as row 3 (g-j). 5__ draws
-    them the other way round and letters panels in drawing order, so the two row blocks
-    are swapped in its source rather than relettered afterwards."""
+    """Redefine FIG_dopamine_overview with the published row order: the embedding
+    benchmark as row 2 (panels d-f) and the transferred program as row 3 (g-j).
+    dopamine_nmf_signature.py draws them the other way round and letters panels in drawing
+    order, so the two row blocks are swapped in its source rather than relettered afterwards."""
     text = FD.SCRIPT.read_text()
     node = next(n for n in ast.parse(text).body
                 if isinstance(n, ast.FunctionDef) and n.name == "FIG_dopamine_overview")
@@ -695,7 +697,7 @@ def main():
     for suffix in ("png", "svg"):
         ns["FIG_dopamine_overview"](output_file=str(out / f"SMA_mouse_dopamine_nmf_pls.{suffix}"),
                                     n_top_loadings=args.top_loadings, top_k=args.nmf_top_k)
-    for k in (10, 20, 30, 50, 100):                          # Fig. 5j sensitivity to top-k (logged)
+    for k in (10, 20, 30, 50, 100):                          # panel j sensitivity to top-k (logged)
         ns["_fig_nmf_mofa_enrichment_stats"](ns["best_nmf_component"], ns["_fig_default_enrichment_models"](), k)
     FD.repair_degenerate_gsea(ns["d2msn_multiome_gsea"], "D2MSN_cCRE")
     panels = fig6_panels(ns)

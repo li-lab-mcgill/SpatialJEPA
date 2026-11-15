@@ -1,10 +1,10 @@
-"""Astrocyte C2 (seed0) carried to Xenium, as astrocyte C1 was for Fig. 7 panel g (astrocyte_c1_ridge.py).
+"""Astrocyte C2 (seed0) carried to Xenium, as astrocyte C1 was (astrocyte_c1_ridge.py).
 
 A ridge from the 464 Xenium panel genes (full snRNA UMIs, normalise_total + log1p, z-scored within
 snRNA astrocytes) to latent C2, fitted within snRNA astrocytes; donor-grouped 5-fold CV for per-nucleus
 and donor-mean agreement. Applied to Xenium astrocytes (log-normalised over the panel, z-scored over
 astrocytes of all sections), then count-adjusted per section (residual of a regression on log
-transcript counts, section mean kept), as for panel g. Writes astro_c2_xenium.pkl next to this script.
+transcript counts, section mean kept), as for astrocyte C1. Writes astro_c2_xenium.pkl next to this script.
 """
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)
     import spatialjepa.paths  # noqa: F401

@@ -8,13 +8,13 @@ except ModuleNotFoundError:
 import os  # noqa: E402
 #%% Student vs teacher on held-out tissue: how different, why, and graph-free fixes.
 #
-# For each finished SpatialJEPA run of the Fig. 5d-f held-out benchmark (configs with a
+# For each finished SpatialJEPA run of the held-out benchmark (configs with a
 # graph teacher, e.g. A), compare the graph-free student's latent with the teacher's
 # (teacher given the scored section's own graph) on
 #   - the source section(s) (in-sample; the student was trained on these spots),
 #   - held-out spatial blocks of the source (re-distillation validation only), and
 #   - held-out sections (other animals, or the unseen half of the training section),
-# all with RNA+MSI input (the Fig. 5d-f condition).
+# all with RNA+MSI input (the dopamine-benchmark condition).
 #
 # Similarity metrics (candidate C vs teacher T, joint latent):
 #   dim_r      mean per-dimension corr(C_d, T_d) (the student is trained per dimension)
@@ -40,7 +40,8 @@ import os  # noqa: E402
 #                         per-spot (graph-free) function of the input
 #
 # Writes per run: diagnostic_latents.npz (keys `<rep>|<section>|<inputs>|<latent>`, read
-# by 9__ for the Fig. 5d-f metrics), student_teacher_diagnostics.csv, redistill_es.json.
+# by heldout_animals_dopamine_structure.py for the dopamine embedding metrics), student_teacher_diagnostics.csv,
+# redistill_es.json.
 # Then `--aggregate` collects them into <runs-dir>/evaluation/.
 #
 # Env: $PY_MSI

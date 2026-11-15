@@ -1,6 +1,6 @@
 """TF motif enrichment worker.
 
-conda env: scenicplus (needs MOODS, pyjaspar, pyfaidx, genomepy, scipy, statsmodels)
+Environment: spatialjepa-motifs (needs MOODS, pyjaspar, pyfaidx, genomepy, scipy, statsmodels)
 
 Runs an explicit foreground-vs-background PWM scan + Fisher's exact test: for
 each JASPAR2024 motif, scan foreground and background peak sequences (both
@@ -10,11 +10,11 @@ first-pass design -- lightweight, no pre-built cisTarget/DEM score database,
 and the statistics (Fisher's exact, BH-corrected) are explicit.
 
 Invoked via subprocess from environments that lack these dependencies (e.g.
-nichecompass_liana), so it takes a single argument: the path to a small JSON
+spatialjepa-analysis), so it takes a single argument: the path to a small JSON
 config, rather than a CLI flag per option.
 
 Usage:
-    /path/to/scenicplus/bin/python motif_enrichment_worker.py <config.json>
+    $PY_MOTIF motif_enrichment_worker.py <config.json>
 
 config.json keys:
     foreground_bed   : path to a BED4 file (chrom, start, end, name; no header)

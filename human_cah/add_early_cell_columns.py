@@ -1,4 +1,4 @@
-"""cah_ad/cells.parquet plus the seed0 Fig. 7 readouts (same recipe as cah_ad/build_cells.py)."""
+"""cells.parquet plus the seed0 CaH readouts (same recipe as build_cell_table.py)."""
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)
     import spatialjepa.paths  # noqa: F401
 except ModuleNotFoundError:

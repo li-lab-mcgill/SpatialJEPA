@@ -1,8 +1,8 @@
-"""Source UMAPs (all spots) for Supplementary Fig. S1, with the Fig. 2d target settings.
+"""Source UMAPs (all spots) for the integration-metrics figure, with the integration figure's target settings.
 
 sc.pp.neighbors(n_neighbors=30) + sc.tl.umap(min_dist=0.1, spread=1.5), other
 arguments at scanpy defaults. Writes "<domain>__fig2d_settings.csv.gz" caches;
-the S1 caches are untouched. As analyze_rna_atac.py flips the student's UMAP
+the figure caches are untouched. As analyze_rna_atac.py flips the student's UMAP
 to face the teacher's, the student's axis signs are chosen here to best match
 the teacher's layout (same spots; sign flips only).
 """

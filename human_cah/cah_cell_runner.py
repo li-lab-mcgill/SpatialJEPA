@@ -6,29 +6,29 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-#%% Recreate the SEA-AD CaH transfer figure (manuscript Fig. 7) from one SpatialJEPA bundle.
+#%% Recreate the SEA-AD CaH transfer figure from one SpatialJEPA bundle.
 #
 # The three CaH scripts are interactive, cell-based and hard-code their output root
-# (outputs/sea_ad_lipid_gps_minimal/cah, which backs the manuscript figure). This driver
+# (outputs/sea_ad_lipid_gps_minimal/cah). This driver
 # executes only the cells the figure needs, in one namespace per stage, with the output
 # root redirected by checked in-memory substitutions; the scripts on disk are untouched.
 #
 #   impute  snrna_msi_impute.py: per-donor student/teacher embeddings and
 #           PLS-imputed MSI for every CaH snRNA donor, the aligned RNA/MSI MuData, and the
 #           Xenium hand-off for the figure section (panel e). The RNA UMAP is copied from
-#           the manuscript MuData (same nuclei; the UMAP is RNA-only and model-free) so
+#           the original CaH MuData (same nuclei; the UMAP is RNA-only and model-free) so
 #           panel b keeps its layout and the 714k-cell UMAP is not recomputed.
 #   mofa    snrna_mofa.py's model: 5 factors, seed 42, 100 iterations.
 #   figure  downstream_analyses.py figure functions: panels a-f
-#           (FIG_cah_transfer_main) plus the bivariate-Moran row (g) of the manuscript.
+#           (FIG_cah_transfer_main) plus the bivariate-Moran row (g).
 #
 # Factor choice: MOFA orders factors by variance explained, so the dopamine axis need
 # not be Factor1 for a new model. `--factor auto` takes the factor whose scores track
 # the imputed dopamine best (|Spearman r| over nuclei) and orients it so msi:Dopamine
 # loads positively; every factor is reported.
 #
-# Envs: impute/figure/mofa run in nichecompass_liana (the hand-off worker itself runs in
-# the spatialMETA env as a subprocess).
+# Environments: impute/figure/mofa run in spatialjepa-analysis (the hand-off worker itself runs in
+# spatialjepa-msi as a subprocess).
 
 import argparse
 import ast
@@ -126,7 +126,7 @@ def manuscript_umap(obs_names):
 
 
 def write_aligned_with_manuscript_umap(ns, donor_ids, *, output_path):
-    """0__'s write_aligned_snrna_mudata, with the RNA UMAP taken from the manuscript."""
+    """snrna_msi_impute.py's write_aligned_snrna_mudata, with the RNA UMAP of the original CaH MuData."""
     import anndata as ad
     import mudata as md
 
@@ -306,7 +306,7 @@ def draw_moran_row(ax, table, x):
 
 
 def fig7_board(ns, section, factor, moran, output_file, smooth=30):
-    """FIG_cah_transfer_main's layout (a-f) with the manuscript's Moran row (g) added."""
+    """FIG_cah_transfer_main's layout (a-f) with the bivariate-Moran row (g) added."""
     import matplotlib.pyplot as plt
 
     with plt.rc_context(ns["FIG_RC"]):

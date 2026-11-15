@@ -1,19 +1,19 @@
-"""Fig. 7 with the astrocyte panels (seed0), laid out on a fixed inch grid.
+"""The CaH figure with the astrocyte panels (seed0), laid out on a fixed inch grid.
 
     python plot_cah_summary.py
 
-a  top C1 RNA and OT-recovered MSI weights (narrower than before; drawn at its size, not squeezed)
+a  top C1 RNA and OT-recovered MSI weights (drawn at its size, not squeezed)
 b  RNA UMAPs coloured by C1 and by subclass
 c  C1 by subclass, ordered by mean
 d  donor-mean astrocyte C1 by ADNC (snRNA, 42 donors; OR from astrocyte_c1_adnc.py); spans the b and c rows
 e  local oligodendrocyte density        f  transferred dopamine (30-NN mean)
 g  projected C1 (30-NN mean)           h  astrocyte C1 (30-NN astrocyte mean; ridge on the 464 Xenium
-                                          genes, count-adjusted per section: astro_c1_checks2.py)
-i  bivariate Moran's I, smoothed (unsmoothed): the three pairs of the current figure, plus
+                                          genes, count-adjusted per section: astrocyte_c1_count_adjusted.py)
+i  bivariate Moran's I, smoothed (unsmoothed): the three pairs among e-g, plus
    astrocyte C1 vs projected C1, computed over the section's astrocytes (W = symmetric binary 6-NN
    among astrocytes; smoothed = both fields as plotted, taken at the astrocytes).
 Data path as cah_components.stage_figure (the MOFA file is opened only for its feature and nucleus
-index, from fix_s0, as fig7_early_figure.py). One font scheme for every panel (FONT below); panel
+index, from fix_s0). One font scheme for every panel (FONT below); panel
 letters sit at the top-left corner of each panel's slot, so letters in one row share a baseline
 and letters in one column share an x position.
 Writes sea_ad_cah_pls_astro.{png,svg} and cah_xenium_bivariate_moran_astro.csv into OUT.
@@ -85,7 +85,7 @@ w_rna = w_rna.groupby(w_rna.index.str.upper()).first()
 
 
 def project_spatial_onto_factor(spatial, *_, key="mofa_factor1", **__):
-    """Fig. 7 recipe (cah_components.stage_figure): snRNA C1 gene weights on per-section z-scored expression."""
+    """The CaH recipe (cah_components.stage_figure): snRNA C1 gene weights on per-section z-scored expression."""
     X = spatial.X.toarray() if sp.issparse(spatial.X) else np.asarray(spatial.X, dtype=float)
     Z = (X - X.mean(0)) / X.std(0).clip(1e-6)
     genes = pd.Index(spatial.var_names.astype(str)).str.upper()
@@ -142,7 +142,7 @@ FW, M = 14.0, 0.12                                  # figure width, outer margin
 COL = (FW - 2 * M) / 4                              # map-row column width; d and h share column 4
 X_A, X_R, X_D = M, M + 2.75, M + 3 * COL            # slot left edges: a (narrow); b and c; d and h
 LET = 0.40                                          # letter band above each slot
-H_B, H_CD, H_MAP, H_I = 2.7, 2.0, 3.0, 1.4         # axes heights (Fig. 7 + caption must fit one page)
+H_B, H_CD, H_MAP, H_I = 2.7, 2.0, 3.0, 1.4         # axes heights (figure and caption fit one page)
 GAP_BC, LAB_C, GAP_ROW, GAP_I = 0.35, 1.5, 0.15, 0.05
 TTL = 0.32                                          # one-line map titles below the letter band
 y = M                                               # running top-down coordinate (inches from the top)

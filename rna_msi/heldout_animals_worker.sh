@@ -22,13 +22,13 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}
 export MKL_NUM_THREADS=${OMP_NUM_THREADS}
 export OPENBLAS_NUM_THREADS=${OMP_NUM_THREADS}
 export ANIMAL_TRANSFER_RUNS_DIR=${RUNS_DIR}
-# queues written before these settings existed fall back to the original benchmark
+# defaults for queue.env files without these settings (the 442-gene benchmark)
 export ANIMAL_TRANSFER_BENCH_DIR=${BENCH_DIR:-${RUNS_DIR}}
 export ANIMAL_TRANSFER_PANEL_TOP=${PANEL_TOP:-442}
 
 log() { echo "[$(date '+%F %T')] [${WORKER_TAG}] $*"; }
 
-# A broken driver (e.g. buckeridge) should cost nothing: check before claiming.
+# Check the GPU driver before claiming a run, so that a node with a broken driver claims nothing.
 if ! "${PY}" -c "import sys, torch; ok = torch.cuda.is_available() and float(torch.ones(8, device='cuda').sum()) == 8.0; sys.exit(0 if ok else 3)" </dev/null; then
     log "GPU unusable on $(hostname -s) (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}); exiting without claiming"
     exit 3

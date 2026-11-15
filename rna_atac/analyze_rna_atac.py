@@ -120,15 +120,14 @@ def save_figure_pdf_vector_raster(fig, filepath, dpi=300):
     finally:
         fonttools_logger.setLevel(prev_level)
 
-# Manuscript figure root (outside the MultiGATE repo). Relative save paths are
-# redirected here so interactive `fig.savefig('foo.svg')` / SAVE_SVG basenames
-# cannot land under scripts/ when the IPython cwd is MultiGATE/scripts.
+# Figure root. Relative save paths are redirected here, so that `fig.savefig('foo.svg')`
+# and SAVE_SVG basenames never land in the working directory.
 CIBB_FIGURES_DIR = f"{__import__('os').environ['SPATIALJEPA_MANUSCRIPT']}/figures"
 CIBB_PLS_FIGURES_DIR = os.path.join(CIBB_FIGURES_DIR, "pls_analysis")
 
 
 def resolve_cibb_figure_path(filepath, default_dir=None):
-    """Resolve a figure path into the CIBB figures tree.
+    """Resolve a figure path into the figures tree.
 
     Absolute paths are left alone. Bare filenames and other relative paths are
     joined under ``default_dir`` (defaults to ``CIBB_PLS_FIGURES_DIR``).
@@ -182,14 +181,12 @@ def save_figure_svg(fig, filepath, dpi=300):
 
 
 ## ---------------------------------------------------------------------------
-## Panels of the assembled LIANA figure (figures/3_liana_analyses.svg)
+## Panel sizes of the LIANA figure (figures/3_liana_analyses.svg)
 ##
-## Panels c/d/e are laid out with the other panels by hand, so each is emitted
-## standalone at the physical size of the slot it occupies there: dropped in at
-## 100% scale, they need no resizing and every panel ends up with the same type
-## size and line weight. c and d share a width (they stack into one column) and
-## their heights sum to e's height, so the three tile a single block.
-## Panel letters are added at assembly time and are deliberately not drawn here.
+## Panels c, d and e are drawn separately, each at its final physical size, so that
+## all panels share one type size and line weight. c and d share a width (they stack
+## into one column) and their heights sum to e's height, so the three tile one block.
+## Panel letters are not drawn here.
 ## ---------------------------------------------------------------------------
 PANEL_SIZE_IN = {
     'c_referee_agreement': (2.05, 1.50),
@@ -482,7 +479,7 @@ def run_co_embed_pathway_embedding_analysis(
     if that run was skipped (missing embedding) or failed. Returns ``None`` if ``combined_gp_dict`` is
     missing.
 
-    Inspect in a session: ``result["source_rna"].correlation``, ``.pathway_scores``, ``.p_values``, etc.
+    Results: ``result["source_rna"].correlation``, ``.pathway_scores``, ``.p_values``, etc.
     If ``cluster_obs_key`` is set (e.g. ``"leiden"`` or ``"RNA_clusters"``) and that column exists on
     ``adata.obs``, each result includes ``pathway_mean_by_cluster`` (groups × pathways) and
     ``cluster_obs_key_used``. Pass ``cluster_obs_key=None`` to skip group means.
@@ -1893,7 +1890,6 @@ device = torch.device("cpu")
 print("Device:", device, "(deterministic mode)")
 
 #%% ── MLflow setup ────────────────────────────────────────────────────────
-#bash $SPATIALJEPA_HOME/BAKLAVA/scripts/start_mlflow_services.sh all
 
 args.run_name = '20260505_190037' #'20260402_153455'
 args.stage2_run_name = '20260402_153455_stage2_20260402_165006'
@@ -1902,8 +1898,6 @@ postgres_tracking_uri = "http://127.0.0.1:5000"
 args.tracking_uri = postgres_tracking_uri
 args.target_model = "zero_shot" # for zero-shot co-embedding if stage2 model is not available
 
-#lsof $SPATIALJEPA_HOME/mlflow_tracking/MultiGATE/mlflow.db
-#curl -i http://127.0.0.1:5000
 
 if os.path.exists(os.path.join(os.environ.get("SPATIALJEPA_RNA_ATAC_RUN_DIR", ""), "run.json")):
     # exported run (tools/export_mlflow_run.py, spatialjepa/mlflow_offline.py): no tracking server needed
@@ -2572,7 +2566,7 @@ source_target_adata, _, _ = run_alignment_and_spatial_plot(
     target_concat_adata,
     deterministic_seed,
     # Source and target clustered independently with shared Leiden parameters
-    # (chosen by BAKLAVA scripts/figures/transfer_leiden_sweep.py).
+    # (chosen by rna_atac/transfer_leiden_sweep.py).
     leiden_neighbors=150,
     leiden_resolution=0.9,
     target_leiden="independent",
@@ -2629,7 +2623,7 @@ merged_rank_genes_leidens_df = merged_rank_genes_leidens_df[(
 rank_genes_leidens_corr = merged_rank_genes_leidens_df.groupby('group')[['pvals_adj_source', 'pvals_adj_target']].corr(method='spearman')
 rank_genes_leidens_corr = rank_genes_leidens_corr.groupby(level=0).apply(lambda df: df.iloc[0, 1])
 
-# Prepare the data: rank-transform and then -log (as in original code)
+# Prepare the data: rank-transform and then -log
 ranked_df = merged_rank_genes_leidens_df[['pvals_adj_source', 'pvals_adj_target']].apply(lambda x: -np.log(x)).rank()
 ranked_df['leiden'] = merged_rank_genes_leidens_df['group']
 
@@ -3019,10 +3013,10 @@ def _spread_ci(point_value, replicate_values, z=1.96):
 
     The spread is rescaled by sqrt(f / (1 - f)), f = bootstrap_frac: the
     delete-d jackknife factor (Shao & Wu 1989) for subsamples drawn without
-    replacement. It replaces an earlier sqrt(f) factor, which assumes near-
-    independent subsamples (m << n or drawing with replacement): at f = 0.8
-    the subsamples share most cells, so sqrt(f) gave intervals ~2.2x too
-    narrow. Same rule as bootstrap_integration_metrics.spread_ci.
+    replacement. A plain sqrt(f) factor assumes near-independent subsamples
+    (m << n, or drawing with replacement); at f = 0.8 the subsamples share most
+    cells and it would give intervals ~2.2x too narrow. Same rule as
+    bootstrap_integration_metrics.spread_ci.
     """
     if not 0.0 < bootstrap_frac < 1.0:
         raise ValueError("_spread_ci needs 0 < bootstrap_frac < 1, got {}.".format(bootstrap_frac))
@@ -3105,8 +3099,8 @@ foscttm_metric_specs = [
 ##   source -> RNA_clusters (the transcriptomic domains in the spatial map)
 ##   target -> celltypist_predictions (already shared by both modalities)
 ##
-## 'per_modality' keeps the old behaviour for comparison; resolve_scib_labels
-## now namespaces the two vocabularies before pooling them, because the
+## 'per_modality' scores each modality on its own labels; resolve_scib_labels
+## namespaces the two vocabularies before pooling them, because the
 ## target's 10x graphclust keys are plain integers in BOTH assays and would
 ## otherwise merge unrelated RNA and ATAC clusters under the same label.
 from train_rna_atac import (
@@ -3181,8 +3175,8 @@ scib_metric_specs = [
 
 ## ── where the metrics come from ───────────────────────────────────────
 ## Computing the bootstrap in-process costs ~n_bootstrap x the point estimates
-## alone, and blocks the session for the duration. bootstrap_integration_metrics.py runs
-## the identical computation as a detached background job.
+## alone; bootstrap_integration_metrics.py runs the identical computation as a
+## separate job.
 ##
 ##   'background' -- launch the worker, return immediately, plot later (default)
 ##   'inline'     -- compute here and block
@@ -3345,11 +3339,10 @@ else:
         ignore_index=True,
     )
 
-#%% [RESUME FROM BOOTSTRAP SCIB] plot the scib / FOSCTTM barplot
+#%% scib / FOSCTTM barplot
 ##
-## This cell only needs `model_metrics_df`, so it can be re-run on its own
-## once a background bootstrap has finished:
-##     from metrics_bootstrap import bootstrap_status, load_bootstrap_metrics
+## Needs only `model_metrics_df`; after a separate bootstrap job has finished:
+##     from bootstrap_integration_metrics import bootstrap_status, load_bootstrap_metrics
 ##     bootstrap_status(metrics_work_dir)
 ##     model_metrics_df = load_bootstrap_metrics(metrics_work_dir)
 if model_metrics_df is None:
@@ -3361,10 +3354,9 @@ if model_metrics_df is None:
         "then re-run this cell.".format(d=metrics_work_dir)
     )
 else:
-    ## Work on a local copy so re-running this cell does not permanently
-    ## rename metric_name in the session-level model_metrics_df (otherwise
-    ## a second pass keeps only 'total', the one name shared by both the
-    ## raw and display vocabularies).
+    ## Work on a local copy so that model_metrics_df keeps its metric names (renamed in
+    ## place, a second pass would keep only 'total', the one name shared by the raw
+    ## and display vocabularies).
     plot_metrics_df = model_metrics_df.loc[
         model_metrics_df['metric_name'].isin(
             ['foscttm', 'ilisi', 'clisi', 'graph_connectivity',
@@ -3383,8 +3375,7 @@ else:
     ## cLISI sits next to iLISI on purpose: iLISI alone cannot distinguish
     ## "modalities mixed, biology preserved" from "modalities mixed because
     ## the embedding discarded the biology"; graph connectivity catches the
-    ## fragmented embeddings both LISIs are blind to. A CSV from an older
-    ## bootstrap run predates them, so keep only the metrics actually present.
+    ## fragmented embeddings both LISIs are blind to. Keep only the metrics present.
     metric_sort_order = [
         m for m in ['1-FOSCTTM', 'iLISI', 'cLISI', 'graph conn.', 'bio_cons.', 'total']
         if m in set(plot_metrics_df['metric_name'])
@@ -3536,7 +3527,7 @@ else:
             )
             for d in plotted_domains if d in domains_to_plot
         ]
-        ## explicit key for the hatch, so the in-sample caveat travels with the figure
+        ## explicit key for the hatch, so the in-sample marking is explained in the figure
         legend_handles.append(
             mpl.patches.Patch(
                 facecolor='white', edgecolor='#555555', hatch=in_sample_hatch,
@@ -3824,8 +3815,8 @@ spatial_metrics_df = pd.concat(
     ],
     ignore_index=True,
 )
-# NOTE: the teacher-graph-shuffle control requires retraining the student
-# with a permuted teacher graph and is run upstream, not in this scoring cell.
+# The teacher-graph-shuffle control needs a student retrained with a permuted
+# teacher graph, so it is not scored in this cell.
 
 # ── absolute scores (mean over folds) + bootstrap 95% CI ─────────────
 def _bootstrap_ci(values, n_boot=2000, alpha=0.05):
@@ -3932,9 +3923,8 @@ from sklearn.model_selection import StratifiedShuffleSplit
 def get_source_multivi_rna_for_analysis(base_path):
     """Return source MultiVI RNA, loading it when this cell is run standalone.
 
-    The script normally creates ``mdata`` in the earlier MultiVI cell.  Keeping
-    this small fallback here also makes the LIANA/Inflow analysis cell runnable
-    after restarting a notebook kernel without repeating all preceding panels.
+    ``mdata`` is normally created by the MultiVI cell above; this fallback lets the
+    LIANA/Inflow analysis cell run on its own.
     """
     source_multivi_mdata = globals().get("mdata")
     if source_multivi_mdata is None:
@@ -4071,9 +4061,9 @@ def fit_sender_collapsed_inflow_nmf(
 ):
     """Fit a separate NMF to sender-collapsed Inflow scores.
 
-    The original sender-resolved result remains untouched and continues to define
-    the LR-informed reference used by panels a--c. This result is used only for
-    factor interpretation and the domain-enrichment panel e.
+    The sender-resolved result is left unchanged and defines the LR-informed
+    reference; this result is used only for factor interpretation and the
+    domain-enrichment panel.
     """
     from sklearn.decomposition import NMF as SklearnNMF
 
@@ -4225,7 +4215,7 @@ def liana_spatial_analysis(
     map_df = map_df.drop(columns=["Gene stable ID", "Mouse gene stable ID"])
 
     if resource is None:
-        resource = li.rs.select_resource('mouseconsensus') # NOTE: mouse_consensus could be used in future
+        resource = li.rs.select_resource('mouseconsensus')
         '''
         resource = li.rs.translate_resource(
             resource,
@@ -4497,9 +4487,9 @@ source_liana_collapsed_results = fit_sender_collapsed_inflow_nmf(
 ## Only source_rna.obsm['spatial'] and the embeddings enter: no imputed target
 ## coordinates, no ingested labels, no OT, no Inflow-NMF, so nothing being compared was
 ## produced by the models under test.
-## Caveat for the caption: the split is held out at evaluation time, not training time,
-## so this shows position is recoverable from the embedding, not that the model
-## generalises to unseen tissue. The teacher sees the spatial graph and is a scale
+## The split is held out at evaluation time, not at training time, so this shows that
+## position is recoverable from the embedding, not that the model generalises to unseen
+## tissue. The teacher sees the spatial graph and is a scale
 ## reference, not a competitor; the non-spatial ablation is the control that isolates
 ## distillation (same architecture, same data, no teacher).
 def plot_heldout_spatial_reconstruction(
@@ -4701,8 +4691,7 @@ def compute_spatial_structure_stats(
 
     Domain-level rows carry neighbourhood contiguity (how much of a spot's
     spatial neighbourhood shares its label) because that is the only covariate
-    found to track the teacher-minus-student gap. Ten others did not; see
-    Section 4.x of the manuscript for the list.
+    found to track the teacher-minus-student gap; ten others did not.
     """
     from sklearn.neighbors import NearestNeighbors
     from scipy.stats import spearmanr
@@ -5088,32 +5077,8 @@ def place_scatter_labels(ax, x, y, labels, fontsize=7, color='0.35',
     return ax
 
 
-## Three readings of the same ordering, differing in what they cost.
-##
-## 'shortfall' is the default: it is the *same statistic* as 'gap', negated, so
-## it keeps the significant p-value while putting the good end at the top and
-## running the cloud from upper-left to lower-right, which is how a reader
-## expects a "more context, more loss" relationship to look. Negation is exact
-## for a rank correlation -- it reverses the ranks and nothing else -- so the
-## p-value is untouched and only the sign of r_s flips.
-##
-## 'gap' is the same numbers with the axis the other way up: r_s is positive,
-## matching the text's teacher-minus-student framing, but up is worse.
-##
-## 'retention' is the ratio. It reads the natural way round with strictly
-## positive values, but it is the weaker statistic (p = 0.083 against 0.011),
-## because variation common to both arms cancels in a difference and re-enters
-## a ratio through the denominator.
-##
-## No rescaling of the ratio recovers that, so do not go looking for one:
-## log(r+1), log(r), sqrt(r), logit(r) and r**3 all leave the Spearman p-value
-## bit-identical (checked to 0.0e+00 across 20000 random contiguity vectors),
-## because a strictly monotone transform preserves ranks and a rank correlation
-## sees nothing else. The weakness is the denominator, not the functional form:
-## dividing discards what a difference keeps, and nothing applied afterwards
-## brings it back. Such a transform would move Pearson, which does see
-## magnitudes, but choosing one post hoc because it lowers a p-value is
-## dredging -- at n = 11 with two extreme domains, indefensibly so.
+## Panel (b) supports three metrics: 'shortfall' (student minus teacher),
+## 'gap' (teacher minus student), and 'retention' (student/teacher ratio).
 ##
 ## ``negate`` flips a column and its correlation together, so a derived reading
 ## cannot drift from the statistics it was derived from.
@@ -5320,21 +5285,11 @@ def plot_spatial_structure_figure(
     alignment and lets one colourbar's labels land on top of the block below.
 
     ``panel_b_metric`` selects what panel (b) plots against contiguity; see
-    :data:`CONTIGUITY_PANEL_METRICS` for the full comparison. In brief:
+    :data:`CONTIGUITY_PANEL_METRICS` for their definitions:
 
-    * ``'shortfall'`` (default) -- student minus teacher kNN agreement. Higher
-      is better, the cloud runs upper-left to lower-right, and because it is
-      only the sign of ``'gap'`` it keeps that reading's p-value exactly.
-    * ``'gap'`` -- the same numbers as teacher minus student, so r_s is positive
-      and matches the text's framing, but up is worse.
-    * ``'retention'`` -- the student/teacher ratio. Strictly positive and reads
-      naturally, but it is the weaker statistic (rho ~ -0.55 against ~0.73):
-      variation common to both arms cancels in a subtraction and re-enters a
-      ratio through the denominator.
-
-    The default avoids the two failure modes that matter: a figure showing a
-    non-significant trend beside prose quoting a significant one, and a y axis
-    whose best domains sit where a reader expects the worst.
+    * ``'shortfall'`` (default) -- student minus teacher kNN agreement.
+    * ``'gap'`` -- teacher minus student kNN agreement.
+    * ``'retention'`` -- the student/teacher ratio.
 
     ``domain_aliases`` maps cluster codes to display labels in panel (b), so that
     the two domains the text discusses are identifiable without a lookup. Confirm
@@ -5439,7 +5394,7 @@ def plot_spatial_structure_figure(
         ax = _bare(fig.add_subplot(gs[2, c]))
         ## ~9k markers per map x 7 maps: rasterised so the SVG carries an image
         ## per panel instead of tens of thousands of vector circles. Axes, text
-        ## and colour bars stay vector, so labels remain editable in Inkscape.
+        ## and colour bars stay vector.
         sca_b = ax.scatter(xy[:, 0], xy[:, 1], c=sm(stats['auc'][a]), s=3.0,
                            linewidths=0, cmap=seq, vmin=0, vmax=1, rasterized=True)
         ax.set_title(f'{a}\narea {np.nanmean(stats["auc"][a]):.2f}', fontsize=9, pad=5)
@@ -5508,27 +5463,21 @@ domain_marker_summary(source_rna, spatial_structure_stats)
 ## F-test for curvature.
 panel_b_tests = panel_b_association_tests(spatial_structure_stats)
 
-## NOTE: this overwrites figures/3_spatial_ecdf_analysis.{svg,png}, including any
-## manual polish applied to them in Inkscape. Pass filename='...' to write a new
-## pair and merge by hand instead.
+## Writes figures/3_spatial_ecdf_analysis.{svg,png}; pass filename='...' to write a
+## new pair instead.
 spatial_structure_fig, spatial_structure_paths = plot_spatial_structure_figure(
     spatial_structure_stats
 )
 
-#%% Panel (b) alone, for hand-assembly into the polished composite
-## Run this cell on its own (it needs only spatial_structure_stats) to re-render
-## panel (b) without touching 3_spatial_ecdf_analysis.{svg,png}. The axes box
-## comes out at the same 2.59 in square it occupies in the composite, so the SVG
-## drops in at 1:1 -- import it in Inkscape, delete the old panel, align, done.
+#%% Panel (b) alone
+## Needs only spatial_structure_stats and leaves 3_spatial_ecdf_analysis.{svg,png}
+## untouched. The axes box is the same 2.59 in square as in the composite.
 contiguity_panel_fig, contiguity_panel_paths = plot_contiguity_panel(
     spatial_structure_stats
 )
 
 #%% (continues) source-side agreement with the Inflow-NMF referee.
-## The target-side referee is deliberately not scored: target spatial coordinates are
-## imputed from the MultiGATE latent space being evaluated (see target_rna.obsm['spatial']
-## assignment above), so any target agreement is circular. On the source the referee is
-## built from real coordinates and expert RNA_clusters, and is model-independent.
+## The source-side referee uses measured coordinates and expert RNA_clusters.
 from matplotlib import gridspec
 from scipy.optimize import linear_sum_assignment
 
@@ -5661,7 +5610,7 @@ def plot_referee_agreement_panel(
     save_dir=CIBB_PLS_FIGURES_DIR,
     dpi=600,
 ):
-    """Panel c of the assembled LIANA figure, at the size it is placed."""
+    """Panel c of the LIANA figure, at its final size."""
     ## drop the repeated 'MultiGATE ' prefix: the four full names do not fit across a
     ## 1.6 in axes at any usable type size, upright or rotated, and panel d sits
     ## directly below with the same four arms spelled out in its legend
@@ -5866,9 +5815,8 @@ def plot_source_referee_panels(
         save_figure_svg(fig, os.path.join(save_dir, f'{save_name}.svg'), dpi=dpi)
     plt.show()
 
-    ## same bars again, standalone and at the size panel c is placed in the assembled
-    ## figure -- the copy inside this overview lives on a 12.6 in canvas and would have
-    ## to be scaled down by ~6x to fit, which is what shrinks its type to nothing
+    ## same bars again, standalone at panel c's final size: the copy inside this
+    ## overview lives on a 12.6 in canvas and would need ~6x downscaling.
     fig_panel_c = plot_referee_agreement_panel(
         res_df, ceil_ari, referee_k, save_dir=save_dir
     )
@@ -6167,10 +6115,6 @@ target_liana_results = liana_spatial_analysis(
 '''
 
 #%% UMAP: ingest nonspatial source leiden (slow viz)
-## The per-arm ARI/NMI barplot that used to live here scored every arm against a
-## Leiden partition whose k was set by the referee's own fixed resolution, and scored
-## the target arms against a referee built on model-imputed coordinates. Both are
-## handled above by plot_source_referee_panels, at matched k and source-only.
 ingested_nonspatial_source_concat_adata = sc.tl.ingest(
     nonspatial_source_concat_adata, source_concat_adata,
     embedding_method='umap', obs='leiden', inplace=False
@@ -6719,7 +6663,7 @@ def plot_pls_spatial_panel(
                 size=size, frameon=True, title=col if r == 0 else '',
                 cmap=cmap, vmin=-lim, vmax=lim, colorbar_loc=None,
             )
-            ## square subpanels, as in the assembled CIBB figure. box_aspect fixes
+            ## square subpanels. box_aspect fixes
             ## the axes box itself; 'equal' with adjustable='datalim' then pads the
             ## shorter data axis to fill it, so the tissue keeps its true geometry
             ## instead of being stretched into the square.
@@ -7592,9 +7536,8 @@ safe_pls_cmp = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in str
 safe_gene = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in str(gene))
 
 #%% ── Composite figure bottom row: h (paired Moran's I) | i (peaks) | j (arcs) ──
-## Panels are exported separately at matched heights for manual assembly. Panel h
-## generalises the single locus in i/j across genes, which is what a reader asks for
-## after seeing one exemplar.
+## Panels are exported separately at matched heights. Panel h generalises the
+## single locus in i/j across genes.
 from gene_peak_attention_utils import (
     linked_peak_score,
     morans_i,
@@ -8969,7 +8912,7 @@ mean_dists = pd.DataFrame(index=source_adata.obs['leiden'].cat.categories, colum
 for cluster in source_adata.obs['leiden'].cat.categories:
     source_dat = source_adata[source_adata.obs['leiden'].eq(cluster)]
     target_dat = target_adata[target_adata.obs['leiden'].eq(cluster)]
-    mean_dists.loc[cluster, 'multigate'] = np.mean(euclidean_distances(source_dat.X, target_dat.X)) # could replace with wasserstein distance
+    mean_dists.loc[cluster, 'multigate'] = np.mean(euclidean_distances(source_dat.X, target_dat.X))
     mean_dists.loc[cluster, 'alpha'] = np.mean(euclidean_distances(source_dat.obsm['alpha_embs'], target_dat.obsm['alpha_embs']))
 mean_dists = mean_dists.sort_values(by='multigate', ascending=True)
 mean_dists.loc['all', 'multigate'] = np.mean(euclidean_distances(source_adata.X, target_adata.X))

@@ -6,25 +6,25 @@ except ModuleNotFoundError:
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
     import spatialjepa.paths  # noqa: F401
 import os  # noqa: E402
-#%% Fig. 5 and Fig. 6 drawn from the PLS decoders instead of MOFA+.
+#%% Dopamine-program figures drawn from the PLS decoders instead of MOFA+.
 #
-# Same layouts and drawing helpers as the manuscript figures (5__'s FIG_* helpers);
+# Same layouts and drawing helpers as dopamine_nmf_signature.py's FIG_* helpers;
 # only the MOFA-derived inputs are replaced (see msi_components_common.py for the
 # rationale). A figure is drawn for one latent direction of one SpatialJEPA run:
 #
 #   dopamine axis   the student MSI decoder's dopamine direction (imputed dopamine)
 #   MSI-PLS Ck      the decoder's k-th component, oriented so dopamine loads positively
 #
-# Fig. 5   rows 1 and 3 unchanged (measured source; embedding benchmark)
+# overview rows 1 and 3 unchanged (measured source; embedding benchmark)
 #          g, h  axis score in the P22 spatial target / multiome nuclei (student latent)
 #          i     axis gene loadings (latent->RNA PLS decoder fitted in the multiome
 #                target) and metabolite loadings (dopamine axis: correlation with the
 #                axis in the source's MEASURED MSI when the run's source latents exist,
 #                else the decoded target MSI; components: the decoder's own loadings,
 #                fitted on measured source MSI)
-#          j     gene-level convergence with the NMF program; same 2,000 genes as Fig. 5j
-# Fig. 6   a     cell-type cCRE maps (adapted from Zhang et al., 2023; unchanged)
-#          b     weighted GSEA of D2-MSN / MXD cCRE peaks over Fig. 6's 2,000 peaks,
+#          j     gene-level convergence with the NMF program (2,000 genes)
+# board    a     cell-type cCRE maps (adapted from Zhang et al., 2023; unchanged)
+#          b     weighted GSEA of D2-MSN / MXD cCRE peaks over the board's 2,000 peaks,
 #                ranked by the axis's ATAC loadings (latent->ATAC PLS decoder);
 #                permutation NES, sign-specific null
 #          c     TF motifs of the leading-edge cCREs vs the remaining cCREs of the type,
@@ -65,7 +65,7 @@ VARIANTS = {
     "fixed_s3_C2": ("fixed s3", "MSI-PLS C2"),
     "manuscript_dopamine_axis": ("manuscript", "dopamine axis"),
 }
-# in file order; from the two Fig. 6 cells only the drawing helpers are taken (their other
+# in file order; from the two regulatory cells only the drawing helpers are taken (their other
 # functions have defaults that reference objects of cells not run here)
 SCRIPT5_CELLS = ("Load data", "Load joint data", "Run NMF on spatial Visium data",
                  "plot cCRE enrichment of the top C12 features", "TF motif enrichment hand-off",
@@ -84,9 +84,9 @@ def parse_args():
     return p.parse_args()
 
 
-# ------------------------------------------------------------------ script-5 helpers
+# ----------------------------------------------------- dopamine_nmf_signature.py helpers
 def script5_namespace(tag):
-    """Run only the light script-5 cells (source data, cached NMF, figure helpers)."""
+    """Run only the light dopamine_nmf_signature.py cells (source data, cached NMF, figure helpers)."""
     os.environ["SPATIALJEPA_RUN_TAG"] = tag
     os.environ["SPATIALJEPA_NMF_CACHE_DIR"] = str(P.PROJ / P.BASE)
     lines = SCRIPT5.read_text().splitlines(keepends=True)
@@ -155,7 +155,7 @@ def source_metabolite_loadings(tag, beta, features):
 
 
 def convergence_stats(ns, label, rna_loadings, universe, top_k=TOP_K):
-    """Panel j statistics, as 5__'s _fig_nmf_mofa_enrichment_stats, for PLS loadings."""
+    """Panel j statistics, as dopamine_nmf_signature.py's _fig_nmf_mofa_enrichment_stats, for PLS loadings."""
     from scipy.stats import hypergeom, spearmanr
     from sklearn.metrics import roc_auc_score
 
@@ -178,7 +178,7 @@ def convergence_stats(ns, label, rna_loadings, universe, top_k=TOP_K):
 
 
 def gsea_object(scores, member, names, term):
-    """gseapy-style result (ranking, hits, running ES) for 5__'s _fig_draw_gsea."""
+    """gseapy-style result (ranking, hits, running ES) for dopamine_nmf_signature.py's _fig_draw_gsea."""
     res, leading = P.weighted_gsea(scores, member)
     order = np.argsort(-scores)
     s, m = scores[order], member[order]
@@ -202,7 +202,7 @@ def motif_table(path):
     }).sort_values(["padj", "pvalue"]).reset_index(drop=True)
 
 
-# --------------------------------------------------------------------------- Fig. 5
+# ------------------------------------------------------------------------ overview figure
 def draw_fig5(ns, panel, output_file, *, lattice_fill=4.5, factor_map_clip=98, factor_map_gamma=2.0):
     """FIG_dopamine_overview's layout with the row-2 inputs taken from PLS."""
     from matplotlib.lines import Line2D
@@ -283,7 +283,7 @@ def draw_fig5(ns, panel, output_file, *, lattice_fill=4.5, factor_map_clip=98, f
     print(f"[fig] wrote {output_file.with_suffix('.png')}", flush=True)
 
 
-# --------------------------------------------------------------------------- Fig. 6
+# ------------------------------------------------------------------------ regulatory board
 def draw_fig6(ns, panel, output_file):
     from PIL import Image
 
@@ -426,8 +426,7 @@ def main():
                            else source_metabolite_loadings(tag, beta, R["multiome"]["features"]))
             metab_source = "measured source MSI"
             if metabolites is None:
-                # the June model behind the manuscript projection has no surviving source
-                # latents: fall back to the decoded (imputed) target MSI
+                # runs without saved source latents: fall back to the decoded (imputed) target MSI
                 msi = R["multiome"]["msi"]
                 s = R["multiome"]["Z"] @ beta
                 metabolites = msi.apply(lambda col: np.corrcoef(col, s)[0, 1])
@@ -447,7 +446,7 @@ def main():
         out.mkdir(parents=True, exist_ok=True)
         draw_fig5(ns, panel5, out / "SMA_mouse_dopamine_pls")
 
-        # Fig. 6 inputs
+        # regulatory-board inputs
         fig_peaks = Tm["peaks"][fig_mask]
         scores = peaks.to_numpy()[fig_mask]
         gsea, motif_inputs = {}, out / "motif_inputs"

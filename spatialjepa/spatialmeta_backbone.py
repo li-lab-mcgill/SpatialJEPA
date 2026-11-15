@@ -126,9 +126,8 @@ def replace_fc_encoder_with_gcn(
 
     ``neighborhood`` controls mini-batch message passing:
 
-    - ``"induced"`` (legacy): a mini-batch only keeps edges with both endpoints in the
-      batch. With random 128-spot batches over ~2.4k spots a node keeps on average
-      k*127/(N-1) neighbours (~0.3 at k=6), so the graph is mostly absent in training.
+    - ``"induced"``: a mini-batch only keeps edges with both endpoints in the
+      batch.
     - ``"exact"``: mini-batch outputs equal the full-graph layer outputs for the batch
       nodes. The layer acts on the model *input*, and GCNConv computes
       ``A_hat @ lin(x) + b`` with a bias-free ``lin``, so ``lin(A_hat @ x)[idx] + b`` is
@@ -833,7 +832,7 @@ def load_spatialjepa_model(checkpoint_path, template_joint_adata, device="cuda:0
 
 
 # ---------------------------------------------------------------------------
-# Teacher-student training (moved from train_rna_msi.py)
+# Teacher-student training
 # ---------------------------------------------------------------------------
 
 def _optimizer_lr(optimizer) -> float:

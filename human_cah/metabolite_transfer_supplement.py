@@ -1,11 +1,11 @@
-"""GPU part of the two supplementary figures (seed0, Fig. 7 recipe; nothing in Fig. 7 changes).
+"""GPU part of the two supplementary figures (seed0; the CaH recipe, which it leaves unchanged).
 
 1  Held-out source sections (as cah_components.stage_validate): each section's MSI held out, U from the
    other two; the held-out section's metabolite weights from its measured MSI vs OT-recovered (the
    paper's estimator) and vs copied from the other two sections. Saves all 787 x K weights per section.
-2  The Fig. 7 OT pairing (40,000 nuclei, seed 0, per-section OT, reg 0.001) with the paired MSI per
+2  The CaH OT pairing (40,000 nuclei, seed 0, per-section OT, reg 0.001) with the paired MSI per
    nucleus, the decoder (B, R) and the nucleus indices, for subclass x metabolite summaries.
-Writes supp_metab.pkl next to this script. Env: nichecompass_liana on a GPU.
+Writes supp_metab.pkl next to this script. Environment: spatialjepa-analysis on a GPU.
 """
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)
     import spatialjepa.paths  # noqa: F401

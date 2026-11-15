@@ -1,8 +1,7 @@
 #!/usr/bin/env python
 """Batch worker for SEA-AD cell-level spatialMETA embeddings.
 
-Run this script with the spatialMETA conda environment, not the SEA-AD/Tangram
-environment. Inputs are staged AnnData files and outputs are compact NPZ
+Run this script in the spatialjepa-msi environment ($PY_MSI). Inputs are staged AnnData files and outputs are compact NPZ
 embedding files keyed by obs_names.
 """
 
@@ -40,7 +39,7 @@ from scipy import sparse
 BYTES_PER_GB = 1024**3
 DEFAULT_MIN_MATCH_FRACTION = 0.10
 BAKLAVAS_SMA_DIR = Path(
-    os.environ["SPATIALJEPA_RNA_MSI"]
+    os.environ.get("BAKLAVAS_SMA_DIR", Path(os.environ["SPATIALJEPA_REPO"]) / "spatialjepa")
 )
 
 
@@ -444,7 +443,7 @@ def patch_sklearn_pls_compat() -> None:
 
 
 def load_spatialmeta_pls_decoder(pls_decoder_path: str | Path) -> dict[str, Any]:
-    """Load the BAKLAVAS student PLS decoder payload for direct script use."""
+    """Load the student PLS decoder payload for direct script use."""
     path = Path(pls_decoder_path)
     if not path.exists():
         raise FileNotFoundError(f"Missing PLS decoder: {path}")

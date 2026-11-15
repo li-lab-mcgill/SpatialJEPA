@@ -7,7 +7,7 @@ gene/peak set of the saved target MuData and raw counts in X (as the script does
 Validation: latents for the 11,637 previously embedded nuclei must match the
 saved X_multivi_{rna,atac}_zero_shot before anything is written.
 
-Outputs (new folder; earlier results untouched):
+Outputs (a separate folder; existing results are untouched):
   metrics_bootstrap_v3/metric_inputs/{specs.json, target_multivi_zero_shot__{rna,atac}.h5ad}
   metrics_bootstrap_v3/multivi_zero_shot_full_target_latents.npz
 """

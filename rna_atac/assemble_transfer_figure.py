@@ -1,9 +1,9 @@
-"""Assemble screenshot panels a--g without writing to the manuscript repository.
+"""Assemble the transfer figure from its panels a--g (the published layout was finished by hand).
 
-Uses the revised a/c/d/e panels and the original b/f/g vector exports.
+Uses the a/c/d/e panels of plot_transfer_panels.py and the b/f/g vector exports.
 The only crop removes the standalone headline/footer and empty side margins
 of f; every scientific plot, title, and colorbar is retained.
-Run with system python3 (librsvg and libcairo are used through ctypes).
+Needs librsvg and libcairo (used through ctypes; reproduce.sh runs it in the motifs environment).
 """
 try:  # repository root on sys.path, then the settings (spatialjepa/paths.py, configs/spatialjepa.env)
     import spatialjepa.paths  # noqa: F401
@@ -75,7 +75,7 @@ def add_panel(root, label, path, x, y, scale, crop=None, label_y=None):
     width, height = view[2] * scale, view[3] * scale
     assert x >= 0 and y >= 0 and x+width <= PAGE[0] and y+height <= PAGE[1]
     namespace_ids(panel, label + "_")
-    # Ordinary groups are directly selectable/movable in Inkscape. Keep the
+    # Ordinary groups stay selectable in SVG editors. Keep the
     # panel letter in the same group, outside the scaled artwork and crop.
     outer = ET.SubElement(root, tag("g"), {
         "id": f"panel_{label}",
